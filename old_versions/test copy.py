@@ -896,3 +896,6 @@ class BotGUI:
 if __name__ == "__main__":
     gui = BotGUI()
     gui.run()
+
+
+    asdasdsad
