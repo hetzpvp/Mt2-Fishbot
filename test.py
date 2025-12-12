@@ -287,7 +287,7 @@ class FishingBot:
     def click_fish(self, x: int, y: int):
         """Clicks on the detected fish if it's within the valid clicking circle."""
         circle_center = (self.region.width // 2, self.region.height // 2)
-        circle_radius = 65
+        circle_radius = 67
         
         if not self.is_fish_in_circle((x, y), (*circle_center, circle_radius)):
             return
