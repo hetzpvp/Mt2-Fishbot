@@ -3,7 +3,6 @@ import numpy as np
 import time
 import pyautogui
 from mss import mss
-from PIL import Image, ImageTk
 import threading
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
@@ -13,6 +12,7 @@ import pygetwindow as gw
 import psutil
 import json
 import os
+import winsound
 try:
     from pynput import keyboard
     from pynput.keyboard import Controller, Key
@@ -201,11 +201,14 @@ class FishingBot:
         self.total_games = 0
         self.bait_counter = bait_counter  # Current bait count
         self.region_auto_calibrated = False  # Track if region has been auto-calibrated
+        self.consecutive_failures = 0  # Track consecutive minigame detection failures
         
         # Callbacks for GUI updates
         self.on_status_update = None
         self.on_stats_update = None
         self.on_pause_toggle = None
+        self.on_bait_update = None  # Callback for bait counter changes
+        self.on_bot_stop = None  # Callback when bot stops
         
         # Setup keyboard listener for pause
         if keyboard:
@@ -341,6 +344,26 @@ class FishingBot:
         else:
             return '4'
     
+    def adjust_bait_tier(self):
+        """Adjusts bait counter to next lower tier when 5 consecutive failures occur."""
+        if self.bait_counter > 600:
+            self.bait_counter = 600
+        elif self.bait_counter > 400:
+            self.bait_counter = 400
+        elif self.bait_counter > 200:
+            self.bait_counter = 200
+        else:
+            self.bait_counter = 0
+        
+        self.consecutive_failures = 0
+        
+        if self.on_status_update:
+            self.on_status_update(f"⚠️ 5 consecutive failures! Bait adjusted to {self.bait_counter}")
+        if self.on_bait_update:
+            self.on_bait_update(self.bait_counter)
+        if self.on_stats_update:
+            self.on_stats_update(self.hits, self.total_games)
+    
     def press_ctrl_key(self, key: str):
         """Presses CTRL+key combination once."""
         try:
@@ -442,9 +465,27 @@ class FishingBot:
                 
                 minigame_detected = self.wait_for_minigame_window(timeout=0.5)
                 if not minigame_detected:
+                    self.consecutive_failures += 1
+                    if self.on_status_update:
+                        self.on_status_update(f"Minigame not detected ({self.consecutive_failures}/5)")
+                    
+                    if self.consecutive_failures >= 3:
+                        self.adjust_bait_tier()
+                        if self.bait_counter <= 0:
+                            if self.on_status_update:
+                                self.on_status_update("Bait depleted after consecutive failures. Stopping bot.")
+                            winsound.Beep(1000, 500)  # Beep at 1000Hz for 500ms
+                            self.running = False
+                            if self.on_bot_stop:
+                                self.on_bot_stop()
+                            break
+                    
                     self.quickskip()
                     time.sleep(0.1)
                     continue
+                
+                # Reset failure counter on successful minigame detection
+                self.consecutive_failures = 0
                 
                 minigame_active = True
                 while self.running and minigame_active:
@@ -491,7 +532,11 @@ class FishingBot:
         
         if self.on_status_update:
             self.on_status_update(f"Bot finished! Total games: {self.total_games}")
+        if self.bait_counter <= 0:
+            winsound.Beep(1000, 500)  # Beep at 1000Hz for 500ms
         self.running = False
+        if self.on_bot_stop:
+            self.on_bot_stop()
     
     def start(self):
         """Starts the bot"""
@@ -516,10 +561,8 @@ class BotGUI:
         self.root.resizable(True, True)
         
         self.window_manager = WindowManager()
-        self.region: Optional[GameRegion] = None
         self.bot: Optional[FishingBot] = None
         self.bot_thread: Optional[threading.Thread] = None
-        self.square_radius = 68  # Default square radius for fishing window
         
         # Config file path in the current working directory
         self.config_file = os.path.join(os.getcwd(), "bot_config.json")
@@ -818,25 +861,6 @@ class BotGUI:
             self.status_frame.pack_forget()
             self.root.geometry("650x600")
     
-    def create_center_square_region(self) -> Optional[GameRegion]:
-        """Creates a square region centered in the selected window."""
-        win_left, win_top, win_width, win_height = self.window_manager.get_window_rect()
-        
-        if win_width == 0 or win_height == 0:
-            return None
-        
-        center_x = win_width // 2
-        center_y = (win_height+40) // 2
-        
-        left = max(0, center_x - self.square_radius)
-        top = max(0, center_y - self.square_radius)
-        size = self.square_radius * 2
-        
-        width = min(size, win_width - left)
-        height = min(size, win_height - top)
-        
-        return GameRegion(left=left, top=top, width=width, height=height)
-    
     def update_stats(self, hits: int, total_games: int):
         """Updates the statistics display with current game progress."""
         self.hits_label.config(text=f"{hits} / 3")
@@ -853,6 +877,12 @@ class BotGUI:
         self.bait_label.config(text=str(self.bait))
         self.add_status("Bait counter reset to 800")
         # Save config when bait is reset
+        self.save_config()
+    
+    def update_bait_from_bot(self, new_bait: int):
+        """Updates GUI bait counter when bot adjusts bait tier."""
+        self.bait = new_bait
+        self.bait_label.config(text=str(self.bait))
         self.save_config()
     
     def toggle_bot(self):
@@ -907,6 +937,8 @@ class BotGUI:
         self.bot.on_status_update = self.add_status
         self.bot.on_stats_update = self.update_stats
         self.bot.on_pause_toggle = self.on_bot_pause_toggle
+        self.bot.on_bait_update = self.update_bait_from_bot
+        self.bot.on_bot_stop = self.on_bot_stopped
         
         self.bot.running = True
         self.bot_thread = threading.Thread(target=self.bot.start, daemon=True)
@@ -934,6 +966,13 @@ class BotGUI:
             self.update_button_state()
             self.window_combo.config(state="disabled")
             self.reset_btn.config(state=tk.DISABLED)
+    
+    def on_bot_stopped(self):
+        """Updates UI when bot stops running."""
+        self.bot = None
+        self.update_button_state()
+        self.window_combo.config(state="readonly")
+        self.reset_btn.config(state=tk.NORMAL)
     
     def run(self):
         """Starts the GUI application."""
