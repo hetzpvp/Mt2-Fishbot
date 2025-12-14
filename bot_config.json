@@ -1,6 +1,17 @@
 {
   "human_like_clicking": false,
   "quick_skip": true,
-  "bait": 0,
-  "selected_window": " - MT2Portugalia"
+  "sound_alert_on_finish": true,
+  "bait_keys": [
+    "1",
+    "2",
+    "3",
+    "4",
+    "F1",
+    "F2",
+    "F3",
+    "F4"
+  ],
+  "bait": 1558,
+  "selected_window": " - MT2Portugalia (1)"
 }

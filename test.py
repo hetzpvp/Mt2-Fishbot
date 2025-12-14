@@ -3,6 +3,7 @@ import numpy as np
 import time
 import pyautogui
 from mss import mss
+from PIL import Image, ImageTk
 import threading
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
@@ -14,14 +15,36 @@ import json
 import os
 import winsound
 try:
-    from pynput import keyboard
+    from pynput import keyboard, mouse
     from pynput.keyboard import Controller, Key
+    mouse_controller = mouse.Controller()
 except ImportError:
     print("ERROR: pynput not installed!")
     print("Install with: pip install pynput")
     keyboard = None
+    mouse = None
     Controller = None
     Key = None
+    mouse_controller = None
+
+def play_rickroll_beep():
+    """Plays a Rick Roll-themed beep sequence (intro)."""
+    melody = [
+        (554, 600),   # C5s - strong opening
+        (622, 1000),  # E5f - longer note
+        (622, 600),   # E5f
+        (698, 600),   # F5
+        (831, 100),   # A5f - quick notes
+        (740, 100),   # F5s
+        (698, 100),   # F5
+        (622, 100),   # E5f
+        (554, 600),   # C5s
+        (622, 800),   # E5f - held note
+        (415, 400),   # A4f - step down
+        (415, 200),   # A4f
+    ]
+    for frequency, duration in melody:
+        winsound.Beep(frequency, duration)
 
 class WindowManager:
     """Manages window detection and focus for the bot"""
@@ -93,9 +116,30 @@ class WindowManager:
     def select_window(self, window: gw.Win32Window):
         """Selects and activates a window"""
         self.selected_window = window
+        self.activate_window()
+    
+    def activate_window(self):
+        """Activates and brings the selected window to focus"""
+        if not self.selected_window:
+            return
         try:
-            window.activate()
-            time.sleep(0.5)
+            # Try to activate the window multiple times for reliability
+            for attempt in range(3):
+                try:
+                    # Restore window if minimized
+                    if self.selected_window.isMinimized:
+                        self.selected_window.restore()
+                        time.sleep(0.2)
+                    
+                    # Activate the window
+                    self.selected_window.activate()
+                    time.sleep(0.3)
+                    break
+                except Exception:
+                    if attempt < 2:
+                        time.sleep(0.2)
+                    else:
+                        raise
         except Exception as e:
             print(f"Error activating window: {e}")
     
@@ -189,7 +233,7 @@ class FishDetector:
 class FishingBot:
     """Main bot that plays the fishing minigame"""
     
-    def __init__(self, region: GameRegion, config: dict, window_manager: WindowManager, bait_counter: int = 800):
+    def __init__(self, region: GameRegion, config: dict, window_manager: WindowManager, bait_counter: int = 800, bait_keys: list = None):
         self.region = region
         self.config = config
         self.window_manager = window_manager
@@ -200,6 +244,7 @@ class FishingBot:
         self.hits = 0
         self.total_games = 0
         self.bait_counter = bait_counter  # Current bait count
+        self.bait_keys = bait_keys if bait_keys else ['1', '2', '3', '4']  # Selected bait keys
         self.region_auto_calibrated = False  # Track if region has been auto-calibrated
         self.consecutive_failures = 0  # Track consecutive minigame detection failures
         
@@ -211,9 +256,12 @@ class FishingBot:
         self.on_bot_stop = None  # Callback when bot stops
         
         # Setup keyboard listener for pause
+        self.keyboard_controller = None
         if keyboard:
             self.key_listener = keyboard.Listener(on_press=self.on_key_press)
             self.key_listener.start()
+            if Controller:
+                self.keyboard_controller = Controller()
         
     def capture_full_window(self) -> np.ndarray:
         """Captures the entire game window for initial detection."""
@@ -273,16 +321,16 @@ class FishingBot:
             return np.zeros((100, 100, 3), dtype=np.uint8)
     
     def click_at(self, x: int, y: int, description: str = ""):
-        """Clicks at coordinates relative to the game region."""
+        """Clicks at coordinates relative to the game region without moving mouse cursor."""
         screen_x, screen_y = self.window_manager.convert_to_absolute_coords(
             self.region.left + x, self.region.top + y
         )
         
-        if self.config.get('human_like_clicking', True):
-            screen_x += np.random.randint(-2, 3)
-            screen_y += np.random.randint(-2, 3)
-        
-        pyautogui.click(screen_x, screen_y)
+        try:
+            pyautogui.click(screen_x, screen_y)
+        except Exception as e:
+            if self.on_status_update:
+                self.on_status_update(f"Click error: {e}")
         
         if description and self.on_status_update:
             self.on_status_update(description)
@@ -304,20 +352,20 @@ class FishingBot:
     def on_key_press(self, key):
         """
         Handles keyboard input for bot control.
-        F1 key toggles pause/resume state of the bot.
+        F5 key toggles pause/resume state of the bot.
         
         Args:
             key: The key pressed (from pynput keyboard listener)
         """
         try:
-            if key == keyboard.Key.f1:
+            if key == keyboard.Key.f5:
                 # Toggle pause state
                 self.paused = not self.paused
                 status = "PAUSED" if self.paused else "RESUMED"
                 
                 # Update status in GUI
                 if self.on_status_update:
-                    self.on_status_update(f"Bot {status} (F1 pressed)")
+                    self.on_status_update(f"Bot {status} (F5 pressed)")
                 
                 # Notify GUI of pause state change
                 if self.on_pause_toggle:
@@ -334,31 +382,46 @@ class FishingBot:
         return distance < radius
     
     def get_bait_key(self, bait_count: int) -> str:
-        """Determines which keyboard key to press based on bait counter."""
-        if bait_count > 600:
+        """Determines which keyboard key to press based on bait counter and selected keys."""
+        if not self.bait_keys:
             return '1'
-        elif bait_count > 400:
-            return '2'
-        elif bait_count > 200:
-            return '3'
-        else:
-            return '4'
+        
+        num_keys = len(self.bait_keys)
+        bait_per_key = 200
+        
+        # Calculate which key index to use based on bait count
+        # Keys are used from first to last as bait depletes
+        for i, key in enumerate(self.bait_keys):
+            threshold = (num_keys - i - 1) * bait_per_key
+            if bait_count > threshold:
+                return key
+        
+        # If bait count is very low, use the last key
+        return self.bait_keys[-1]
+    
+    def get_tier_thresholds(self) -> list:
+        """Returns list of tier thresholds based on selected keys."""
+        num_keys = len(self.bait_keys)
+        # Create thresholds: e.g., for 4 keys: [600, 400, 200, 0]
+        return [(num_keys - i - 1) * 200 for i in range(num_keys)]
     
     def adjust_bait_tier(self):
-        """Adjusts bait counter to next lower tier when 5 consecutive failures occur."""
-        if self.bait_counter > 600:
-            self.bait_counter = 600
-        elif self.bait_counter > 400:
-            self.bait_counter = 400
-        elif self.bait_counter > 200:
-            self.bait_counter = 200
+        """Adjusts bait counter to next lower tier when 2 consecutive failures occur."""
+        thresholds = self.get_tier_thresholds()
+        
+        # Find current tier and drop to next one
+        for threshold in thresholds:
+            if self.bait_counter > threshold:
+                self.bait_counter = threshold
+                break
         else:
+            # Already at or below lowest threshold
             self.bait_counter = 0
         
         self.consecutive_failures = 0
         
         if self.on_status_update:
-            self.on_status_update(f"⚠️ 5 consecutive failures! Bait adjusted to {self.bait_counter}")
+            self.on_status_update(f"2 consecutive failures! Bait adjusted to {self.bait_counter}")
         if self.on_bait_update:
             self.on_bait_update(self.bait_counter)
         if self.on_stats_update:
@@ -366,16 +429,16 @@ class FishingBot:
     
     def press_ctrl_key(self, key: str):
         """Presses CTRL+key combination once."""
+        if not self.keyboard_controller:
+            return
         try:
-            if keyboard and Controller:
-                kb = Controller()
-                kb.press(Key.ctrl)
-                time.sleep(0.05)
-                kb.press(key)
-                time.sleep(0.05)
-                kb.release(key)
-                time.sleep(0.05)
-                kb.release(Key.ctrl)
+            self.keyboard_controller.press(Key.ctrl)
+            time.sleep(0.05)
+            self.keyboard_controller.press(key)
+            time.sleep(0.05)
+            self.keyboard_controller.release(key)
+            time.sleep(0.05)
+            self.keyboard_controller.release(Key.ctrl)
         except Exception as e:
             if self.on_status_update:
                 self.on_status_update(f"Error pressing CTRL+{key}: {e}")
@@ -391,21 +454,36 @@ class FishingBot:
     
     def press_key(self, key: str, description: str = ""):
         """Presses a keyboard key using pynput."""
+        if not self.keyboard_controller:
+            return
         try:
-            if keyboard:
-                keyboard_controller = Controller()
-                
-                if key == 'space':
-                    keyboard_controller.press(Key.space)
-                    time.sleep(0.05)
-                    keyboard_controller.release(Key.space)
-                elif key in ['1', '2', '3', '4']:
-                    keyboard_controller.press(key)
-                    time.sleep(0.05)
-                    keyboard_controller.release(key)
-                
-                if description and self.on_status_update:
-                    self.on_status_update(description)
+            if key == 'space':
+                self.keyboard_controller.press(Key.space)
+                time.sleep(0.05)
+                self.keyboard_controller.release(Key.space)
+            elif key in ('1', '2', '3', '4'):
+                self.keyboard_controller.press(key)
+                time.sleep(0.05)
+                self.keyboard_controller.release(key)
+            elif key.upper() == 'F1':
+                self.keyboard_controller.press(Key.f1)
+                time.sleep(0.05)
+                self.keyboard_controller.release(Key.f1)
+            elif key.upper() == 'F2':
+                self.keyboard_controller.press(Key.f2)
+                time.sleep(0.05)
+                self.keyboard_controller.release(Key.f2)
+            elif key.upper() == 'F3':
+                self.keyboard_controller.press(Key.f3)
+                time.sleep(0.05)
+                self.keyboard_controller.release(Key.f3)
+            elif key.upper() == 'F4':
+                self.keyboard_controller.press(Key.f4)
+                time.sleep(0.05)
+                self.keyboard_controller.release(Key.f4)
+            
+            if description and self.on_status_update:
+                self.on_status_update(description)
         except Exception as e:
             if self.on_status_update:
                 self.on_status_update(f"Error pressing key '{key}': {e}")
@@ -447,6 +525,15 @@ class FishingBot:
     
     def play_game(self):
         """Main game loop implementing the fishing minigame workflow."""
+        # Reset bait if starting with 0 or negative bait
+        max_bait = len(self.bait_keys) * 200
+        if self.bait_counter <= 0:
+            self.bait_counter = max_bait
+            if self.on_bait_update:
+                self.on_bait_update(self.bait_counter)
+            if self.on_status_update:
+                self.on_status_update(f"Bait counter was 0! Reset to {max_bait}.")
+        
         if self.on_status_update:
             self.on_status_update(f"Bot started! Bait: {self.bait_counter}")
         
@@ -467,14 +554,13 @@ class FishingBot:
                 if not minigame_detected:
                     self.consecutive_failures += 1
                     if self.on_status_update:
-                        self.on_status_update(f"Minigame not detected ({self.consecutive_failures}/5)")
+                        self.on_status_update(f"Minigame not detected ({self.consecutive_failures}/2)")
                     
-                    if self.consecutive_failures >= 3:
+                    if self.consecutive_failures >= 2:
                         self.adjust_bait_tier()
                         if self.bait_counter <= 0:
                             if self.on_status_update:
                                 self.on_status_update("Bait depleted after consecutive failures. Stopping bot.")
-                            winsound.Beep(1000, 500)  # Beep at 1000Hz for 500ms
                             self.running = False
                             if self.on_bot_stop:
                                 self.on_bot_stop()
@@ -488,30 +574,37 @@ class FishingBot:
                 self.consecutive_failures = 0
                 
                 minigame_active = True
+                capture = self.capture_screen
+                detect_window = self.detector.detect_fishing_window
+                find_fish = self.detector.find_fish
+                human_like = self.config.get('human_like_clicking', True)
+                
                 while self.running and minigame_active:
                     if self.paused:
                         time.sleep(0.1)
                         continue
                     
-                    time.sleep(np.random.uniform(0.15, 0.3) if self.config.get('human_like_clicking', True) else 0)
+                    if human_like:
+                        time.sleep(np.random.uniform(0.15, 0.3))
                     try:
-                        frame = self.capture_screen()
+                        frame = capture()
                         
-                        if not self.detector.detect_fishing_window(frame):
+                        if not detect_window(frame):
                             minigame_active = False
                             self.total_games += 1
                             self.bait_counter -= 1
                             
                             if self.on_status_update:
                                 self.on_status_update(f"Game finished. Total: {self.total_games}, Bait: {self.bait_counter}")
+                            if self.on_bait_update:
+                                self.on_bait_update(self.bait_counter)
                             if self.on_stats_update:
                                 self.on_stats_update(0, self.total_games)
                             break
                         
-                        fish_pos = self.detector.find_fish(frame)
+                        fish_pos = find_fish(frame)
                         if fish_pos:
-                            fx, fy = fish_pos
-                            self.click_fish(fx, fy)
+                            self.click_fish(*fish_pos)
                             
                     except Exception as e:
                         if self.on_status_update:
@@ -532,8 +625,8 @@ class FishingBot:
         
         if self.on_status_update:
             self.on_status_update(f"Bot finished! Total games: {self.total_games}")
-        if self.bait_counter <= 0:
-            winsound.Beep(1000, 500)  # Beep at 1000Hz for 500ms
+        if self.bait_counter <= 0 and self.config.get('sound_alert_on_finish', True):
+            play_rickroll_beep()
         self.running = False
         if self.on_bot_stop:
             self.on_bot_stop()
@@ -556,9 +649,18 @@ class BotGUI:
     
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Metin2 Fishing Bot")
-        self.root.geometry("650x1000")
-        self.root.resizable(True, True)
+        self.root.title("MT2 Fishing Bot by boristei")
+        self.root.geometry("500x600")
+        self.root.resizable(False, False)
+        self.root.configure(bg="#000000")
+        
+        # Try to load and set window icon
+        icon_path = os.path.join(os.path.dirname(__file__), "monkey.ico")
+        if os.path.exists(icon_path):
+            try:
+                self.root.iconbitmap(icon_path)
+            except Exception as e:
+                print(f"Error loading icon: {e}")
         
         self.window_manager = WindowManager()
         self.bot: Optional[FishingBot] = None
@@ -569,6 +671,8 @@ class BotGUI:
         
         self.config = {
             'human_like_clicking': True,
+            'quick_skip': True,
+            'sound_alert_on_finish': True,
         }
         
         # Bait counter
@@ -586,51 +690,98 @@ class BotGUI:
         style = ttk.Style()
         style.theme_use('clam')
         
-        # Header
-        header = tk.Frame(self.root, bg="#000000", height=80)
+        # Try to load and display GIF
+        gif_path = os.path.join(os.path.dirname(__file__), "monkey-eating.gif")
+        self.photo_images = []
+        self.current_frame = 0
+        self.gif_label_left = None
+        self.gif_label_right = None
+        
+        if os.path.exists(gif_path):
+            try:
+                img = Image.open(gif_path)
+                # Extract all frames from the GIF
+                for frame_index in range(img.n_frames):
+                    img.seek(frame_index)
+                    frame = img.convert("RGBA")
+                    frame.thumbnail((200, 120), Image.Resampling.LANCZOS)
+                    self.photo_images.append(ImageTk.PhotoImage(frame))
+            except Exception as e:
+                print(f"Error loading GIF: {e}")
+        
+        # Header (always created)
+        header = tk.Frame(self.root, bg="#000000", height=100 if self.photo_images else 45)
         header.pack(fill=tk.X)
         header.pack_propagate(False)
         
-        title = tk.Label(header, text="Fishing bot by borist", 
-                        font=("Arial", 20, "bold"), 
+        # Header content frame
+        header_content = tk.Frame(header, bg="#000000")
+        header_content.pack(pady=5)
+        
+        # Left GIF (only if loaded)
+        if self.photo_images:
+            self.gif_label_left = tk.Label(header_content, image=self.photo_images[0], bg="#000000")
+            self.gif_label_left.pack(side=tk.LEFT, padx=10)
+        
+        # Title and Discord info container
+        title_container = tk.Frame(header_content, bg="#000000")
+        title_container.pack(side=tk.LEFT, padx=10)
+        
+        # Title (always shown)
+        title = tk.Label(title_container, text="MT2 Fishing bot", 
+                        font=("Courier New", 16, "bold"), 
                         bg="#000000", fg="#FFD700")
-        title.pack(pady=15)
+        title.pack(anchor=tk.CENTER)
+        
+        # Discord info
+        discord_label = tk.Label(title_container, text="Discord: boristei", 
+                                font=("Courier New", 10), 
+                                bg="#000000", fg="#FFD700")
+        discord_label.pack(anchor=tk.CENTER)
+        
+        # Right GIF (only if loaded)
+        if self.photo_images:
+            self.gif_label_right = tk.Label(header_content, image=self.photo_images[0], bg="#000000")
+            self.gif_label_right.pack(side=tk.LEFT, padx=10)
+            
+            # Start GIF animation (only if GIFs loaded)
+            self.animate_gif()
         
         # Main container
         main = tk.Frame(self.root, bg="#1a1a1a")
-        main.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        main.pack(fill=tk.BOTH, expand=True, padx=8, pady=5)
         
         # Process & Window Selection Section
         process_frame = tk.LabelFrame(main, text="Process & Window Selection", 
-                                     font=("Arial", 12, "bold"),
+                                     font=("Courier New", 10, "bold"),
                                      bg="#2a2a2a", fg="#FFD700",
-                                     padx=10, pady=10)
-        process_frame.pack(fill=tk.X, pady=5)
+                                     padx=8, pady=5)
+        process_frame.pack(fill=tk.X, pady=3)
         
         tk.Label(process_frame, text="Select Window:", 
                 bg="#2a2a2a", fg="#ffffff",
-                font=("Arial", 10)).pack(side=tk.LEFT, padx=5)
+                font=("Courier New", 9)).pack(side=tk.LEFT, padx=3)
         
         self.window_var = tk.StringVar()
         self.window_combo = ttk.Combobox(process_frame, textvariable=self.window_var, 
-                                         state="readonly", width=45)
-        self.window_combo.pack(side=tk.LEFT, padx=5)
+                                         state="readonly", width=40)
+        self.window_combo.pack(side=tk.LEFT, padx=3)
         
         tk.Button(process_frame, text="Refresh",
                  command=self.refresh_windows,
                  bg="#2a2a2a", fg="#FFD700",
                  activebackground="#3a3a3a", activeforeground="#FFD700",
-                 font=("Arial", 10),
+                 font=("Courier New", 9),
                  cursor="hand2",
                  relief=tk.FLAT,
-                 padx=10, pady=2).pack(side=tk.LEFT, padx=5)
+                 padx=8, pady=1).pack(side=tk.LEFT, padx=3)
         
         # Bot Configuration Section
         config_frame = tk.LabelFrame(main, text="Bot Configuration", 
-                                    font=("Arial", 12, "bold"),
+                                    font=("Courier New", 10, "bold"),
                                     bg="#2a2a2a", fg="#FFD700",
-                                    padx=10, pady=10)
-        config_frame.pack(fill=tk.X, pady=5)
+                                    padx=8, pady=5)
+        config_frame.pack(fill=tk.X, pady=3)
         
         # Human-like clicking
         self.human_like_var = tk.BooleanVar(value=self.config.get('human_like_clicking', True))
@@ -640,8 +791,8 @@ class BotGUI:
                                     bg="#2a2a2a", fg="#ffffff",
                                     selectcolor="#1a1a1a",
                                     activebackground="#2a2a2a",
-                                    font=("Arial", 10))
-        human_check.pack(anchor=tk.W, pady=5)
+                                    font=("Courier New", 9))
+        human_check.pack(anchor=tk.W, pady=2)
         
         # Quick skip checkbox
         self.quick_skip_var = tk.BooleanVar(value=self.config.get('quick_skip', False))
@@ -651,8 +802,69 @@ class BotGUI:
                                          bg="#2a2a2a", fg="#ffffff",
                                          selectcolor="#1a1a1a",
                                          activebackground="#2a2a2a",
-                                         font=("Arial", 10))
-        quick_skip_check.pack(anchor=tk.W, pady=5)
+                                         font=("Courier New", 9))
+        quick_skip_check.pack(anchor=tk.W, pady=2)
+        
+        # Sound alert checkbox
+        self.sound_alert_var = tk.BooleanVar(value=self.config.get('sound_alert_on_finish', True))
+        sound_alert_check = tk.Checkbutton(config_frame, 
+                                          text="No bait alert",
+                                          variable=self.sound_alert_var,
+                                          bg="#2a2a2a", fg="#ffffff",
+                                          selectcolor="#1a1a1a",
+                                          activebackground="#2a2a2a",
+                                          font=("Courier New", 9))
+        sound_alert_check.pack(anchor=tk.W, pady=2)
+        
+        # Bait Keys Selection Section
+        bait_keys_frame = tk.LabelFrame(config_frame, text="Bait Keys (200 bait each)", 
+                                        font=("Courier New", 9),
+                                        bg="#2a2a2a", fg="#FFD700",
+                                        padx=4, pady=3)
+        bait_keys_frame.pack(fill=tk.X, pady=2)
+        
+        # Get saved bait keys or default to ['1', '2', '3', '4']
+        saved_bait_keys = self.config.get('bait_keys', ['1', '2', '3', '4'])
+        
+        # Number keys row
+        num_keys_frame = tk.Frame(bait_keys_frame, bg="#2a2a2a")
+        num_keys_frame.pack(fill=tk.X)
+        
+        self.bait_key_vars = {}
+        for key in ['1', '2', '3', '4']:
+            var = tk.BooleanVar(value=key in saved_bait_keys)
+            self.bait_key_vars[key] = var
+            cb = tk.Checkbutton(num_keys_frame, text=key, variable=var,
+                               command=self.update_bait_capacity,
+                               bg="#2a2a2a", fg="#ffffff",
+                               selectcolor="#1a1a1a",
+                               activebackground="#2a2a2a",
+                               font=("Courier New", 9),
+                               width=1)
+            cb.pack(side=tk.LEFT, padx=(1, 18))
+        
+        # Function keys row
+        fn_keys_frame = tk.Frame(bait_keys_frame, bg="#2a2a2a")
+        fn_keys_frame.pack(fill=tk.X)
+        
+        for key in ['F1', 'F2', 'F3', 'F4']:
+            var = tk.BooleanVar(value=key in saved_bait_keys)
+            self.bait_key_vars[key] = var
+            cb = tk.Checkbutton(fn_keys_frame, text=key, variable=var,
+                               command=self.update_bait_capacity,
+                               bg="#2a2a2a", fg="#ffffff",
+                               selectcolor="#1a1a1a",
+                               activebackground="#2a2a2a",
+                               font=("Courier New", 9),
+                               width=1)
+            cb.pack(side=tk.LEFT, padx=(4, 14))
+        
+        # Capacity label
+        self.bait_capacity_label = tk.Label(bait_keys_frame, text="", 
+                                           bg="#2a2a2a", fg="#00ff00",
+                                           font=("Courier New", 8))
+        self.bait_capacity_label.pack(anchor=tk.W, pady=1)
+        self.update_bait_capacity()
         
         # Show status log checkbox
         self.show_log_var = tk.BooleanVar(value=False)
@@ -663,15 +875,15 @@ class BotGUI:
                                        bg="#2a2a2a", fg="#ffffff",
                                        selectcolor="#1a1a1a",
                                        activebackground="#2a2a2a",
-                                       font=("Arial", 10))
-        show_log_check.pack(anchor=tk.W, pady=5)
+                                       font=("Courier New", 9))
+        show_log_check.pack(anchor=tk.W, pady=2)
         
         # Statistics Section
         stats_frame = tk.LabelFrame(main, text="Statistics", 
-                                   font=("Arial", 12, "bold"),
+                                   font=("Courier New", 10, "bold"),
                                    bg="#2a2a2a", fg="#FFD700",
-                                   padx=10, pady=10)
-        stats_frame.pack(fill=tk.X, pady=5)
+                                   padx=8, pady=5)
+        stats_frame.pack(fill=tk.X, pady=3)
         
         stats_grid = tk.Frame(stats_frame, bg="#2a2a2a")
         stats_grid.pack(fill=tk.X)
@@ -679,46 +891,46 @@ class BotGUI:
         # Click attempts
         tk.Label(stats_grid, text="Click Attempts:", 
                 bg="#2a2a2a", fg="#ffffff",
-                font=("Arial", 10)).grid(row=0, column=0, sticky=tk.W, pady=2)
-        self.hits_label = tk.Label(stats_grid, text="0 / 3", 
+                font=("Courier New", 9)).grid(row=0, column=0, sticky=tk.W, pady=1)
+        self.hits_label = tk.Label(stats_grid, text="0", 
                                   bg="#2a2a2a", fg="#FFD700",
-                                  font=("Arial", 10, "bold"))
-        self.hits_label.grid(row=0, column=1, sticky=tk.W, padx=20, pady=2)
+                                  font=("Courier New", 9, "bold"))
+        self.hits_label.grid(row=0, column=1, sticky=tk.W, padx=15, pady=1)
         
         # Bait counter with reset button
         tk.Label(stats_grid, text="Bait:", 
                 bg="#2a2a2a", fg="#ffffff",
-                font=("Arial", 10)).grid(row=1, column=0, sticky=tk.W, pady=2)
+                font=("Courier New", 9)).grid(row=1, column=0, sticky=tk.W, pady=1)
         self.bait_label = tk.Label(stats_grid, text=str(self.bait), 
                                   bg="#2a2a2a", fg="#FFD700",
-                                  font=("Arial", 10, "bold"))
-        self.bait_label.grid(row=1, column=1, sticky=tk.W, padx=20, pady=2)
+                                  font=("Courier New", 9, "bold"))
+        self.bait_label.grid(row=1, column=1, sticky=tk.W, padx=15, pady=1)
         
         self.reset_btn = tk.Button(stats_grid,
                                   text="Reset",
                                   command=self.reset_bait,
-                                  font=("Arial", 9, "bold"),
+                                  font=("Courier New", 8),
                                   bg="#e74c3c", fg="white",
                                   activebackground="#c0392b",
                                   cursor="hand2",
-                                  padx=10, pady=2,
+                                  padx=3, pady=0,
                                   state=tk.NORMAL)
-        self.reset_btn.grid(row=1, column=2, sticky=tk.W, padx=10, pady=2)
+        self.reset_btn.grid(row=1, column=2, sticky=tk.W, padx=8, pady=1)
         
         # Status Log Section
         self.status_frame = tk.LabelFrame(main, text="Status Log", 
-                                    font=("Arial", 12, "bold"),
+                                    font=("Courier New", 10, "bold"),
                                     bg="#2a2a2a", fg="#FFD700",
-                                    padx=10, pady=10)
-        self.status_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+                                    padx=8, pady=5)
+        self.status_frame.pack(fill=tk.BOTH, expand=True, pady=3)
         
         # Status text with scrollbar
         status_scroll = tk.Scrollbar(self.status_frame)
         status_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         
-        self.status_text = tk.Text(self.status_frame, height=5, 
+        self.status_text = tk.Text(self.status_frame, height=4, 
                                    bg="#1a1a1a", fg="#00ff00",
-                                   font=("Courier", 9),
+                                   font=("Courier", 8),
                                    yscrollcommand=status_scroll.set,
                                    state=tk.DISABLED)
         self.status_text.pack(fill=tk.BOTH, expand=True)
@@ -726,17 +938,17 @@ class BotGUI:
         
         # Control Button (combined Start/Pause)
         button_frame = tk.Frame(main, bg="#1a1a1a")
-        button_frame.pack(fill=tk.X, pady=10)
+        button_frame.pack(fill=tk.X, pady=5)
         
         self.control_btn = tk.Button(button_frame, 
                                      text="▶ Start",
                                      command=self.toggle_bot,
-                                     font=("Arial", 14, "bold"),
+                                     font=("Courier New", 12, "bold"),
                                      bg="#2ecc71", fg="white",
                                      activebackground="#27ae60",
                                      cursor="hand2",
                                      state=tk.NORMAL,
-                                     padx=50, pady=15)
+                                     padx=40, pady=10)
         self.control_btn.pack(side=tk.LEFT, expand=True, padx=5)
         
         self.add_status("Welcome! Select a window and click Start to begin.")
@@ -762,31 +974,31 @@ class BotGUI:
         donations_frame.pack(fill=tk.X, side=tk.BOTTOM)
         
         donations_text_frame = tk.Frame(donations_frame, bg="#000000")
-        donations_text_frame.pack(pady=5)
+        donations_text_frame.pack(pady=2)
         
         self.btc_address = "3AGrrTf1v9QZsMPEoezYTRbf9JyW4nQtHu"
         donations_label = tk.Label(donations_text_frame, 
                                   text=f"Donations in BTC: {self.btc_address}",
-                                  font=("Arial", 12, "bold"),
+                                  font=("Courier New", 9),
                                   bg="#000000", fg="#FFD700",
                                   wraplength=600, justify=tk.CENTER)
-        donations_label.pack(side=tk.LEFT, padx=5)
+        donations_label.pack(side=tk.LEFT, padx=3)
         
         copy_btn = tk.Button(donations_text_frame,
                             text="📋",
                             command=self.copy_btc_address,
-                            font=("Arial", 12),
+                            font=("Courier New", 10),
                             bg="#000000", fg="#FFD700",
                             activebackground="#1a1a1a", activeforeground="#FFD700",
                             relief=tk.FLAT,
                             cursor="hand2",
-                            padx=5, pady=0)
+                            padx=3, pady=0)
         copy_btn.pack(side=tk.LEFT, padx=2)
     
     def load_config(self):
         """
         Loads configuration from the config file if it exists.
-        Restores human_like_clicking, quick_skip, bait counter, and window selection.
+        Restores human_like_clicking, quick_skip, bait counter, bait keys, and window selection.
         """
         if os.path.exists(self.config_file):
             try:
@@ -797,6 +1009,11 @@ class BotGUI:
                         self.config['human_like_clicking'] = saved_config['human_like_clicking']
                     if 'quick_skip' in saved_config:
                         self.config['quick_skip'] = saved_config['quick_skip']
+                    if 'sound_alert_on_finish' in saved_config:
+                        self.config['sound_alert_on_finish'] = saved_config['sound_alert_on_finish']
+                    # Restore bait keys
+                    if 'bait_keys' in saved_config:
+                        self.config['bait_keys'] = saved_config['bait_keys']
                     # Restore bait counter
                     if 'bait' in saved_config:
                         self.bait = saved_config['bait']
@@ -814,9 +1031,14 @@ class BotGUI:
         Saves human_like_clicking, quick_skip, bait counter, and selected window.
         """
         try:
+            # Get selected bait keys
+            selected_bait_keys = self.get_selected_bait_keys() if hasattr(self, 'bait_key_vars') else ['1', '2', '3', '4']
+            
             config_data = {
                 'human_like_clicking': self.config.get('human_like_clicking', True),
                 'quick_skip': self.config.get('quick_skip', False),
+                'sound_alert_on_finish': self.config.get('sound_alert_on_finish', True),
+                'bait_keys': selected_bait_keys,
                 'bait': self.bait,
                 'selected_window': self.window_var.get() if hasattr(self, 'window_var') else None
             }
@@ -824,6 +1046,35 @@ class BotGUI:
                 json.dump(config_data, f, indent=2)
         except Exception as e:
             print(f"Error saving config: {e}")
+    
+    def get_selected_bait_keys(self) -> list:
+        """Returns list of selected bait keys in order."""
+        key_order = ['1', '2', '3', '4', 'F1', 'F2', 'F3', 'F4']
+        return [key for key in key_order if self.bait_key_vars.get(key, tk.BooleanVar(value=False)).get()]
+    
+    def get_max_bait_capacity(self) -> int:
+        """Returns max bait capacity based on selected keys (200 per key)."""
+        return len(self.get_selected_bait_keys()) * 200
+    
+    def update_bait_capacity(self):
+        """Updates the bait capacity label based on selected keys."""
+        selected_keys = self.get_selected_bait_keys()
+        capacity = len(selected_keys) * 200
+        if capacity > 0:
+            self.bait_capacity_label.config(
+                text=f"Max capacity: {capacity} bait ({len(selected_keys)} keys)",
+                fg="#00ff00"
+            )
+            # Reset bait to new capacity
+            self.bait = capacity
+            if hasattr(self, 'bait_label'):
+                self.bait_label.config(text=str(self.bait))
+            self.save_config()
+        else:
+            self.bait_capacity_label.config(
+                text="⚠ Select at least one bait key!",
+                fg="#e74c3c"
+            )
         
     def refresh_windows(self):
         """Refreshes the list of available windows"""
@@ -856,26 +1107,36 @@ class BotGUI:
         """Toggles the visibility of the status log."""
         if self.show_log_var.get():
             self.status_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-            self.root.geometry("650x1000")
+            self.root.geometry("500x800")
         else:
             self.status_frame.pack_forget()
-            self.root.geometry("650x600")
+            self.root.geometry("500x600")
+    
+    def animate_gif(self):
+        """Animates the GIF frames."""
+        if self.photo_images and (self.gif_label_left or self.gif_label_right):
+            self.current_frame = (self.current_frame + 1) % len(self.photo_images)
+            if self.gif_label_left:
+                self.gif_label_left.config(image=self.photo_images[self.current_frame])
+            if self.gif_label_right:
+                self.gif_label_right.config(image=self.photo_images[self.current_frame])
+            # Schedule next frame update (50ms for smooth animation)
+            self.root.after(50, self.animate_gif)
     
     def update_stats(self, hits: int, total_games: int):
         """Updates the statistics display with current game progress."""
-        self.hits_label.config(text=f"{hits} / 3")
-        
-        if total_games > self.last_total_games and hits == 0 and self.bait > 0:
-            self.bait -= 1
-            self.bait_label.config(text=str(self.bait))
-            self.last_total_games = total_games
-            self.save_config()
+        self.hits_label.config(text=f"{hits}")
+        self.last_total_games = total_games
     
     def reset_bait(self):
-        """Resets the bait counter to 800"""
-        self.bait = 800
+        """Resets the bait counter to max capacity based on selected keys"""
+        max_bait = self.get_max_bait_capacity()
+        self.bait = max_bait
         self.bait_label.config(text=str(self.bait))
-        self.add_status("Bait counter reset to 800")
+        # Also reset the bot's bait counter if it's running
+        if self.bot:
+            self.bot.bait_counter = max_bait
+        self.add_status(f"Bait counter reset to {max_bait}")
         # Save config when bait is reset
         self.save_config()
     
@@ -900,8 +1161,8 @@ class BotGUI:
         if self.bot and self.bot.paused:
             self.config['human_like_clicking'] = self.human_like_var.get()
             self.config['quick_skip'] = self.quick_skip_var.get()
-            self.window_manager.selected_window.activate()
-            time.sleep(0.3)
+            # Activate window before resuming
+            self.window_manager.activate_window()
             self.bot.paused = False
             self.add_status("Bot resumed")
             self.window_combo.config(state="disabled")
@@ -930,10 +1191,20 @@ class BotGUI:
         
         self.config['human_like_clicking'] = self.human_like_var.get()
         self.config['quick_skip'] = self.quick_skip_var.get()
+        self.config['sound_alert_on_finish'] = self.sound_alert_var.get()
         self.save_config()
         
+        self.add_status(f"Window '{selected_name}' activated")
+        time.sleep(0.5)  # Give window time to focus before starting bot
+        
+        # Get selected bait keys
+        selected_bait_keys = self.get_selected_bait_keys()
+        if not selected_bait_keys:
+            messagebox.showerror("Error", "Please select at least one bait key!")
+            return
+        
         # Pass None region - bot will auto-detect on first fishing window
-        self.bot = FishingBot(None, self.config, self.window_manager, bait_counter=self.bait)
+        self.bot = FishingBot(None, self.config, self.window_manager, bait_counter=self.bait, bait_keys=selected_bait_keys)
         self.bot.on_status_update = self.add_status
         self.bot.on_stats_update = self.update_stats
         self.bot.on_pause_toggle = self.on_bot_pause_toggle
@@ -952,7 +1223,7 @@ class BotGUI:
     def update_button_state(self):
         """Updates the control button text and state based on bot status."""
         if self.bot and self.bot.running and not self.bot.paused:
-            self.control_btn.config(text="⏸ Pause (F1)", bg="#f39c12", activebackground="#e67e22")
+            self.control_btn.config(text="⏸ Pause (F5)", bg="#f39c12", activebackground="#e67e22")
         else:
             self.control_btn.config(text="▶ Start", bg="#2ecc71", activebackground="#27ae60")
     
