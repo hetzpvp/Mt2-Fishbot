@@ -1,5 +1,5 @@
 {
-  "human_like_clicking": false,
+  "human_like_clicking": true,
   "quick_skip": true,
   "sound_alert_on_finish": true,
   "bait_keys": [
@@ -17,7 +17,11 @@
     " - MT2Portugalia (1)",
     " - MT2Portugalia (2)",
     " - MT2Portugalia (3)",
-    " - MT2Portugalia (4)"
+    " - MT2Portugalia (4)",
+    "",
+    "",
+    "",
+    ""
   ],
   "selected_window": " - MT2Portugalia (1)"
 }

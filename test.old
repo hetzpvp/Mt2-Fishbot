@@ -1,44 +1,37 @@
-"""
-MT2 Fishing Bot - Multi-Window Support
-Automated fishing minigame bot for Metin2
-Author: boristei
-"""
-
-# === Standard Library ===
-import os
-import json
-import time
-import threading
-import winsound
-from dataclasses import dataclass
-from typing import Optional, Tuple, List, Dict
-
-# === Third Party ===
 import cv2
 import numpy as np
+import time
 import pyautogui
 from mss import mss
 from PIL import Image, ImageTk
+import threading
+from dataclasses import dataclass
+from typing import Optional, Tuple, List, Dict
 import tkinter as tk
 from tkinter import ttk, messagebox
 import pygetwindow as gw
 import psutil
-
-# === Keyboard/Mouse Control ===
+import json
+import os
+import winsound
 try:
-    from pynput import keyboard
+    from pynput import keyboard, mouse
     from pynput.keyboard import Controller, Key
+    mouse_controller = mouse.Controller()
 except ImportError:
-    print("ERROR: pynput not installed! Install with: pip install pynput")
+    print("ERROR: pynput not installed!")
+    print("Install with: pip install pynput")
     keyboard = None
+    mouse = None
     Controller = None
     Key = None
+    mouse_controller = None
 
-# Thread synchronization for mouse/keyboard - prevents race conditions
+# Global lock for input device access - only one thread can use mouse/keyboard at a time
 input_lock = threading.Lock()
 
-# Max simultaneous game windows
-MAX_WINDOWS = 8
+# Maximum number of simultaneous game windows
+MAX_WINDOWS = 4
 
 def play_rickroll_beep():
     """Plays a Rick Roll-themed beep sequence (intro)."""
@@ -126,6 +119,11 @@ class WindowManager:
         
         return result
     
+    def select_window(self, window: gw.Win32Window):
+        """Selects and activates a window"""
+        self.selected_window = window
+        self.activate_window()
+    
     def activate_window(self, force_activate: bool = False):
         """Activates and brings the selected window to focus"""
         if not self.selected_window:
@@ -175,7 +173,14 @@ class WindowManager:
         except Exception as e:
             print(f"Error getting window rect: {e}")
             return (0, 0, 0, 0)
-
+    
+    def convert_to_absolute_coords(self, rel_x: int, rel_y: int) -> Tuple[int, int]:
+        """Converts relative window coordinates to absolute screen coordinates"""
+        if not self.selected_window:
+            return (rel_x, rel_y)
+        
+        left, top, _, _ = self.get_window_rect()
+        return (left + rel_x, top + rel_y)
 
 @dataclass
 class GameRegion:
@@ -186,16 +191,25 @@ class GameRegion:
     height: int
 
 class FishDetector:
-    """Detects fish and game elements using computer vision (HSV color detection)"""
+    """Detects fish and game elements using computer vision"""
     
     def __init__(self):
-        # HSV color range for fish (blue-ish)
+        # Color ranges for detecting the fish
+        # Calibrated ranges for accurate fish detection
         self.fish_color_lower = np.array([97, 130, 108])
         self.fish_color_upper = np.array([110, 146, 133])
         
-        # HSV color range for minigame window background (cyan)
+        # Color range for the fishing window background
+        # Calibrated ranges for minigame window detection
         self.window_color_lower = np.array([98, 170, 189])
         self.window_color_upper = np.array([106, 255, 250])
+         
+    def detect_fishing_window(self, frame: np.ndarray) -> bool:
+        """Detects if the fishing window is currently active."""
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, self.window_color_lower, self.window_color_upper)
+        pixel_count = cv2.countNonZero(mask)
+        return pixel_count > 10000
     
     def find_fishing_window_bounds(self, frame: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
         """Finds the bounding box of the fishing window. Returns (x, y, width, height) or None."""
@@ -211,6 +225,24 @@ class FishDetector:
         
         if w > 50 and h > 50:
             return (x, y, w, h)
+        return None
+    
+    def find_fish(self, frame: np.ndarray) -> Optional[Tuple[int, int]]:
+        """Finds the fish position in the current frame using color detection."""
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, self.fish_color_lower, self.fish_color_upper)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if not contours:
+            return None
+        
+        largest_contour = max(contours, key=cv2.contourArea)
+        M = cv2.moments(largest_contour)
+        if M["m00"] != 0:
+            cx = int(M["m10"] / M["m00"])
+            cy = int(M["m01"] / M["m00"])
+            return (cx, cy)
+        
         return None
     
     def detect_window_and_fish(self, frame: np.ndarray) -> Tuple[bool, Optional[Tuple[int, int]]]:
@@ -239,32 +271,28 @@ class FishDetector:
      
 
 class FishingBot:
-    """Main bot that plays the fishing minigame - one instance per game window"""
+    """Main bot that plays the fishing minigame"""
     
-    def __init__(self, region: GameRegion, config: dict, window_manager: WindowManager, 
-                 bait_counter: int = 800, bait_keys: list = None, bot_id: int = 0):
-        # Core components
+    def __init__(self, region: GameRegion, config: dict, window_manager: WindowManager, bait_counter: int = 800, bait_keys: list = None, bot_id: int = 0):
         self.region = region
         self.config = config
         self.window_manager = window_manager
         self.detector = FishDetector()
-        self.sct = None  # Screen capture (created per-thread)
-        
-        # State tracking
+        self.sct = None  # Will be created in thread
         self.running = False
         self.paused = False
         self.hits = 0
         self.total_games = 0
-        self.bait_counter = bait_counter
-        self.bait_keys = bait_keys if bait_keys else ['1', '2', '3', '4']
-        self.region_auto_calibrated = False
-        self.consecutive_failures = 0
-        self.bot_id = bot_id
+        self.bait_counter = bait_counter  # Current bait count
+        self.bait_keys = bait_keys if bait_keys else ['1', '2', '3', '4']  # Selected bait keys
+        self.region_auto_calibrated = False  # Track if region has been auto-calibrated
+        self.consecutive_failures = 0  # Track consecutive minigame detection failures
+        self.bot_id = bot_id  # Identifier for this bot instance (0-3)
         
-        # Cached circle values for performance
+        # Cached constants for performance (updated when region changes)
         self._circle_center = None
         self._circle_radius = 67
-        self._circle_radius_sq = 67 * 67
+        self._circle_radius_sq = 67 * 67  # Pre-computed for faster distance check
         
         # Callbacks for GUI updates
         self.on_status_update = None
@@ -342,9 +370,47 @@ class FishingBot:
                 return np.zeros((self.region.height, self.region.width, 3), dtype=np.uint8)
             return np.zeros((100, 100, 3), dtype=np.uint8)
     
+    def click_at(self, x: int, y: int, description: str = ""):
+        """Clicks at coordinates relative to the game region. Uses input lock for thread safety."""
+        screen_x, screen_y = self.window_manager.convert_to_absolute_coords(
+            self.region.left + x, self.region.top + y
+        )
+        
+        # Acquire input lock before using mouse/keyboard
+        with input_lock:
+            try:
+                # Activate window before clicking (skips if already active)
+                self.window_manager.activate_window()
+                # Click immediately - no extra delay
+                pyautogui.click(screen_x, screen_y)
+            except Exception as e:
+                if self.on_status_update:
+                    self.on_status_update(f"[W{self.bot_id+1}] Click error: {e}")
+        
+        if description and self.on_status_update:
+            self.on_status_update(f"[W{self.bot_id+1}] {description}")
+    
+    def click_fish(self, x: int, y: int):
+        """Clicks on the detected fish if it's within the valid clicking circle."""
+        circle_center = (self.region.width // 2, self.region.height // 2)
+        circle_radius = 67
+        
+        if not self.is_fish_in_circle((x, y), (*circle_center, circle_radius)):
+            return
+        
+        self.click_at(x, y, f"Hit #{self.hits + 1}")
+        self.hits += 1
+        
+        if self.on_stats_update:
+            self.on_stats_update(self.bot_id, self.hits, self.total_games, self.bait_counter)
+    
     def atomic_capture_and_click(self) -> Tuple[bool, Optional[Tuple[int, int]]]:
-        """Captures screen and clicks fish if in circle. Two-phase: pre-check then lock+click.
-        Returns: (minigame_active, fish_position_clicked or None)"""
+        """
+        Two-phase approach optimized for performance:
+        1. Quick pre-check WITHOUT lock (avoid contention when no fish)
+        2. Re-capture FRESH position WITH lock before clicking
+        Returns: (window_active, fish_clicked_position or None)
+        """
         try:
             # ========== PHASE 1: Quick pre-check (NO LOCK) ==========
             frame = self.capture_screen()
@@ -377,7 +443,7 @@ class FishingBot:
                 window_active, fish_pos = self.detector.detect_window_and_fish(frame)
                 if not window_active:
                     return (False, None)
-                if not fish_pos or not self. is_fish_in_circle(fish_pos):
+                if not fish_pos or not self.is_fish_in_circle(fish_pos):
                     return (True, None)
                 
                 # Click at FRESH position - inline coordinate conversion
@@ -401,6 +467,30 @@ class FishingBot:
             if self.on_status_update:
                 self.on_status_update(f"[W{self.bot_id+1}] Click error: {e}")
             return (True, None)
+    
+    def on_key_press(self, key):
+        """
+        Handles keyboard input for bot control.
+        F5 key toggles pause/resume state of the bot.
+        
+        Args:
+            key: The key pressed (from pynput keyboard listener)
+        """
+        try:
+            if key == keyboard.Key.f5:
+                # Toggle pause state
+                self.paused = not self.paused
+                status = "PAUSED" if self.paused else "RESUMED"
+                
+                # Update status in GUI
+                if self.on_status_update:
+                    self.on_status_update(f"[W{self.bot_id+1}] Bot {status} (F5 pressed)")
+                
+                # Notify GUI of pause state change
+                if self.on_pause_toggle:
+                    self.on_pause_toggle(self.bot_id, self.paused)
+        except AttributeError:
+            pass
     
     def is_fish_in_circle(self, fish_pos: Tuple[int, int], 
                           circle_info: Tuple[int, int, int] = None) -> bool:
@@ -489,9 +579,9 @@ class FishingBot:
         if self.on_status_update:
             self.on_status_update(f"[W{self.bot_id+1}] Quick skip...")
         self.press_ctrl_key('g')
-        time.sleep(0.15)  # Longer delay for game to process first CTRL+G
+        time.sleep(0.03)
         self.press_ctrl_key('g')
-        time.sleep(0.15)  # Delay after second press before next action
+        time.sleep(0.03)
     
     def press_key(self, key: str, description: str = ""):
         """Presses a keyboard key using pynput. Uses input lock for thread safety."""
@@ -547,8 +637,7 @@ class FishingBot:
                 else:
                     # Use standard detection after calibration
                     frame = self.capture_screen()
-                    window_active, _ = self.detector.detect_window_and_fish(frame)
-                    if window_active:
+                    if self.detector.detect_fishing_window(frame):
                         return True
                 
                 time.sleep(0.05)  # Faster polling for quicker minigame detection
@@ -602,13 +691,8 @@ class FishingBot:
                                 self.on_bot_stop(self.bot_id)
                             break
                     
-                    # Press CTRL+G once per failure to dismount horse if that's the issue
-                    # First failure: try to dismount if on horse
-                    # Second failure: you actually mounted in first attemp and now you need to unmount
-                    if self.on_status_update:
-                        self.on_status_update(f"[W{self.bot_id+1}] Pressing CTRL+G to dismount horse...")
-                    self.press_ctrl_key('g')
-                    time.sleep(0.15)
+                    self.quickskip()
+                    time.sleep(0.05)
                     continue
                 
                 # Reset failure counter on successful minigame detection
@@ -687,12 +771,12 @@ class FishingBot:
 
 
 class BotGUI:
-    """GUI for the fishing bot - supports up to 8 simultaneous windows"""
+    """GUI for the fishing bot - supports up to 4 simultaneous windows"""
     
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("MT2 Fishing Bot by boristei (Multi-Window)")
-        self.root.geometry("600x800")
+        self.root.geometry("600x750")
         self.root.resizable(False, False)
         self.root.configure(bg="#000000")
         
@@ -708,7 +792,7 @@ class BotGUI:
         self.bot: Optional[FishingBot] = None
         self.bot_thread: Optional[threading.Thread] = None
         
-        # Multi-window support: up to 8 bots
+        # Multi-window support: up to 4 bots
         self.bots: Dict[int, FishingBot] = {}  # bot_id -> FishingBot
         self.bot_threads: Dict[int, threading.Thread] = {}  # bot_id -> Thread
         self.window_managers: Dict[int, WindowManager] = {}  # bot_id -> WindowManager
@@ -721,11 +805,6 @@ class BotGUI:
             self.global_key_listener = keyboard.Listener(on_press=self.on_global_key_press)
             self.global_key_listener.start()
         
-        # Cooldown for button presses (1 second between actions)
-        self.last_action_time = 0
-        self.action_cooldown = 3.0  # seconds
-        self.in_cooldown = False  # Flag to prevent button re-enabling during cooldown
-        
         # Config file path in the current working directory
         self.config_file = os.path.join(os.getcwd(), "bot_config.json")
         
@@ -737,6 +816,7 @@ class BotGUI:
         
         # Bait counter
         self.bait = 800
+        self.last_total_games = 0  # Track previous game count to detect new games
         
         # Load config from file if it exists
         self.load_config()
@@ -811,7 +891,7 @@ class BotGUI:
         main.pack(fill=tk.BOTH, expand=True, padx=8, pady=5)
         
         # Multi-Window Selection Section
-        windows_frame = tk.LabelFrame(main, text="Game Windows (up to 8)", 
+        windows_frame = tk.LabelFrame(main, text="Game Windows (up to 4)", 
                                      font=("Courier New", 10, "bold"),
                                      bg="#2a2a2a", fg="#FFD700",
                                      padx=8, pady=5)
@@ -851,8 +931,6 @@ class BotGUI:
             combo = ttk.Combobox(row_frame, textvariable=self.window_selections[i], 
                                 state="readonly", width=32)
             combo.pack(side=tk.LEFT, padx=2)
-            # Bind selection change event to update bait display
-            combo.bind("<<ComboboxSelected>>", lambda event, idx=i: self.on_window_selected(idx))
             self.window_combos[i] = combo
             
             # Status indicator
@@ -878,6 +956,10 @@ class BotGUI:
             
             # Initialize stats
             self.window_stats[i] = {'hits': 0, 'games': 0, 'bait': self.bait}
+        
+        # Keep old window_var for compatibility
+        self.window_var = self.window_selections[0]
+        self.window_combo = self.window_combos[0]
         
         # Bot Configuration Section
         config_frame = tk.LabelFrame(main, text="Bot Configuration", 
@@ -969,17 +1051,6 @@ class BotGUI:
         self.bait_capacity_label.pack(anchor=tk.W, pady=1)
         self.update_bait_capacity()
         
-        # Reset All Bait button
-        self.reset_btn = tk.Button(bait_keys_frame,
-                                  text="Reset All Bait",
-                                  command=self.reset_bait,
-                                  font=("Courier New", 8),
-                                  bg="#e74c3c", fg="white",
-                                  activebackground="#c0392b",
-                                  cursor="hand2",
-                                  padx=3, pady=2)
-        self.reset_btn.pack(anchor=tk.W, pady=2)
-        
         # Show status log checkbox
         self.show_log_var = tk.BooleanVar(value=False)
         show_log_check = tk.Checkbutton(config_frame, 
@@ -1021,15 +1092,27 @@ class BotGUI:
         self.active_windows_label.grid(row=0, column=3, sticky=tk.W, padx=5, pady=1)
         
         # Reset all bait button
-        tk.Label(stats_grid, text="Total bait:", 
+        tk.Label(stats_grid, text="Bait (all):", 
                 bg="#2a2a2a", fg="#ffffff",
                 font=("Courier New", 9)).grid(row=1, column=0, sticky=tk.W, pady=1)
-        # Calculate total bait across selected windows only
-        total_bait = sum(self.window_stats[i]['bait'] for i in range(MAX_WINDOWS) if self.window_selections[i].get())
-        self.bait_label = tk.Label(stats_grid, text=str(total_bait), 
+        self.bait_label = tk.Label(stats_grid, text=str(self.bait), 
                                   bg="#2a2a2a", fg="#FFD700",
                                   font=("Courier New", 9, "bold"))
         self.bait_label.grid(row=1, column=1, sticky=tk.W, padx=15, pady=1)
+        
+        self.reset_btn = tk.Button(stats_grid,
+                                  text="Reset All Bait",
+                                  command=self.reset_bait,
+                                  font=("Courier New", 8),
+                                  bg="#e74c3c", fg="white",
+                                  activebackground="#c0392b",
+                                  cursor="hand2",
+                                  padx=3, pady=0,
+                                  state=tk.NORMAL)
+        self.reset_btn.grid(row=1, column=2, columnspan=2, sticky=tk.W, padx=8, pady=1)
+        
+        # Keep hits_label for compatibility
+        self.hits_label = tk.Label(stats_grid, text="0", bg="#2a2a2a", fg="#FFD700")
         
         # Status Log Section
         self.status_frame = tk.LabelFrame(main, text="Status Log", 
@@ -1054,17 +1137,29 @@ class BotGUI:
         button_frame = tk.Frame(main, bg="#1a1a1a")
         button_frame.pack(fill=tk.X, pady=5)
         
-        # Start/Pause button (combines start, pause, resume functionality)
-        self.start_pause_btn = tk.Button(button_frame, 
+        # Start All button
+        self.start_all_btn = tk.Button(button_frame, 
                                        text="▶ Start All",
-                                       command=self.start_or_pause_bots,
+                                       command=self.start_all_bots,
                                        font=("Courier New", 11, "bold"),
                                        bg="#2ecc71", fg="white",
                                        activebackground="#27ae60",
                                        cursor="hand2",
                                        state=tk.NORMAL,
-                                       padx=40, pady=8)
-        self.start_pause_btn.pack(side=tk.LEFT, expand=True, padx=3)
+                                       padx=20, pady=8)
+        self.start_all_btn.pack(side=tk.LEFT, expand=True, padx=3)
+        
+        # Pause All button
+        self.pause_all_btn = tk.Button(button_frame, 
+                                       text="⏸ Pause All (F5)",
+                                       command=self.pause_all_bots,
+                                       font=("Courier New", 11, "bold"),
+                                       bg="#f39c12", fg="white",
+                                       activebackground="#e67e22",
+                                       cursor="hand2",
+                                       state=tk.DISABLED,
+                                       padx=20, pady=8)
+        self.pause_all_btn.pack(side=tk.LEFT, expand=True, padx=3)
         
         # Stop All button
         self.stop_all_btn = tk.Button(button_frame, 
@@ -1075,10 +1170,13 @@ class BotGUI:
                                       activebackground="#c0392b",
                                       cursor="hand2",
                                       state=tk.DISABLED,
-                                      padx=40, pady=8)
+                                      padx=20, pady=8)
         self.stop_all_btn.pack(side=tk.LEFT, expand=True, padx=3)
         
-        self.add_status("Welcome! Select up to 8 windows and click Start All to begin.")
+        # Keep control_btn for compatibility
+        self.control_btn = self.start_all_btn
+        
+        self.add_status("Welcome! Select up to 4 windows and click Start All to begin.")
         self.add_status("Press F5 to pause/resume all bots.")
         
         # Refresh windows list after UI is fully initialized
@@ -1091,14 +1189,7 @@ class BotGUI:
                 for i, prev_win in enumerate(self.previous_windows):
                     if i < MAX_WINDOWS and prev_win and prev_win in current_windows:
                         self.window_selections[i].set(prev_win)
-                        # Update bait label for restored window
-                        self.window_stats[i]['bait'] = self.bait
-                        self.window_bait_labels[i].config(text=f"B:{self.bait}")
                         self.add_status(f"Restored window {i+1}: {prev_win}")
-                # Update total bait label after restoring windows
-                total_bait = sum(self.window_stats[i]['bait'] for i in range(MAX_WINDOWS) if self.window_selections[i].get())
-                if hasattr(self, 'bait_label'):
-                    self.bait_label.config(text=str(total_bait))
             except Exception as e:
                 print(f"Error restoring window selection: {e}")
         
@@ -1214,41 +1305,14 @@ class BotGUI:
             )
             # Reset bait to new capacity
             self.bait = capacity
-            
-            # Update bait counters for selected windows only
-            for i in range(MAX_WINDOWS):
-                self.window_stats[i]['bait'] = capacity
-                # Only update label if window is selected
-                if self.window_selections[i].get():
-                    if i in self.window_bait_labels:
-                        self.window_bait_labels[i].config(text=f"B:{capacity}")
-            
-            # Update total bait label with sum of selected windows only
             if hasattr(self, 'bait_label'):
-                total_bait = sum(self.window_stats[i]['bait'] for i in range(MAX_WINDOWS) if self.window_selections[i].get())
-                self.bait_label.config(text=str(total_bait))
-            
+                self.bait_label.config(text=str(self.bait))
             self.save_config()
         else:
-            # No keys selected - set bait to 0
-            self.bait = 0
             self.bait_capacity_label.config(
                 text="⚠ Select at least one bait key!",
                 fg="#e74c3c"
             )
-            if hasattr(self, 'bait_label'):
-                self.bait_label.config(text="0")
-            # Reset all window bait displays - selected windows show B:0, unselected show B:---
-            for i in range(MAX_WINDOWS):
-                self.window_stats[i]['bait'] = 0
-                if i in self.window_bait_labels:
-                    if self.window_selections[i].get():
-                        # Selected window - show B:0
-                        self.window_bait_labels[i].config(text="B:0")
-                    else:
-                        # Unselected window - show B:---
-                        self.window_bait_labels[i].config(text="B:---")
-            self.save_config()
         
     def refresh_windows(self):
         """Refreshes the list of available windows for all window combos"""
@@ -1292,36 +1356,7 @@ class BotGUI:
             self.root.geometry("600x900")
         else:
             self.status_frame.pack_forget()
-            self.root.geometry("600x800")
-    
-    def on_window_selected(self, window_id: int):
-        """Updates bait display when a window is selected."""
-        selected_name = self.window_selections[window_id].get()
-        
-        # Check if this window is already selected in another slot
-        if selected_name:
-            for i in range(MAX_WINDOWS):
-                if i != window_id and self.window_selections[i].get() == selected_name:
-                    # Window already selected elsewhere, prevent duplicate
-                    self.window_selections[window_id].set("")
-                    self.add_status(f"Window '{selected_name}' is already selected in slot W{i+1}")
-                    # Reset display
-                    self.window_stats[window_id]['bait'] = 0
-                    self.window_bait_labels[window_id].config(text="B:---")
-                    return
-            
-            # Window is selected - update bait to current capacity
-            self.window_stats[window_id]['bait'] = self.bait
-            self.window_bait_labels[window_id].config(text=f"B:{self.bait}")
-        else:
-            # Window is unselected - show --- and reset bait to 0
-            self.window_stats[window_id]['bait'] = 0
-            self.window_bait_labels[window_id].config(text="B:---")
-        
-        # Update total bait label to reflect new sum of selected windows
-        total_bait = sum(self.window_stats[i]['bait'] for i in range(MAX_WINDOWS) if self.window_selections[i].get())
-        if hasattr(self, 'bait_label'):
-            self.bait_label.config(text=str(total_bait))
+            self.root.geometry("600x750")
     
     def animate_gif(self):
         """Animates the GIF frames."""
@@ -1342,57 +1377,21 @@ class BotGUI:
         except AttributeError:
             pass
     
-    def disable_buttons_for_cooldown(self):
-        """Disables all control buttons during cooldown period."""
-        self.in_cooldown = True
-        self.start_pause_btn.config(state=tk.DISABLED)
-        self.stop_all_btn.config(state=tk.DISABLED)
-        # Re-enable buttons after cooldown
-        self.root.after(int(self.action_cooldown * 1000), self.end_cooldown_and_update_buttons)
-    
-    def end_cooldown_and_update_buttons(self):
-        """Ends cooldown period and updates button states."""
-        self.in_cooldown = False
-        self.update_all_button_states()
-    
-    def start_or_pause_bots(self):
-        """Combined Start/Pause/Resume handler - decides action based on current state."""
-        any_running = any(bot.running for bot in self.bots.values()) if self.bots else False
-        
-        if not any_running:
-            # No bots running - start them
-            self.start_all_bots()
-        else:
-            # Bots are running - toggle pause
-            self.toggle_pause_all_bots()
-    
     def toggle_pause_all_bots(self):
         """Toggles pause state for all running bots."""
-        # Check cooldown
-        current_time = time.time()
-        if current_time - self.last_action_time < self.action_cooldown:
-            return
-        self.last_action_time = current_time
-        self.disable_buttons_for_cooldown()
-        
         any_running = any(bot.running for bot in self.bots.values())
         if not any_running:
             return
         
         any_paused = any(bot.paused for bot in self.bots.values() if bot.running)
         
-        for bot_id, bot in self.bots.items():
+        for bot in self.bots.values():
             if bot.running:
                 bot.paused = not any_paused
-                # Update status indicator
-                if bot_id in self.window_status_labels:
-                    if bot.paused:
-                        self.window_status_labels[bot_id].config(text="🟡", fg="#f39c12")
-                    else:
-                        self.window_status_labels[bot_id].config(text="🟢", fg="#00ff00")
         
         status = "PAUSED" if not any_paused else "RESUMED"
         self.add_status(f"All bots {status} (F5)")
+        self.update_all_button_states()
     
     def update_stats(self, bot_id: int, hits: int, total_games: int, bait: int):
         """Updates the statistics display for a specific bot."""
@@ -1409,16 +1408,12 @@ class BotGUI:
         total_all_games = sum(s['games'] for s in self.window_stats.values())
         self.total_games_label.config(text=str(total_all_games))
         
-        # Update total bait across selected windows only
-        total_bait = sum(self.window_stats[i]['bait'] for i in range(MAX_WINDOWS) if self.window_selections[i].get())
-        self.bait_label.config(text=str(total_bait))
-        
         # Count active windows
         active_count = len([b for b in self.bots.values() if b.running])
         self.active_windows_label.config(text=str(active_count))
     
     def reset_bait(self):
-        """Resets the bait counter to max capacity for selected windows, 0 for unselected"""
+        """Resets the bait counter to max capacity for all bots"""
         max_bait = self.get_max_bait_capacity()
         self.bait = max_bait
         self.bait_label.config(text=str(self.bait))
@@ -1430,19 +1425,12 @@ class BotGUI:
             if bot_id in self.window_bait_labels:
                 self.window_bait_labels[bot_id].config(text=f"B:{max_bait}")
         
-        # Reset stats for all windows - selected get max_bait, unselected get 0
+        # Reset stats for windows without bots
         for i in range(MAX_WINDOWS):
             if i not in self.bots:
-                if self.window_selections[i].get():
-                    # Window is selected - reset to max_bait
-                    self.window_stats[i]['bait'] = max_bait
-                    if i in self.window_bait_labels:
-                        self.window_bait_labels[i].config(text=f"B:{max_bait}")
-                else:
-                    # Window is unselected - reset to 0
-                    self.window_stats[i]['bait'] = 0
-                    if i in self.window_bait_labels:
-                        self.window_bait_labels[i].config(text="B:---")
+                self.window_stats[i]['bait'] = max_bait
+                if i in self.window_bait_labels:
+                    self.window_bait_labels[i].config(text=f"B:{max_bait}")
         
         self.add_status(f"All bait counters reset to {max_bait}")
         self.save_config()
@@ -1457,13 +1445,6 @@ class BotGUI:
     
     def start_all_bots(self):
         """Starts bots for all selected windows."""
-        # Check cooldown
-        current_time = time.time()
-        if current_time - self.last_action_time < self.action_cooldown:
-            return
-        self.last_action_time = current_time
-        self.disable_buttons_for_cooldown()
-        
         # Get config
         self.config['human_like_clicking'] = self.human_like_var.get()
         self.config['quick_skip'] = self.quick_skip_var.get()
@@ -1540,20 +1521,38 @@ class BotGUI:
             return
         
         self.add_status(f"Started {started_count} bot(s)")
+        self.update_all_button_states()
         
         # Keep bot reference for compatibility
         if self.bots:
             self.bot = list(self.bots.values())[0]
     
+    def pause_all_bots(self):
+        """Toggles pause state for all running bots."""
+        if not self.bots:
+            return
+        
+        any_running = any(bot.running for bot in self.bots.values())
+        if not any_running:
+            return
+        
+        any_paused = any(bot.paused for bot in self.bots.values() if bot.running)
+        
+        for bot_id, bot in self.bots.items():
+            if bot.running:
+                bot.paused = not any_paused
+                if bot_id in self.window_status_labels:
+                    if bot.paused:
+                        self.window_status_labels[bot_id].config(text="🟡", fg="#f39c12")
+                    else:
+                        self.window_status_labels[bot_id].config(text="🟢", fg="#00ff00")
+        
+        status = "paused" if not any_paused else "resumed"
+        self.add_status(f"All bots {status}")
+        self.update_all_button_states()
+    
     def stop_all_bots(self):
         """Stops all running bots."""
-        # Check cooldown
-        current_time = time.time()
-        if current_time - self.last_action_time < self.action_cooldown:
-            return
-        self.last_action_time = current_time
-        self.disable_buttons_for_cooldown()
-        
         for bot_id, bot in list(self.bots.items()):
             bot.running = False
             bot.stop()
@@ -1565,34 +1564,38 @@ class BotGUI:
         self.bot = None
         
         self.add_status("All bots stopped")
+        self.update_all_button_states()
     
     def update_all_button_states(self):
         """Updates all control buttons based on bot states."""
-        # Don't update buttons during cooldown period
-        if self.in_cooldown:
-            return
-        
         any_running = any(bot.running for bot in self.bots.values()) if self.bots else False
         any_paused = any(bot.paused for bot in self.bots.values() if bot.running) if self.bots else False
         
         if any_running:
-            self.start_pause_btn.config(state=tk.NORMAL)
+            self.start_all_btn.config(state=tk.DISABLED)
+            self.pause_all_btn.config(state=tk.NORMAL)
             self.stop_all_btn.config(state=tk.NORMAL)
             
             if any_paused:
-                # Show Resume button
-                self.start_pause_btn.config(text="▶ Resume All (F5)", bg="#2ecc71", activebackground="#27ae60")
+                self.pause_all_btn.config(text="▶ Resume All", bg="#2ecc71", activebackground="#27ae60")
             else:
-                # Show Pause button
-                self.start_pause_btn.config(text="⏸ Pause All (F5)", bg="#f39c12", activebackground="#e67e22")
+                self.pause_all_btn.config(text="⏸ Pause All (F5)", bg="#f39c12", activebackground="#e67e22")
         else:
-            # No bots running - show Start button
-            self.start_pause_btn.config(state=tk.NORMAL, text="▶ Start All", bg="#2ecc71", activebackground="#27ae60")
+            self.start_all_btn.config(state=tk.NORMAL)
+            self.pause_all_btn.config(state=tk.DISABLED, text="⏸ Pause All (F5)", bg="#f39c12")
             self.stop_all_btn.config(state=tk.DISABLED)
         
         # Update active windows count
         active_count = len([b for b in self.bots.values() if b.running])
         self.active_windows_label.config(text=str(active_count))
+    
+    def toggle_bot(self):
+        """Legacy method - redirects to start_all_bots."""
+        self.start_all_bots()
+    
+    def update_button_state(self):
+        """Updates the control button text and state based on bot status."""
+        self.update_all_button_states()
     
     def on_bot_pause_toggle(self, bot_id: int, is_paused: bool):
         """Updates UI when a bot's pause state changes."""
