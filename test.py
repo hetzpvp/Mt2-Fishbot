@@ -705,8 +705,7 @@ class BotGUI:
                 print(f"Error loading icon: {e}")
         
         self.window_manager = WindowManager()
-        self.bot: Optional[FishingBot] = None
-        self.bot_thread: Optional[threading.Thread] = None
+        self.bot: Optional[FishingBot] = None  # For compatibility
         
         # Multi-window support: up to 8 bots
         self.bots: Dict[int, FishingBot] = {}  # bot_id -> FishingBot
@@ -967,7 +966,6 @@ class BotGUI:
                                            bg="#2a2a2a", fg="#00ff00",
                                            font=("Courier New", 8))
         self.bait_capacity_label.pack(anchor=tk.W, pady=1)
-        self.update_bait_capacity()
         
         # Reset All Bait button
         self.reset_btn = tk.Button(bait_keys_frame,
@@ -1031,6 +1029,9 @@ class BotGUI:
                                   font=("Courier New", 9, "bold"))
         self.bait_label.grid(row=1, column=1, sticky=tk.W, padx=15, pady=1)
         
+        # Now that bait_label exists, update capacity for the first time
+        self.update_bait_capacity()
+        
         # Status Log Section
         self.status_frame = tk.LabelFrame(main, text="Status Log", 
                                     font=("Courier New", 10, "bold"),
@@ -1085,9 +1086,9 @@ class BotGUI:
         self.refresh_windows()
         
         # Restore previously selected windows if they exist
-        if hasattr(self, 'previous_windows') and self.previous_windows:
+        if self.previous_windows:
             try:
-                current_windows = list(self.window_combos[0]['values'])
+                current_windows = set(self.window_combos[0]['values'])
                 for i, prev_win in enumerate(self.previous_windows):
                     if i < MAX_WINDOWS and prev_win and prev_win in current_windows:
                         self.window_selections[i].set(prev_win)
@@ -1097,8 +1098,7 @@ class BotGUI:
                         self.add_status(f"Restored window {i+1}: {prev_win}")
                 # Update total bait label after restoring windows
                 total_bait = sum(self.window_stats[i]['bait'] for i in range(MAX_WINDOWS) if self.window_selections[i].get())
-                if hasattr(self, 'bait_label'):
-                    self.bait_label.config(text=str(total_bait))
+                self.bait_label.config(text=str(total_bait))
             except Exception as e:
                 print(f"Error restoring window selection: {e}")
         
@@ -1215,18 +1215,19 @@ class BotGUI:
             # Reset bait to new capacity
             self.bait = capacity
             
-            # Update bait counters for selected windows only
+            # Update bait counters and labels for all windows
             for i in range(MAX_WINDOWS):
                 self.window_stats[i]['bait'] = capacity
-                # Only update label if window is selected
-                if self.window_selections[i].get():
-                    if i in self.window_bait_labels:
-                        self.window_bait_labels[i].config(text=f"B:{capacity}")
+                # Update label - show capacity if selected, otherwise show B:---
+                is_selected = self.window_selections[i].get()
+                if is_selected:
+                    self.window_bait_labels[i].config(text=f"B:{capacity}")
+                else:
+                    self.window_bait_labels[i].config(text="B:---")
             
             # Update total bait label with sum of selected windows only
-            if hasattr(self, 'bait_label'):
-                total_bait = sum(self.window_stats[i]['bait'] for i in range(MAX_WINDOWS) if self.window_selections[i].get())
-                self.bait_label.config(text=str(total_bait))
+            total_bait = sum(self.window_stats[i]['bait'] for i in range(MAX_WINDOWS) if self.window_selections[i].get())
+            self.bait_label.config(text=str(total_bait))
             
             self.save_config()
         else:
@@ -1236,18 +1237,12 @@ class BotGUI:
                 text="⚠ Select at least one bait key!",
                 fg="#e74c3c"
             )
-            if hasattr(self, 'bait_label'):
-                self.bait_label.config(text="0")
+            self.bait_label.config(text="0")
             # Reset all window bait displays - selected windows show B:0, unselected show B:---
             for i in range(MAX_WINDOWS):
                 self.window_stats[i]['bait'] = 0
-                if i in self.window_bait_labels:
-                    if self.window_selections[i].get():
-                        # Selected window - show B:0
-                        self.window_bait_labels[i].config(text="B:0")
-                    else:
-                        # Unselected window - show B:---
-                        self.window_bait_labels[i].config(text="B:---")
+                is_selected = self.window_selections[i].get()
+                self.window_bait_labels[i].config(text="B:0" if is_selected else "B:---")
             self.save_config()
         
     def refresh_windows(self):
@@ -1258,11 +1253,15 @@ class BotGUI:
             
             # Add empty option at the start to allow unselecting
             window_names_with_empty = [""] + window_names
+            window_names_set = set(window_names)
             
-            # Update all window combos
+            # Update all window combos and preserve current selections if still available
             for i in range(MAX_WINDOWS):
-                if i in self.window_combos:
-                    self.window_combos[i]['values'] = window_names_with_empty
+                current_sel = self.window_selections[i].get()
+                self.window_combos[i]['values'] = window_names_with_empty
+                # Restore selection if it's still available
+                if current_sel and current_sel in window_names_set:
+                    self.window_selections[i].set(current_sel)
             
             if window_names:
                 self.add_status(f"Found {len(window_names)} visible window(s)")
@@ -1298,17 +1297,17 @@ class BotGUI:
         """Updates bait display when a window is selected."""
         selected_name = self.window_selections[window_id].get()
         
-        # Check if this window is already selected in another slot
+        # Check if this window is already selected in another slot (optimized check)
         if selected_name:
-            for i in range(MAX_WINDOWS):
-                if i != window_id and self.window_selections[i].get() == selected_name:
-                    # Window already selected elsewhere, prevent duplicate
-                    self.window_selections[window_id].set("")
-                    self.add_status(f"Window '{selected_name}' is already selected in slot W{i+1}")
-                    # Reset display
-                    self.window_stats[window_id]['bait'] = 0
-                    self.window_bait_labels[window_id].config(text="B:---")
-                    return
+            selected_windows = {self.window_selections[i].get() for i in range(MAX_WINDOWS) if i != window_id}
+            if selected_name in selected_windows:
+                # Window already selected elsewhere, prevent duplicate
+                self.window_selections[window_id].set("")
+                self.add_status(f"Window '{selected_name}' is already selected in another slot")
+                # Reset display
+                self.window_stats[window_id]['bait'] = 0
+                self.window_bait_labels[window_id].config(text="B:---")
+                return
             
             # Window is selected - update bait to current capacity
             self.window_stats[window_id]['bait'] = self.bait
@@ -1320,8 +1319,7 @@ class BotGUI:
         
         # Update total bait label to reflect new sum of selected windows
         total_bait = sum(self.window_stats[i]['bait'] for i in range(MAX_WINDOWS) if self.window_selections[i].get())
-        if hasattr(self, 'bait_label'):
-            self.bait_label.config(text=str(total_bait))
+        self.bait_label.config(text=str(total_bait))
     
     def animate_gif(self):
         """Animates the GIF frames."""
@@ -1421,28 +1419,24 @@ class BotGUI:
         """Resets the bait counter to max capacity for selected windows, 0 for unselected"""
         max_bait = self.get_max_bait_capacity()
         self.bait = max_bait
-        self.bait_label.config(text=str(self.bait))
+        self.bait_label.config(text=str(max_bait))
         
         # Reset all bots' bait counters
         for bot_id, bot in self.bots.items():
             bot.bait_counter = max_bait
             self.window_stats[bot_id]['bait'] = max_bait
-            if bot_id in self.window_bait_labels:
-                self.window_bait_labels[bot_id].config(text=f"B:{max_bait}")
+            self.window_bait_labels[bot_id].config(text=f"B:{max_bait}")
         
-        # Reset stats for all windows - selected get max_bait, unselected get 0
+        # Reset stats for all non-running windows
         for i in range(MAX_WINDOWS):
             if i not in self.bots:
-                if self.window_selections[i].get():
-                    # Window is selected - reset to max_bait
+                is_selected = self.window_selections[i].get()
+                if is_selected:
                     self.window_stats[i]['bait'] = max_bait
-                    if i in self.window_bait_labels:
-                        self.window_bait_labels[i].config(text=f"B:{max_bait}")
+                    self.window_bait_labels[i].config(text=f"B:{max_bait}")
                 else:
-                    # Window is unselected - reset to 0
                     self.window_stats[i]['bait'] = 0
-                    if i in self.window_bait_labels:
-                        self.window_bait_labels[i].config(text="B:---")
+                    self.window_bait_labels[i].config(text="B:---")
         
         self.add_status(f"All bait counters reset to {max_bait}")
         self.save_config()
