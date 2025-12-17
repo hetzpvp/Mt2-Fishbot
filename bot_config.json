@@ -1,15 +1,47 @@
 {
-  "human_like_clicking": false,
+  "human_like_clicking": true,
   "quick_skip": true,
   "sound_alert_on_finish": true,
+  "auto_fish_handling": true,
+  "fish_actions": {
+    "Aal_living.jpg": "keep",
+    "Ayu_living.jpg": "keep",
+    "Barsch_living.jpg": "keep",
+    "Brookforell_living.jpg": "keep",
+    "Carp_living.jpg": "keep",
+    "Goldfish_living.jpg": "keep",
+    "Grasscarp_living.jpg": "keep",
+    "Large_zander_living.jpg": "keep",
+    "Lotusfish_living.jpg": "keep",
+    "Mandarinfish_living.jpg": "keep",
+    "Mirrorcarp_living.jpg": "keep",
+    "Rainbowforell_living.jpg": "keep",
+    "Redfeather_living.jpg": "keep",
+    "Riverforell_living.jpg": "keep",
+    "Salmon_living.jpg": "keep",
+    "Shiri_living.jpg": "keep",
+    "Stint_living.jpg": "keep",
+    "Tenchi_living.jpg": "keep",
+    "Vai_living.jpg": "keep",
+    "Zander_living.jpg": "keep",
+    "Goldring_item.jpg": "keep",
+    "Lucys_ring_item.jpg": "keep",
+    "Refugee_cape_item.jpg": "keep",
+    "Sage_King_Glove_item.jpg": "keep",
+    "Symbol_wise_emperors_item.jpg": "keep",
+    "Catsfish_living.jpg": "keep",
+    "Yabby_living.png": "keep"
+  },
   "bait_keys": [
     "1",
-    "2"
+    "2",
+    "3",
+    "4"
   ],
-  "bait": 400,
+  "bait": 800,
   "selected_windows": [
-    " - MT2Portugalia (1)",
-    " - MT2Portugalia (2)",
+    "",
+    "",
     "",
     "",
     "",
@@ -17,5 +49,5 @@
     "",
     ""
   ],
-  "selected_window": " - MT2Portugalia (1)"
+  "selected_window": ""
 }
