@@ -1,8 +1,8 @@
 {
-  "human_like_clicking": false,
+  "human_like_clicking": true,
   "quick_skip": true,
   "sound_alert_on_finish": true,
-  "auto_fish_handling": true,
+  "auto_fish_handling": false,
   "fish_actions": {
     "Aal_living.jpg": "keep",
     "Ayu_living.jpg": "open",
@@ -29,27 +29,20 @@
     "Refugee_cape_item.jpg": "keep",
     "Sage_King_Glove_item.jpg": "keep",
     "Symbol_wise_emperors_item.jpg": "keep",
-    "Catsfish_living.jpg": "keep",
+    "Catsfish_living.jpg": "open",
     "Yabby_living.png": "keep",
-    "Crab_living.jpg": "keep",
+    "Crab_living.jpg": "open",
     "Kelp_Key_item.jpg": "keep",
     "Snake_head_living.jpg": "keep",
     "Yabby_living.jpg": "keep"
   },
   "bait_keys": [
-    "1",
-    "2",
-    "3",
-    "4",
-    "F1",
-    "F2",
-    "F3",
-    "F4"
+    "1"
   ],
-  "bait": 1600,
+  "bait": 200,
   "selected_windows": [
-    "MT2Portugalia (1)",
-    "MT2Portugalia (2)",
+    "WoM2",
+    "",
     "",
     "",
     "",
@@ -57,5 +50,5 @@
     "",
     ""
   ],
-  "selected_window": "MT2Portugalia (1)"
+  "selected_window": "WoM2"
 }

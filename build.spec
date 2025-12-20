@@ -3,12 +3,13 @@
 # Bundles the executable with the icon and GIF resources
 
 a = Analysis(
-    ['Fishbot by boristei.py'],
+    ['Fishing puzzle player.py'],
     pathex=[],
     binaries=[],
     datas=[
         ('monkey-eating.gif', '.'),
         ('monkey.ico', '.'),
+        ('assets', 'assets'),
     ],
     hiddenimports=[
         'PIL',

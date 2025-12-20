@@ -57,10 +57,10 @@ input_lock = threading.Lock()
 MAX_WINDOWS = 8
 
 # Debug mode - enable/disable IgnoredPositionsWindow
-DEBUG_MODE_EN = False
+DEBUG_MODE_EN = True
 
 # Debug prints - enable/disable verbose debug print statements
-DEBUG_PRINTS = False
+DEBUG_PRINTS = True
 
 def play_rickroll_beep():
     """Plays a Rick Roll-themed beep sequence (intro)."""
@@ -302,7 +302,7 @@ class FishingBot:
         self._inventory_width = 200
         
         # Inventory capture Y offset (skip top 300px of window)
-        self._inventory_y_offset = 300
+        self._inventory_y_offset = 200
         
         # Dead fish tracking: ignored slot positions (10 pixel radius around center)
         self._ignored_positions = set()  # Positions confirmed as dead fish
@@ -386,8 +386,6 @@ class FishingBot:
         If first match is ignored, tries to find another match within same template."""
         templates = self._load_template_cache()
         if not templates:
-            if self.on_status_update and DEBUG_PRINTS:
-                self.on_status_update(f"[W{self.bot_id+1}] [DEBUG] No templates loaded!")
             return None
         
         # Convert inventory to grayscale once
@@ -398,7 +396,7 @@ class FishingBot:
         match_template = cv2.matchTemplate
         minMaxLoc = cv2.minMaxLoc
         TM_CCOEFF_NORMED = cv2.TM_CCOEFF_NORMED
-        CONFIDENCE_THRESHOLD = 0.65  # Lowered from 0.8 for better detection
+        CONFIDENCE_THRESHOLD = 0.80  # Lowered from 0.8 for better detection
         EARLY_EXIT_THRESHOLD = 0.90  # Near-perfect match, skip remaining templates
         
         best_match = None
@@ -435,21 +433,15 @@ class FishingBot:
                         for ix, iy in ignore_positions:
                             if abs(center_x - ix) < 10 and abs(center_y - iy) < 10:
                                 is_ignored = True
-                                if self.on_status_update and DEBUG_PRINTS:
-                                    self.on_status_update(f"[W{self.bot_id+1}] [DEBUG] Instance {match_count} ignored: {filename} @ ({center_x}, {center_y}) conf={max_val:.3f}")
                                 break
                     
                     # If not ignored and better than current best, accept it
                     if not is_ignored and max_val > best_confidence:
                         best_confidence = max_val
                         best_match = (filename, (center_x, center_y))
-                        if self.on_status_update and DEBUG_PRINTS:
-                            self.on_status_update(f"[W{self.bot_id+1}] [DEBUG] Match found (instance {match_count}): {filename} @ ({center_x}, {center_y}) conf={max_val:.3f}")
                         
                         # Early exit on near-perfect match
                         if best_confidence >= EARLY_EXIT_THRESHOLD:
-                            if self.on_status_updat and DEBUG_PRINTS:
-                                self.on_status_update(f"[W{self.bot_id+1}] [DEBUG] Early exit - confidence {best_confidence:.3f} >= {EARLY_EXIT_THRESHOLD}")
                             return best_match
                         break  # Found good match for this template, move to next template
                     
@@ -461,8 +453,6 @@ class FishingBot:
                     result_copy[mask_y1:mask_y2, mask_x1:mask_x2] = -1.0
                     
             except Exception as e:
-                if self.on_status_update and DEBUG_PRINTS:
-                    self.on_status_update(f"[W{self.bot_id+1}] [DEBUG] Template match error for {filename}: {e}")
                 continue
         
         return best_match
@@ -510,107 +500,80 @@ class FishingBot:
         
         return False
     
-    def right_click_item(self, inventory_x: int, inventory_y: int):
-        """Right-clicks on an item in the inventory area.
-        Coordinates are relative to the inventory capture area (which starts at y=300)."""
-        try:
-            win_left, win_top, win_width, win_height = self.window_manager.get_window_rect()
-            
-            # Convert inventory-relative coords to screen coords
-            # Note: inventory_y is relative to captured area which starts at _inventory_y_offset
-            screen_x = win_left + win_width - self._inventory_width + inventory_x
-            screen_y = win_top + self._inventory_y_offset + inventory_y
-            
-            with input_lock:
-                self.window_manager.activate_window(force_activate=True)
-                time.sleep(0.05) 
-                
-                # Right-click sequence
-                pyautogui.moveTo(screen_x, screen_y, _pause=False)
-                time.sleep(0.02)
-                pyautogui.click(button='right', _pause=False)
-                time.sleep(0.1)  # Wait for game to process
-                
-        except Exception as e:
-            if self.on_status_update:
-                self.on_status_update(f"[W{self.bot_id+1}] Error right-clicking item: {e}")
-    
     def handle_caught_item(self):
         """Identifies and handles caught item based on fish_actions config.
         Should be called after a successful catch.
-        After clicking, immediately checks if fish is still there - if so, adds to ignore list."""
-        if not self.config.get('auto_fish_handling', False):
-            if self.on_status_update and DEBUG_PRINTS:
-                self.on_status_update(f"[W{self.bot_id+1}] [DEBUG] Auto fish handling disabled, skipping")
-            return
+        After clicking, immediately checks if fish is still there - if so, adds to ignore list.
         
-        if self.on_status_update:
-            self.on_status_update(f"[W{self.bot_id+1}] [DEBUG] Starting item detection...")
+        IMPORTANT: The entire detection + click sequence must be atomic to prevent
+        another bot from interfering between detection and action."""
+        if not self.config.get('auto_fish_handling', False):
+            return
         
         fish_actions = self.config.get('fish_actions', {})
         if not fish_actions:
-            if self.on_status_update and DEBUG_PRINTS:
-                self.on_status_update(f"[W{self.bot_id+1}] [DEBUG] No fish actions configured, skipping")
             return
         
-        try:
-            # Small delay for item to appear in inventory
-            time.sleep(0.2)
-            
-            # Capture inventory area
-            if self.on_status_update and DEBUG_PRINTS:
-                self.on_status_update(f"[W{self.bot_id+1}] [DEBUG] Capturing inventory area...")
-            inventory_frame = self.capture_inventory_area()
-            if self.on_status_update and DEBUG_PRINTS:
-                self.on_status_update(f"[W{self.bot_id+1}] [DEBUG] Inventory captured: {inventory_frame.shape}")
-            
-            # Identify the item (ignoring known dead fish positions)
-            if self.on_status_update and DEBUG_PRINTS:
-                self.on_status_update(f"[W{self.bot_id+1}] [DEBUG] Running template matching (ignoring {len(self._ignored_positions)} dead fish)...")
-            match = self.identify_item_in_inventory(inventory_frame, ignore_positions=self._ignored_positions)
-                        
-            if not match:
-                if self.on_status_update and DEBUG_PRINTS:
-                    self.on_status_update(f"[W{self.bot_id+1}] [DEBUG] No item matched after retry (no catch or below threshold)")
-                return  # No item found, that's OK (not every catch gives an item)
-            
-            filename, (inv_x, inv_y) = match
-            if self.on_status_update and DEBUG_PRINTS:
-                self.on_status_update(f"[W{self.bot_id+1}] [DEBUG] Matched: {filename} at ({inv_x}, {inv_y})")
-            
-            action = fish_actions.get(filename, 'keep')
-            if self.on_status_update and DEBUG_PRINTS:
-                self.on_status_update(f"[W{self.bot_id+1}] [DEBUG] Action for {filename}: {action}")
-            
-            if action == 'keep':
-                # Item stays in inventory - add to ignore list so we don't process it again
-                # Each bot has its own _ignored_positions set, no lock needed
-                self._ignored_positions.add((inv_x, inv_y))
-                if self.on_status_update:
-                    self.on_status_update(f"[W{self.bot_id+1}] Keeping: {filename.replace('_living.jpg', '').replace('_item.jpg', '')} (ignored)")
-            elif action == 'open':
-                # Right-click to open fish
-                if self.on_status_update:
-                    self.on_status_update(f"[W{self.bot_id+1}] Opening: {filename.replace('_living.jpg', '').replace('_item.jpg', '')}")
-                self.right_click_item(inv_x, inv_y)
+        try: 
+            # ========== ACQUIRE LOCK FOR ENTIRE DETECTION + ACTION SEQUENCE ==========
+            # This prevents another bot from moving the mouse/clicking between our
+            # detection and action, which could cause clicking on the wrong fish
+            with input_lock:
+                # Activate our window first
+                self.window_manager.activate_window(force_activate=True)
+                # Small delay for item to appear in inventory
+                time.sleep(0.2)
                 
-                # Move cursor away from item (with lock to prevent interference from other bots)
-                # Convert inventory-relative coords to screen coords first
-                with input_lock:
+                # Capture inventory area
+                inventory_frame = self.capture_inventory_area()
+                
+                # Identify the item (ignoring known dead fish positions)
+                match = self.identify_item_in_inventory(inventory_frame, ignore_positions=self._ignored_positions)
+                            
+                if not match:
+                    return  # No item found, that's OK (not every catch gives an item)
+                
+                filename, (inv_x, inv_y) = match
+                
+                action = fish_actions.get(filename, 'keep')
+                
+                if action == 'keep':
+                    # Item stays in inventory - add to ignore list so we don't process it again
+                    self._ignored_positions.add((inv_x, inv_y))
+                    if self.on_status_update:
+                        self.on_status_update(f"[W{self.bot_id+1}] Keeping: {filename.replace('_living.jpg', '').replace('_item.jpg', '')} (ignored)")
+                        
+                elif action == 'open':
+                    # Right-click to open fish - coordinates already computed, window already active
+                    if self.on_status_update:
+                        self.on_status_update(f"[W{self.bot_id+1}] Opening: {filename.replace('_living.jpg', '').replace('_item.jpg', '')}")
+                    
+                    # Convert inventory-relative coords to screen coords
                     win_left, win_top, win_width, _ = self.window_manager.get_window_rect()
                     screen_x = win_left + win_width - self._inventory_width + inv_x
                     screen_y = win_top + self._inventory_y_offset + inv_y
-                    # Move 100px left and up from the item's screen position
-                    pyautogui.moveTo(screen_x - 100, screen_y - 100, _pause=False)
-                
+                    
+                    # Right-click sequence (already inside lock)
+                    pyautogui.moveTo(screen_x, screen_y, _pause=False)
+                    time.sleep(0.05)
+                    pyautogui.click(button='right', _pause=False)
+                    time.sleep(0.2)  # Wait for game to process
+                    
+                    # Move cursor to center of the window (safe position)
+                    win_center_x = win_left + win_width // 2
+                    win_center_y = win_top + 400  # Upper-middle area of window
+                    pyautogui.moveTo(win_center_x, win_center_y, _pause=False)
+                    
+            # ========== LOCK RELEASED ==========
+            
+            # Dead fish detection can happen outside lock (read-only captures)
+            if action == 'open':
                 time.sleep(0.1)  # Wait for right click to register
                 
                 inventory_frame_after = self.capture_inventory_area()
                 
                 # Check if the SAME fish is still at the SAME position
                 still_there = self._is_item_at_position(inventory_frame_after, inv_x, inv_y)
-                if self.on_status_update and DEBUG_PRINTS:
-                    self.on_status_update(f"[W{self.bot_id+1}] [DEBUG] Dead fish check at ({inv_x}, {inv_y}): still_there={still_there}")
                 
                 # Safety check: wait 100ms and verify again to be absolutely sure
                 if still_there:
@@ -618,29 +581,18 @@ class FishingBot:
                     inventory_frame_safety = self.capture_inventory_area()
                     still_there_safety = self._is_item_at_position(inventory_frame_safety, inv_x, inv_y)
                     
-                    if self.on_status_update and DEBUG_PRINTS:
-                        self.on_status_update(f"[W{self.bot_id+1}] [DEBUG] Safety check after 100ms: still_there={still_there_safety}")
-                    
                     # Only mark as dead if BOTH checks confirm it's still there
                     if still_there_safety:
-                        # Each bot has its own _ignored_positions set, no lock needed
                         self._ignored_positions.add((inv_x, inv_y))
-                        if self.on_status_update and DEBUG_PRINTS:
-                            self.on_status_update(f"[W{self.bot_id+1}] [DEBUG] Dead fish confirmed and added to ignore list (total: {len(self._ignored_positions)})")
-                    else:
-                        # Fish disappeared in safety check - it was a living fish
-                        if self.on_status_update and DEBUG_PRINTS:
-                            self.on_status_update(f"[W{self.bot_id+1}] [DEBUG] False alarm - fish was actually alive (disappeared in safety check)")
                 
             elif action == 'drop':
                 # TODO: Implement drop functionality later
-                if self.on_status_update :
+                if self.on_status_update:
                     self.on_status_update(f"[W{self.bot_id+1}] Drop not implemented yet: {filename}")
                 pass
                 
         except Exception as e:
-            if self.on_status_update and DEBUG_PRINTS:
-                self.on_status_update(f"[W{self.bot_id+1}] [DEBUG] Error handling item: {e}")
+            pass
         
     def _update_region_cache(self):
         """Updates cached constants when region changes."""
@@ -886,7 +838,7 @@ class FishingBot:
                 if self.on_status_update:
                     self.on_status_update(f"[W{self.bot_id+1}] Error pressing key '{key}': {e}")
     
-    def wait_for_minigame_window(self, timeout: float = 2.0) -> Optional[GameRegion]:
+    def wait_for_minigame_window(self, timeout: float = 4.0) -> Optional[GameRegion]:
         """Waits for and finds the fishing minigame window. Auto-calibrates region on first detection."""
         start_time = time.time()
         
@@ -934,7 +886,7 @@ class FishingBot:
         try:
             # Activate window before capturing
             self.window_manager.activate_window(force_activate=True)
-            time.sleep(0.1)  # Give window time to come into focus
+            time.sleep(0.3)  # Give window time to come into focus
             
             inventory_frame = self.capture_inventory_area()
             inventory_gray = cv2.cvtColor(inventory_frame, cv2.COLOR_BGR2GRAY)
@@ -1028,13 +980,13 @@ class FishingBot:
                 self.press_key('space', "Cast fishing line")
                 time.sleep(0.05)
                 
-                minigame_detected = self.wait_for_minigame_window(timeout=0.5)
+                minigame_detected = self.wait_for_minigame_window(timeout=4)
                 if not minigame_detected:
                     self.consecutive_failures += 1
                     if self.on_status_update:
-                        self.on_status_update(f"[W{self.bot_id+1}] Minigame not detected ({self.consecutive_failures}/2)")
+                        self.on_status_update(f"[W{self.bot_id+1}] Minigame not detected ({self.consecutive_failures}/5)")
                     
-                    if self.consecutive_failures >= 2:
+                    if self.consecutive_failures >= 5:
                         self.adjust_bait_tier()
                         if self.bait_counter <= 0:
                             if self.on_status_update:
@@ -1103,7 +1055,7 @@ class FishingBot:
                     if self.config.get('quick_skip', False):
                         self.quickskip()
                     else:
-                        wait_time = np.random.uniform(3.5, 4)
+                        wait_time = np.random.uniform(4, 4.5)
                         time.sleep(wait_time)
                 
             except Exception as e:
@@ -1129,7 +1081,6 @@ class FishingBot:
         self.running = False
         if self.on_status_update:
             self.on_status_update(f"[W{self.bot_id+1}] Bot stopped")
-
 
 class IgnoredPositionsWindow:
     """Window displaying ignored positions with 10px radius visualization"""
@@ -1217,8 +1168,6 @@ class IgnoredPositionsWindow:
             self.canvas.delete("all")
             self.canvas.create_image(140, 140, image=self.placeholder_image, anchor="center")
             self.canvas.update()
-            if DEBUG_PRINTS:
-                print(f"DEBUG: Placeholder drawn successfully")
         except Exception as e:
             print(f"Error drawing placeholder: {e}")
             import traceback
@@ -1401,6 +1350,285 @@ class IgnoredPositionsWindow:
             self.window.destroy()
             self.window = None
 
+class FishDetectorDebugWindow:
+    """Debug window for visualizing fish detection (window bounds and fish position)"""
+    
+    def __init__(self, parent, bot_instance):
+        self.parent = parent
+        self.bot = bot_instance
+        self.window = None
+        self.canvas = None
+        self.photo_image = None
+        self.sct = None  # Own screen capture instance (thread-safe)
+        self.status_label = None
+        self._create_window()
+        self._update_loop_id = None
+    
+    def _create_window(self):
+        """Creates the fish detector debug window"""
+        self.window = tk.Toplevel(self.parent)
+        self.window.title(f"Fish Detector Debug - [W{self.bot.bot_id+1}]")
+        self.window.geometry("600x550")
+        self.window.configure(bg="#1a1a1a")
+        self.window.resizable(False, False)
+        
+        # Try to load and set window icon
+        icon_path = get_resource_path("monkey.ico")
+        if os.path.exists(icon_path):
+            try:
+                self.window.iconbitmap(icon_path)
+            except Exception as e:
+                pass
+        
+        # Header
+        header = tk.Frame(self.window, bg="#000000", height=35)
+        header.pack(fill=tk.X)
+        header.pack_propagate(False)
+        
+        title = tk.Label(header, text="🎣 Fish Detector Debug", 
+                        font=("Courier New", 11, "bold"),
+                        bg="#000000", fg="#FFD700")
+        title.pack(pady=6)
+        
+        # Status info frame
+        info_frame = tk.Frame(self.window, bg="#2a2a2a")
+        info_frame.pack(fill=tk.X, padx=5, pady=3)
+        
+        info_text = tk.Label(info_frame, 
+                            text="Shows: Window bounds (green) | Fish position (red circle) | HSV detection results",
+                            font=("Courier New", 8),
+                            bg="#2a2a2a", fg="#ffffff",
+                            justify=tk.LEFT)
+        info_text.pack(anchor="w", padx=5, pady=2)
+        
+        # Status label
+        self.status_label = tk.Label(self.window, text="Status: Ready",
+                                    font=("Courier New", 9),
+                                    bg="#1a1a1a", fg="#00ff00")
+        self.status_label.pack(pady=2)
+        
+        # Canvas for image display
+        self.canvas = tk.Canvas(self.window, bg="#000000", width=560, height=380,
+                               highlightthickness=1, highlightbackground="#333333")
+        self.canvas.pack(fill=tk.BOTH, expand=False, padx=5, pady=5)
+        
+        # Info panel at bottom
+        info_panel = tk.Frame(self.window, bg="#1a1a1a")
+        info_panel.pack(fill=tk.X, padx=5, pady=5)
+        
+        self.info_text = tk.Label(info_panel, 
+                                 text="",
+                                 font=("Courier New", 8),
+                                 bg="#1a1a1a", fg="#00ff00",
+                                 justify=tk.LEFT)
+        self.info_text.pack(anchor="w")
+        
+        # Store a reference to the placeholder image
+        self.placeholder_image = None
+        self.photo_image = None
+        
+        # Draw initial placeholder
+        self._draw_placeholder()
+        
+        # Start update loop
+        self._schedule_update()
+        
+        # Handle window close
+        self.window.protocol("WM_DELETE_WINDOW", self._on_close)
+    
+    def _draw_placeholder(self):
+        """Draws a placeholder image on the canvas"""
+        try:
+            placeholder = np.zeros((380, 560, 3), dtype=np.uint8)
+            placeholder[:] = (50, 50, 100)
+            cv2.rectangle(placeholder, (10, 10), (550, 370), (100, 255, 100), 3)
+            cv2.putText(placeholder, "Waiting for detection...", (80, 180), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+            
+            rgb_frame = cv2.cvtColor(placeholder, cv2.COLOR_BGR2RGB)
+            pil_image = Image.fromarray(rgb_frame)
+            self.placeholder_image = ImageTk.PhotoImage(pil_image)
+            
+            self.canvas.delete("all")
+            self.canvas.create_image(280, 190, image=self.placeholder_image, anchor="center")
+            self.canvas.update()
+        except Exception as e:
+            pass
+    
+    def _schedule_update(self):
+        """Schedule next update"""
+        if self.window and self.window.winfo_exists():
+            self._update_loop_id = self.window.after(200, self._update_display)
+    
+    def _on_close(self):
+        """Handle window close"""
+        if self._update_loop_id:
+            self.window.after_cancel(self._update_loop_id)
+        if self.window:
+            self.window.destroy()
+            self.window = None
+    
+    def _update_display(self):
+        """Update the detection visualization"""
+        try:
+            if not self.window or not self.window.winfo_exists():
+                return
+            
+            # Only attempt capture if bot has a selected window
+            if not self.bot.window_manager or not self.bot.window_manager.selected_window:
+                if self.placeholder_image:
+                    self.canvas.delete("all")
+                    self.canvas.create_image(280, 190, image=self.placeholder_image, anchor="center")
+                self.status_label.config(text="Status: No window selected")
+                self._schedule_update()
+                return
+            
+            # Initialize mss if needed
+            if self.sct is None:
+                self.sct = mss()
+            
+            # Capture full window
+            try:
+                win_left, win_top, win_width, win_height = self.bot.window_manager.get_window_rect()
+                
+                monitor = {
+                    "left": win_left,
+                    "top": win_top,
+                    "width": win_width,
+                    "height": win_height
+                }
+                
+                sct_img = self.sct.grab(monitor)
+                frame = np.array(sct_img)
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+                
+            except Exception as e:
+                self.status_label.config(text=f"Status: Capture failed - {str(e)[:40]}")
+                self._schedule_update()
+                return
+            
+            if frame is None or frame.size == 0:
+                self.status_label.config(text="Status: Invalid frame")
+                self._schedule_update()
+                return
+            
+            # Run detections
+            viz_frame = frame.copy()
+            h, w = frame.shape[:2]
+            
+            try:
+                # Detection 1: find_fishing_window_bounds
+                window_bounds = self.bot.detector.find_fishing_window_bounds(frame)
+                
+                # Detection 2: detect_window_and_fish
+                window_active, fish_pos = self.bot.detector.detect_window_and_fish(frame)
+                
+                # Draw results on visualization
+                status_msg = []
+                
+                # Draw window bounds if found
+                if window_bounds:
+                    x, y, bw, bh = window_bounds
+                    cv2.rectangle(viz_frame, (x, y), (x + bw, y + bh), (0, 255, 0), 3)
+                    cv2.putText(viz_frame, f"Window: {bw}x{bh}", (x, y - 5),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    status_msg.append(f"Window bounds: ({x}, {y}) {bw}x{bh}")
+                else:
+                    status_msg.append("Window bounds: NOT FOUND")
+                
+                # Draw window active status
+                if window_active:
+                    cv2.putText(viz_frame, "WINDOW ACTIVE", (20, 40),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                    status_msg.append("Window active: YES")
+                else:
+                    cv2.putText(viz_frame, "WINDOW INACTIVE", (20, 40),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                    status_msg.append("Window active: NO")
+                
+                # Draw fish position if detected
+                if fish_pos:
+                    fx, fy = fish_pos
+                    cv2.circle(viz_frame, (fx, fy), 12, (0, 0, 255), 2)
+                    cv2.circle(viz_frame, (fx, fy), 3, (255, 255, 255), -1)
+                    cv2.putText(viz_frame, f"Fish ({fx},{fy})", (fx + 15, fy - 5),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                    status_msg.append(f"Fish position: ({fx}, {fy})")
+                else:
+                    status_msg.append("Fish position: NOT DETECTED")
+                
+                # Draw circle region if region is calibrated
+                if self.bot.region and self.bot.region_auto_calibrated:
+                    cx = self.bot.region.left + self.bot.region.width // 2
+                    cy = self.bot.region.top + self.bot.region.height // 2
+                    radius = 67
+                    cv2.circle(viz_frame, (cx, cy), radius, (255, 255, 0), 2)
+                    cv2.putText(viz_frame, "Click zone", (cx - 40, cy - radius - 10),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                
+                self.status_label.config(text=f"Status: {' | '.join(status_msg[:2])}")
+                
+            except Exception as e:
+                status_msg = [f"Detection error: {str(e)[:50]}"]
+                self.status_label.config(text=f"Status: ERROR - {str(e)[:40]}")
+            
+            # Resize to fit canvas
+            scale = min(560.0 / w, 380.0 / h, 1.0)
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            
+            if new_w > 0 and new_h > 0:
+                viz_resized = cv2.resize(viz_frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            else:
+                self._schedule_update()
+                return
+            
+            # Convert to RGB
+            rgb_frame = cv2.cvtColor(viz_resized, cv2.COLOR_BGR2RGB)
+            
+            # Create PIL image
+            pil_image = Image.fromarray(rgb_frame)
+            
+            # Create PhotoImage
+            self.photo_image = ImageTk.PhotoImage(pil_image)
+            
+            # Update canvas
+            self.canvas.delete("all")
+            self.canvas.create_image(280, 190, image=self.photo_image, anchor="center")
+            
+            # Update info panel
+            info_str = " | ".join(status_msg)
+            self.info_text.config(text=info_str)
+            
+        except Exception as e:
+            self.status_label.config(text=f"Status: ERROR")
+        
+        self._schedule_update()
+    
+    def show(self):
+        """Show the window"""
+        if self.window:
+            self.window.deiconify()
+            self.window.lift()
+            self.window.focus_force()
+    
+    def hide(self):
+        """Hide the window"""
+        if self.window:
+            self.window.withdraw()
+    
+    def is_visible(self) -> bool:
+        """Check if window is visible"""
+        if self.window:
+            return self.window.winfo_viewable()
+        return False
+    
+    def destroy(self):
+        """Destroy the window"""
+        if self._update_loop_id:
+            self.window.after_cancel(self._update_loop_id)
+        if self.window:
+            self.window.destroy()
 
 class StatusLogWindow:
     """Separate window for displaying status log messages"""
@@ -1516,7 +1744,6 @@ class StatusLogWindow:
         if self.window:
             self.window.destroy()
             self.window = None
-
 
 class FishSelectionWindow:
     """Window for selecting fish/item actions (keep, drop, open)"""
@@ -1824,7 +2051,6 @@ class FishSelectionWindow:
         
         self.window.destroy()
 
-
 class BotGUI:
     """GUI for the fishing bot - supports up to 8 simultaneous windows"""
     
@@ -1853,6 +2079,7 @@ class BotGUI:
         self.window_selections: Dict[int, tk.StringVar] = {}  # bot_id -> selected window name
         self.window_stats: Dict[int, dict] = {}  # bot_id -> {hits, games, bait}
         self.ignored_positions_windows: Dict[int, IgnoredPositionsWindow] = {}  # bot_id -> IgnoredPositionsWindow
+        self.fish_detector_debug_windows: Dict[int, FishDetectorDebugWindow] = {}  # bot_id -> FishDetectorDebugWindow
         
         # Global keyboard listener for F5 pause
         self.global_key_listener = None
@@ -2716,6 +2943,7 @@ class BotGUI:
             # Create ignored positions debug window (only if DEBUG_MODE_EN is true)
             if DEBUG_MODE_EN:
                 self.ignored_positions_windows[bot_id] = IgnoredPositionsWindow(self.root, bot)
+                self.fish_detector_debug_windows[bot_id] = FishDetectorDebugWindow(self.root, bot)
             
             # Start bot thread
             thread = threading.Thread(target=bot.start, daemon=True)
@@ -2809,6 +3037,11 @@ class BotGUI:
             self.ignored_positions_windows[bot_id].destroy()
             del self.ignored_positions_windows[bot_id]
         
+        # Destroy fish detector debug window
+        if bot_id in self.fish_detector_debug_windows:
+            self.fish_detector_debug_windows[bot_id].destroy()
+            del self.fish_detector_debug_windows[bot_id]
+        
         # Remove from active bots
         if bot_id in self.bots:
             del self.bots[bot_id]
@@ -2844,6 +3077,20 @@ class BotGUI:
         # Destroy status log window
         if hasattr(self, 'status_log_window') and self.status_log_window:
             self.status_log_window.destroy()
+        
+        # Destroy all ignored positions windows
+        for window in self.ignored_positions_windows.values():
+            try:
+                window.destroy()
+            except:
+                pass
+        
+        # Destroy all fish detector debug windows
+        for window in self.fish_detector_debug_windows.values():
+            try:
+                window.destroy()
+            except:
+                pass
         
         self.save_config()
         self.root.destroy()
