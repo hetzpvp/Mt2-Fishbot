@@ -1,6 +1,6 @@
 # MT2 Fishing Bot
 
-Automated fishing bot for Metin2 that supports up to 8 windows simultaneously.
+Free fishing minigame bot for Metin2. No subscriptions, no licenses.
 
 **Author:** boristei | **Discord:** boristei
 
@@ -8,67 +8,63 @@ Automated fishing bot for Metin2 that supports up to 8 windows simultaneously.
 
 ## Features
 
-✅ Multi-window support (up to 8 windows)  
-✅ Auto fish detection  
-✅ Configurable bait keys  
-✅ Pause/resume with F5  
-✅ Real-time statistics  
+- Multi-window support (up to 8 clients, depends on hardware)
+- Visual processing only (undetectable)
+- Works on any server with the new fishing system
+- Configurable bait keys (1-4 F1-F4)
+- Auto fish handling (keep/drop/open)
+- Quick skip with horse (CTRL+G)
+- F5 pause/resume
 
 ---
 
-## Quick Start
+## Usage
 
-**Run:** Double-click `MT2 Fishing Bot.exe` (or `python "Fishbot by boristei.py"`)
+⚠️ **Run as Administrator!**
 
-## How to Use
-
-1. **Select Bait Keys** - Check which keys have bait (1, 2, 3, 4 by default)
-2. **Refresh Windows** - Click "🔄 Refresh Windows" to find your game windows
-3. **Select Windows** - Choose up to 8 windows to run the bot on
-4. **Click Start All** - Bot will begin automatically
-5. **Press F5 to pause/resume** - All bots pause and resume together
-6. **Click Stop All** to stop
+1. Execute the bot as administrator
+2. Select bait keys and place bait in those hotkeys
+3. Click **Refresh Windows** to find game windows
+4. Select windows to run on
+5. Click **Start All**
+6. Press **F5** to pause/resume
 
 ---
 
 ## Settings
 
-- **Human-like clicking** - Random click offsets (recommended)
-- **Quick skip** - Auto-skip between games (only if you have a horse)
-- **Show status log** - View real-time bot activity
+- **Human-like clicking** - Random click offsets
+- **Quick skip** - Auto-skip between games (requires horse)
+- **Auto fish handling** - Configure keep/drop/open per fish type
+  - ⚠️ Requires inventory to be open
+  - Keep inventory as empty as possible
+- **Show status log** - View bot activity
 
 ---
 
 ## Troubleshooting
 
-**No windows found?**
-- Make sure game windows are open and visible
-- Click "Refresh Windows" again
-
-**Bot not clicking?**
-- Check that bait keys are selected
-- Enable "Show status log" to see errors
-- Restart the bot
+**Start button not showing?**
+- Set Windows display scale to 100% (Settings → Display → Scale)
 
 ---
 
-## Keys
+## Planned Updates
 
-- **F5** - Pause/Resume all bots
+- Jigsaw Puzzle solver
+
+## TODO
+
+- [ ] Implement item drop logic
+- [ ] Auto fish handling across all inventory pages
+- [ ] Fish skipping based on chat message (skip minigame)
 
 ---
 
 ## Donations
 
-Support the developer:  
 **BTC:** `3AGrrTf1v9QZsMPEoezYTRbf9JyW4nQtHu`
 
 ---
 
-## Disclaimer
-
-For **personal use only**. Use at your own risk. Read the game's terms of service regarding bots.
-
----
-
-**Version:** 1.0 | **Last Updated:** December 2025
+*For personal use only. Use at your own risk.*
