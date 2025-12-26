@@ -57,10 +57,10 @@ input_lock = threading.Lock()
 MAX_WINDOWS = 8
 
 # Debug mode - enable/disable IgnoredPositionsWindow
-DEBUG_MODE_EN = True
+DEBUG_MODE_EN = False
 
 # Debug prints - enable/disable verbose debug print statements
-DEBUG_PRINTS = True
+DEBUG_PRINTS = False
 
 def play_rickroll_beep():
     """Plays a Rick Roll-themed beep sequence (intro)."""
@@ -1083,7 +1083,7 @@ class FishingBot:
             self.on_status_update(f"[W{self.bot_id+1}] Bot stopped")
 
 class IgnoredPositionsWindow:
-    """Window displaying ignored positions with 10px radius visualization"""
+    """Debug window displaying ignored positions with 10px radius visualization"""
     
     def __init__(self, parent, bot_instance):
         self.parent = parent
@@ -1631,7 +1631,7 @@ class FishDetectorDebugWindow:
             self.window.destroy()
 
 class StatusLogWindow:
-    """Separate window for displaying status log messages"""
+    """Debug window for displaying status log messages"""
     
     def __init__(self, parent):
         self.parent = parent

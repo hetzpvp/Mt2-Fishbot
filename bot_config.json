@@ -41,7 +41,7 @@
   ],
   "bait": 200,
   "selected_windows": [
-    "WoM2",
+    "",
     "",
     "",
     "",
@@ -50,5 +50,5 @@
     "",
     ""
   ],
-  "selected_window": "WoM2"
+  "selected_window": ""
 }
