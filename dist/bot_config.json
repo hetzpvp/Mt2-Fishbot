@@ -1,0 +1,25 @@
+{
+  "human_like_clicking": true,
+  "quick_skip": true,
+  "sound_alert_on_finish": true,
+  "auto_fish_handling": false,
+  "fish_actions": {},
+  "bait_keys": [
+    "1",
+    "2",
+    "3",
+    "4"
+  ],
+  "bait": 800,
+  "selected_windows": [
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    ""
+  ],
+  "selected_window": ""
+}

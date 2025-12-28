@@ -11,8 +11,16 @@ import json
 import time
 import threading
 import winsound
+import ctypes
 from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict
+
+# === Windows DPI Awareness ===
+# Fix for high DPI displays (125%, 150%, etc.) where UI elements may be cut off
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(1)  # PROCESS_SYSTEM_DPI_AWARE
+except Exception:
+    pass  # Older Windows versions may not support this
 
 # === Third Party ===
 import cv2
@@ -1083,7 +1091,7 @@ class FishingBot:
             self.on_status_update(f"[W{self.bot_id+1}] Bot stopped")
 
 class IgnoredPositionsWindow:
-    """Debug window displaying ignored positions with 10px radius visualization"""
+    """Window displaying ignored positions with 10px radius visualization"""
     
     def __init__(self, parent, bot_instance):
         self.parent = parent
@@ -1631,7 +1639,7 @@ class FishDetectorDebugWindow:
             self.window.destroy()
 
 class StatusLogWindow:
-    """Debug window for displaying status log messages"""
+    """Separate window for displaying status log messages"""
     
     def __init__(self, parent):
         self.parent = parent
@@ -2057,8 +2065,19 @@ class BotGUI:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Fishing puzzle player (Multi-Window)")
-        self.root.geometry("600x850")
-        self.root.resizable(False, False)
+        
+        # Calculate window height based on DPI scaling
+        base_height = 850
+        try:
+            dpi_scale = ctypes.windll.shcore.GetScaleFactorForDevice(0) / 100.0
+            # Increase height proportionally for high DPI (add extra space)
+            window_height = int(base_height * max(1.0, dpi_scale * 0.9))
+        except Exception:
+            window_height = base_height
+        
+        self.root.geometry(f"600x{window_height}")
+        self.root.resizable(False, True)  # Allow vertical resize for DPI scaling
+        self.root.minsize(600, 750)
         self.root.configure(bg="#000000")
         
         # Try to load and set window icon
