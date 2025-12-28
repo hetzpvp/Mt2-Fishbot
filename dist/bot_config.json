@@ -2,6 +2,8 @@
   "human_like_clicking": true,
   "quick_skip": true,
   "sound_alert_on_finish": true,
+  "classic_fishing": true,
+  "classic_fishing_delay": 3.0,
   "auto_fish_handling": false,
   "fish_actions": {},
   "bait_keys": [
@@ -12,7 +14,7 @@
   ],
   "bait": 800,
   "selected_windows": [
-    "",
+    "Metin2009 - Actiunea Orientala MMORPG!",
     "",
     "",
     "",
@@ -21,5 +23,5 @@
     "",
     ""
   ],
-  "selected_window": ""
+  "selected_window": "Metin2009 - Actiunea Orientala MMORPG!"
 }

@@ -268,6 +268,7 @@ class FishingBot:
     # Class-level template cache (shared by all bot instances - loaded only once)
     _template_cache = None
     _template_border_crop = 7  # Pixels to crop from each edge of templates
+    _classic_fish_template = None  # Cache for classic fish detection template
     
     def __init__(self, region: GameRegion, config: dict, window_manager: WindowManager, 
                  bait_counter: int = 800, bait_keys: list = None, bot_id: int = 0):
@@ -958,6 +959,111 @@ class FishingBot:
             if self.on_status_update:
                 self.on_status_update(f"[W{self.bot_id+1}] Error scanning inventory: {e}")
     
+    def _load_classic_fish_template(self):
+        """Loads the classic_fish.jpg template for classic fishing mode."""
+        if FishingBot._classic_fish_template is not None:
+            return FishingBot._classic_fish_template
+        
+        template_path = get_resource_path(os.path.join("assets", "classic_fish.jpg"))
+        if not os.path.exists(template_path):
+            # Try .png extension
+            template_path = get_resource_path(os.path.join("assets", "classic_fish.png"))
+        
+        if os.path.exists(template_path):
+            try:
+                template = cv2.imread(template_path)
+                if template is not None:
+                    FishingBot._classic_fish_template = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+                    if self.on_status_update:
+                        self.on_status_update(f"[W{self.bot_id+1}] Loaded classic fish template")
+            except Exception as e:
+                if self.on_status_update:
+                    self.on_status_update(f"[W{self.bot_id+1}] Error loading classic fish template: {e}")
+        else:
+            if self.on_status_update:
+                self.on_status_update(f"[W{self.bot_id+1}] Classic fish template not found at assets/classic_fish.jpg")
+        
+        return FishingBot._classic_fish_template
+    
+    def wait_for_classic_fish(self, timeout: float = 10.0) -> bool:
+        """Waits for the classic fish image to appear in the game window.
+        Returns True if found, False if timeout."""
+        template = self._load_classic_fish_template()
+        if template is None:
+            if self.on_status_update:
+                self.on_status_update(f"[W{self.bot_id+1}] No classic fish template, using fallback timing")
+            return True  # Fallback: proceed anyway
+        
+        start_time = time.time()
+        t_h, t_w = template.shape
+        
+        # Multi-scale detection: check scales from 25% to 300% of original template size
+        scales = [0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.25, 2.5, 2.75, 3.0]
+        
+        while self.running and time.time() - start_time < timeout:
+            if self.paused:
+                time.sleep(0.1)
+                continue
+            
+            try:
+                frame = self.capture_full_window()
+                frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                
+                # Crop to 250px wide centered bar, upper half only for performance
+                f_h, f_w = frame_gray.shape
+                center_x = f_w // 2
+                crop_left = max(0, center_x - 125)
+                crop_right = min(f_w, center_x + 125)
+                crop_bottom = f_h // 2  # Only upper half
+                frame_gray = frame_gray[:crop_bottom, crop_left:crop_right]
+                
+                f_h, f_w = frame_gray.shape
+                
+                # Multi-scale template matching
+                best_match_val = 0
+                best_scale = 1.0
+                
+                for scale in scales:
+                    # Resize template to current scale
+                    new_w = int(t_w * scale)
+                    new_h = int(t_h * scale)
+                    
+                    # Skip if scaled template is larger than frame or too small
+                    if new_h > f_h or new_w > f_w or new_w < 10 or new_h < 10:
+                        continue
+                    
+                    scaled_template = cv2.resize(template, (new_w, new_h), interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR)
+                    
+                    # Template matching
+                    result = cv2.matchTemplate(frame_gray, scaled_template, cv2.TM_CCOEFF_NORMED)
+                    _, max_val, _, _ = cv2.minMaxLoc(result)
+                    
+                    if max_val > best_match_val:
+                        best_match_val = max_val
+                        best_scale = scale
+                    
+                    # Early exit if we found a very good match
+                    if max_val >= 0.8:
+                        break
+                
+                if best_match_val >= 0.7:  # Found the classic fish indicator
+                    # Start timer IMMEDIATELY after detection (configurable delay)
+                    delay = self.config.get('classic_fishing_delay', 3.0)
+                    time.sleep(delay-0.05)  # Subtract small polling delay
+                    if self.on_status_update:
+                        self.on_status_update(f"[W{self.bot_id+1}] Classic fish detected (confidence: {best_match_val:.2f}, scale: {best_scale:.1f}x, delay: {delay}s)")
+                    return True
+                
+                time.sleep(0.02)  # Fast polling
+            except Exception as e:
+                if self.on_status_update:
+                    self.on_status_update(f"[W{self.bot_id+1}] Error detecting classic fish: {e}")
+                time.sleep(0.1)
+        
+        if self.on_status_update:
+            self.on_status_update(f"[W{self.bot_id+1}] Classic fish detection timeout")
+        return False
+    
     def play_game(self):
         """Main game loop implementing the fishing minigame workflow."""
         # Reset bait if starting with 0 or negative bait
@@ -988,83 +1094,127 @@ class FishingBot:
                 self.press_key('space', "Cast fishing line")
                 time.sleep(0.05)
                 
-                minigame_detected = self.wait_for_minigame_window(timeout=4)
-                if not minigame_detected:
-                    self.consecutive_failures += 1
-                    if self.on_status_update:
-                        self.on_status_update(f"[W{self.bot_id+1}] Minigame not detected ({self.consecutive_failures}/5)")
-                    
-                    if self.consecutive_failures >= 5:
-                        self.adjust_bait_tier()
-                        if self.bait_counter <= 0:
-                            if self.on_status_update:
-                                self.on_status_update(f"[W{self.bot_id+1}] Bait depleted after consecutive failures. Stopping bot.")
-                            self.running = False
-                            if self.on_bot_stop:
-                                self.on_bot_stop(self.bot_id)
-                            break
-                    
-                    # Press CTRL+G once per failure to dismount horse if that's the issue
-                    # First failure: try to dismount if on horse
-                    # Second failure: you actually mounted in first attemp and now you need to unmount
-                    if self.on_status_update:
-                        self.on_status_update(f"[W{self.bot_id+1}] Pressing CTRL+G to dismount horse...")
-                    self.press_ctrl_key('g')
-                    time.sleep(0.15)
-                    continue
-                
-                # Reset failure counter on successful minigame detection
-                self.consecutive_failures = 0
-                
-                minigame_active = True
-                human_like = self.config.get('human_like_clicking', True)
-                
-                while self.running and minigame_active:
-                    if self.paused:
-                        time.sleep(0.1)
+                # Only play minigame if Classic Fishing system is NOT enabled
+                if not self.config.get('classic_fishing', False):
+                    minigame_detected = self.wait_for_minigame_window(timeout=4)
+                    if not minigame_detected:
+                        self.consecutive_failures += 1
+                        if self.on_status_update:
+                            self.on_status_update(f"[W{self.bot_id+1}] Minigame not detected ({self.consecutive_failures}/5)")
+                        
+                        if self.consecutive_failures >= 5:
+                            self.adjust_bait_tier()
+                            if self.bait_counter <= 0:
+                                if self.on_status_update:
+                                    self.on_status_update(f"[W{self.bot_id+1}] Bait depleted after consecutive failures. Stopping bot.")
+                                self.running = False
+                                if self.on_bot_stop:
+                                    self.on_bot_stop(self.bot_id)
+                                break
+                        
+                        # Press CTRL+G once per failure to dismount horse if that's the issue
+                        # First failure: try to dismount if on horse
+                        # Second failure: you actually mounted in first attemp and now you need to unmount
+                        if self.on_status_update:
+                            self.on_status_update(f"[W{self.bot_id+1}] Pressing CTRL+G to dismount horse...")
+                        self.press_ctrl_key('g')
+                        time.sleep(0.15)
                         continue
                     
-                    # Small delay between attempts (minimized for responsiveness)
-                    if human_like:
-                        time.sleep(np.random.uniform(0.15, 0.7))
+                    # Reset failure counter on successful minigame detection
+                    self.consecutive_failures = 0
                     
-                    try:
-                        # Atomic operation: capture + detect + click all within lock
-                        window_active, fish_pos = self.atomic_capture_and_click()
+                    minigame_active = True
+                    human_like = self.config.get('human_like_clicking', True)
+                    
+                    while self.running and minigame_active:
+                        if self.paused:
+                            time.sleep(0.1)
+                            continue
                         
-                        if not window_active:
-                            # Minigame ended
-                            minigame_active = False
-                            self.total_games += 1
-                            self.bait_counter -= 1
+                        # Small delay between attempts (minimized for responsiveness)
+                        if human_like:
+                            time.sleep(np.random.uniform(0.15, 0.7))
+                        
+                        try:
+                            # Atomic operation: capture + detect + click all within lock
+                            window_active, fish_pos = self.atomic_capture_and_click()
                             
+                            if not window_active:
+                                # Minigame ended
+                                minigame_active = False
+                                self.total_games += 1
+                                self.bait_counter -= 1
+                                
+                                if self.on_status_update:
+                                    self.on_status_update(f"[W{self.bot_id+1}] Game finished. Total: {self.total_games}, Bait: {self.bait_counter}")
+                                if self.on_bait_update:
+                                    self.on_bait_update(self.bot_id, self.bait_counter)
+                                if self.on_stats_update:
+                                    self.on_stats_update(self.bot_id, 0, self.total_games, self.bait_counter)
+                                
+                                # Handle caught item (if auto fish handling is enabled)
+                                self.handle_caught_item()
+                                break
+                            
+                            if fish_pos:
+                                self.hits += 1
+                                if self.on_stats_update:
+                                    self.on_stats_update(self.bot_id, self.hits, self.total_games, self.bait_counter)
+                                
+                        except Exception as e:
                             if self.on_status_update:
-                                self.on_status_update(f"[W{self.bot_id+1}] Game finished. Total: {self.total_games}, Bait: {self.bait_counter}")
-                            if self.on_bait_update:
-                                self.on_bait_update(self.bot_id, self.bait_counter)
-                            if self.on_stats_update:
-                                self.on_stats_update(self.bot_id, 0, self.total_games, self.bait_counter)
-                            
-                            # Handle caught item (if auto fish handling is enabled)
-                            self.handle_caught_item()
-                            break
-                        
-                        if fish_pos:
-                            self.hits += 1
-                            if self.on_stats_update:
-                                self.on_stats_update(self.bot_id, self.hits, self.total_games, self.bait_counter)
-                            
-                    except Exception as e:
+                                self.on_status_update(f"[W{self.bot_id+1}] Error: {e}")
+                    
+                    self.hits = 0
+                    if self.bait_counter > 0:
+                        if self.config.get('quick_skip', False):
+                            self.quickskip()
+                        else:
+                            wait_time = np.random.uniform(4, 4.5)
+                            time.sleep(wait_time)
+                else:
+                    # Classic Fishing system - wait for fish indicator, then reel in
+                    # Step 1: Wait for classic fish image to appear
+                    fish_found = self.wait_for_classic_fish(timeout=40)
+                    
+                    if not fish_found:
+                        # Timeout waiting for fish - continue to next cast
                         if self.on_status_update:
-                            self.on_status_update(f"[W{self.bot_id+1}] Error: {e}")
-                
-                self.hits = 0
-                if self.bait_counter > 0:
-                    if self.config.get('quick_skip', False):
-                        self.quickskip()
-                    else:
-                        wait_time = np.random.uniform(4, 4.5)
-                        time.sleep(wait_time)
+                            self.on_status_update(f"[W{self.bot_id+1}] No fish bite detected, recasting...")
+                        continue
+                    
+                    # Timer already elapsed in wait_for_classic_fish - press space to reel in
+                    # Acquire lock and activate window BEFORE pressing space (critical timing)
+                    with input_lock:
+                        self.window_manager.activate_window(force_activate=True)
+                        time.sleep(0.05)
+                        if self.keyboard_controller:
+                            self.keyboard_controller.press(Key.space)
+                            time.sleep(0.025)
+                            self.keyboard_controller.release(Key.space)
+                    if self.on_status_update:
+                        self.on_status_update(f"[W{self.bot_id+1}] Reeling in fish")
+                    
+                    # Update counters
+                    self.total_games += 1
+                    self.bait_counter -= 1
+                    
+                    if self.on_status_update:
+                        self.on_status_update(f"[W{self.bot_id+1}] Classic catch! Total: {self.total_games}, Bait: {self.bait_counter}")
+                    if self.on_bait_update:
+                        self.on_bait_update(self.bot_id, self.bait_counter)
+                    if self.on_stats_update:
+                        self.on_stats_update(self.bot_id, 0, self.total_games, self.bait_counter)
+                    
+                    # Step 4: Quick skip or wait before next cast
+                    if self.bait_counter > 0:
+                        if self.config.get('quick_skip', False):
+                            time.sleep(1)
+                            self.quickskip()
+                        else:
+                            wait_time = np.random.uniform(4, 4.5)
+                            time.sleep(wait_time)
                 
             except Exception as e:
                 if self.on_status_update:
@@ -1403,7 +1553,7 @@ class FishDetectorDebugWindow:
         info_frame.pack(fill=tk.X, padx=5, pady=3)
         
         info_text = tk.Label(info_frame, 
-                            text="Shows: Window bounds (green) | Fish position (red circle) | HSV detection results",
+                            text="Window (green) | Fish (red) | Classic fish (magenta) | Click zone (yellow)",
                             font=("Courier New", 8),
                             bg="#2a2a2a", fg="#ffffff",
                             justify=tk.LEFT)
@@ -1525,54 +1675,152 @@ class FishDetectorDebugWindow:
             h, w = frame.shape[:2]
             
             try:
-                # Detection 1: find_fishing_window_bounds
-                window_bounds = self.bot.detector.find_fishing_window_bounds(frame)
-                
-                # Detection 2: detect_window_and_fish
-                window_active, fish_pos = self.bot.detector.detect_window_and_fish(frame)
-                
                 # Draw results on visualization
                 status_msg = []
                 
-                # Draw window bounds if found
-                if window_bounds:
-                    x, y, bw, bh = window_bounds
-                    cv2.rectangle(viz_frame, (x, y), (x + bw, y + bh), (0, 255, 0), 3)
-                    cv2.putText(viz_frame, f"Window: {bw}x{bh}", (x, y - 5),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                    status_msg.append(f"Window bounds: ({x}, {y}) {bw}x{bh}")
-                else:
-                    status_msg.append("Window bounds: NOT FOUND")
+                # Check which fishing mode is active
+                is_classic_mode = self.bot.config.get('classic_fishing', False)
                 
-                # Draw window active status
-                if window_active:
-                    cv2.putText(viz_frame, "WINDOW ACTIVE", (20, 40),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-                    status_msg.append("Window active: YES")
+                # Show fishing mode status in top-right
+                if is_classic_mode:
+                    cv2.putText(viz_frame, "MODE: CLASSIC", (w - 180, 40),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
                 else:
-                    cv2.putText(viz_frame, "WINDOW INACTIVE", (20, 40),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                    status_msg.append("Window active: NO")
+                    cv2.putText(viz_frame, "MODE: MINIGAME", (w - 180, 40),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                 
-                # Draw fish position if detected
-                if fish_pos:
-                    fx, fy = fish_pos
-                    cv2.circle(viz_frame, (fx, fy), 12, (0, 0, 255), 2)
-                    cv2.circle(viz_frame, (fx, fy), 3, (255, 255, 255), -1)
-                    cv2.putText(viz_frame, f"Fish ({fx},{fy})", (fx + 15, fy - 5),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                    status_msg.append(f"Fish position: ({fx}, {fy})")
+                if not is_classic_mode:
+                    # ========== MINIGAME MODE DETECTION ==========
+                    # Detection 1: find_fishing_window_bounds
+                    window_bounds = self.bot.detector.find_fishing_window_bounds(frame)
+                    
+                    # Detection 2: detect_window_and_fish
+                    window_active, fish_pos = self.bot.detector.detect_window_and_fish(frame)
+                    
+                    # Draw window bounds if found
+                    if window_bounds:
+                        x, y, bw, bh = window_bounds
+                        cv2.rectangle(viz_frame, (x, y), (x + bw, y + bh), (0, 255, 0), 3)
+                        cv2.putText(viz_frame, f"Window: {bw}x{bh}", (x, y - 5),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                        status_msg.append(f"Window bounds: ({x}, {y}) {bw}x{bh}")
+                    else:
+                        status_msg.append("Window bounds: NOT FOUND")
+                    
+                    # Draw window active status
+                    if window_active:
+                        cv2.putText(viz_frame, "WINDOW ACTIVE", (20, 40),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                        status_msg.append("Window active: YES")
+                    else:
+                        cv2.putText(viz_frame, "WINDOW INACTIVE", (20, 40),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                        status_msg.append("Window active: NO")
+                    
+                    # Draw fish position if detected
+                    if fish_pos:
+                        fx, fy = fish_pos
+                        cv2.circle(viz_frame, (fx, fy), 12, (0, 0, 255), 2)
+                        cv2.circle(viz_frame, (fx, fy), 3, (255, 255, 255), -1)
+                        cv2.putText(viz_frame, f"Fish ({fx},{fy})", (fx + 15, fy - 5),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                        status_msg.append(f"Fish position: ({fx}, {fy})")
+                    else:
+                        status_msg.append("Fish position: NOT DETECTED")
+                    
+                    # Draw circle region if region is calibrated
+                    if self.bot.region and self.bot.region_auto_calibrated:
+                        cx = self.bot.region.left + self.bot.region.width // 2
+                        cy = self.bot.region.top + self.bot.region.height // 2
+                        radius = 67
+                        cv2.circle(viz_frame, (cx, cy), radius, (255, 255, 0), 2)
+                        cv2.putText(viz_frame, "Click zone", (cx - 40, cy - radius - 10),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                
                 else:
-                    status_msg.append("Fish position: NOT DETECTED")
-                
-                # Draw circle region if region is calibrated
-                if self.bot.region and self.bot.region_auto_calibrated:
-                    cx = self.bot.region.left + self.bot.region.width // 2
-                    cy = self.bot.region.top + self.bot.region.height // 2
-                    radius = 67
-                    cv2.circle(viz_frame, (cx, cy), radius, (255, 255, 0), 2)
-                    cv2.putText(viz_frame, "Click zone", (cx - 40, cy - radius - 10),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                    # ========== CLASSIC FISHING MODE DETECTION ==========
+                    # Load classic fish template if available
+                    template = self.bot._load_classic_fish_template()
+                    if template is not None:
+                        frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                        t_h, t_w = template.shape
+                        f_h, f_w = frame_gray.shape
+                        
+                        # Crop to 250px wide centered bar, upper half only (same as detection)
+                        center_x = f_w // 2
+                        crop_left = max(0, center_x - 125)
+                        crop_right = min(f_w, center_x + 125)
+                        crop_bottom = f_h // 2  # Only upper half
+                        frame_gray_cropped = frame_gray[:crop_bottom, crop_left:crop_right]
+                        
+                        # Draw the search region on viz_frame (semi-transparent overlay)
+                        overlay = viz_frame.copy()
+                        # Darken areas outside the search region
+                        overlay[:, :crop_left] = (overlay[:, :crop_left] * 0.3).astype(np.uint8)
+                        overlay[:, crop_right:] = (overlay[:, crop_right:] * 0.3).astype(np.uint8)
+                        overlay[crop_bottom:, :] = (overlay[crop_bottom:, :] * 0.3).astype(np.uint8)  # Darken lower half
+                        # Draw lines to mark search region
+                        cv2.line(overlay, (crop_left, 0), (crop_left, crop_bottom), (0, 255, 255), 2)
+                        cv2.line(overlay, (crop_right, 0), (crop_right, crop_bottom), (0, 255, 255), 2)
+                        cv2.line(overlay, (crop_left, crop_bottom), (crop_right, crop_bottom), (0, 255, 255), 2)  # Bottom line
+                        cv2.putText(overlay, "Search region (250px, upper, multi-scale)", (crop_left + 5, 25),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+                        viz_frame = overlay
+                        
+                        f_h_cropped, f_w_cropped = frame_gray_cropped.shape
+                        
+                        # Multi-scale template matching (same as detection code)
+                        scales = [0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.25, 2.5, 2.75, 3.0]
+                        best_match_val = 0
+                        best_scale = 1.0
+                        best_loc = (0, 0)
+                        best_size = (t_w, t_h)
+                        
+                        for scale in scales:
+                            new_w = int(t_w * scale)
+                            new_h = int(t_h * scale)
+                            
+                            if new_h > f_h_cropped or new_w > f_w_cropped or new_w < 10 or new_h < 10:
+                                continue
+                            
+                            scaled_template = cv2.resize(template, (new_w, new_h), interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR)
+                            result = cv2.matchTemplate(frame_gray_cropped, scaled_template, cv2.TM_CCOEFF_NORMED)
+                            _, max_val, _, max_loc = cv2.minMaxLoc(result)
+                            
+                            if max_val > best_match_val:
+                                best_match_val = max_val
+                                best_scale = scale
+                                best_loc = max_loc
+                                best_size = (new_w, new_h)
+                            
+                            if max_val >= 0.8:
+                                break
+                        
+                        if best_match_val >= 0.7:
+                            # Draw rectangle around detected classic fish (adjust x for crop offset)
+                            pt1 = (best_loc[0] + crop_left, best_loc[1])
+                            pt2 = (best_loc[0] + crop_left + best_size[0], best_loc[1] + best_size[1])
+                            cv2.rectangle(viz_frame, pt1, pt2, (255, 0, 255), 3)  # Magenta
+                            cv2.putText(viz_frame, f"CLASSIC FISH DETECTED!", 
+                                       (pt1[0], pt1[1] - 30),
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2)
+                            cv2.putText(viz_frame, f"Conf: {best_match_val:.2f}, Scale: {best_scale:.1f}x", 
+                                       (pt1[0], pt1[1] - 10),
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
+                            status_msg.append(f"Classic fish: DETECTED ({best_match_val:.2f}, {best_scale:.1f}x)")
+                        else:
+                            # Show confidence while searching
+                            cv2.putText(viz_frame, f"Searching (multi-scale 0.5x-1.5x)...", (20, 40),
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 128, 128), 2)
+                            cv2.putText(viz_frame, f"Best: {best_match_val:.2f} @ {best_scale:.1f}x (need 0.70)", (20, 70),
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (128, 128, 128), 2)
+                            status_msg.append(f"Classic fish: searching ({best_match_val:.2f})")
+                    else:
+                        cv2.putText(viz_frame, "NO CLASSIC FISH TEMPLATE!", (20, 40),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                        cv2.putText(viz_frame, "Add assets/classic_fish.jpg", (20, 70),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                        status_msg.append("Classic fish: NO TEMPLATE")
                 
                 self.status_label.config(text=f"Status: {' | '.join(status_msg[:2])}")
                 
@@ -2067,7 +2315,7 @@ class BotGUI:
         self.root.title("Fishing puzzle player (Multi-Window)")
         
         # Calculate window height based on DPI scaling
-        base_height = 850
+        base_height = 890
         try:
             dpi_scale = ctypes.windll.shcore.GetScaleFactorForDevice(0) / 100.0
             # Increase height proportionally for high DPI (add extra space)
@@ -2118,6 +2366,8 @@ class BotGUI:
             'human_like_clicking': True,
             'quick_skip': True,
             'sound_alert_on_finish': True,
+            'classic_fishing': False,
+            'classic_fishing_delay': 3.0,  # Delay in seconds after fish detection
             'auto_fish_handling': False,
             'fish_actions': {},  # {filename: 'keep'|'drop'|'open'}
         }
@@ -2276,16 +2526,47 @@ class BotGUI:
                                     padx=8, pady=5)
         config_frame.pack(fill=tk.X, pady=3)
         
+        # Classic Fishing checkbox (no minigame) - FIRST option
+        classic_frame = tk.Frame(config_frame, bg="#2a2a2a")
+        classic_frame.pack(anchor=tk.W, fill=tk.X, pady=2)
+        
+        self.classic_fishing_var = tk.BooleanVar(value=self.config.get('classic_fishing', False))
+        self.classic_fishing_check = tk.Checkbutton(classic_frame, 
+                                              text="Classic Fishing",
+                                              variable=self.classic_fishing_var,
+                                              command=self.toggle_classic_fishing,
+                                              bg="#2a2a2a", fg="#ffffff",
+                                              selectcolor="#1a1a1a",
+                                              activebackground="#2a2a2a",
+                                              font=("Courier New", 9))
+        self.classic_fishing_check.pack(side=tk.LEFT)
+        
+        # Delay input for classic fishing
+        tk.Label(classic_frame, text="Delay:", bg="#2a2a2a", fg="#aaaaaa",
+                font=("Courier New", 8)).pack(side=tk.LEFT, padx=(10, 2))
+        
+        self.classic_delay_var = tk.StringVar(value=str(self.config.get('classic_fishing_delay', 3.0)))
+        self.classic_delay_entry = tk.Entry(classic_frame, textvariable=self.classic_delay_var,
+                                           width=5, bg="#1a1a1a", fg="#00ff00",
+                                           font=("Courier New", 9), insertbackground="#00ff00")
+        self.classic_delay_entry.pack(side=tk.LEFT)
+        self.classic_delay_entry.bind('<FocusOut>', self.update_classic_delay)
+        self.classic_delay_entry.bind('<Return>', self.update_classic_delay)
+        
+        tk.Label(classic_frame, text="sec", bg="#2a2a2a", fg="#aaaaaa",
+                font=("Courier New", 8)).pack(side=tk.LEFT, padx=(2, 0))
+        
         # Human-like clicking
         self.human_like_var = tk.BooleanVar(value=self.config.get('human_like_clicking', True))
-        human_check = tk.Checkbutton(config_frame, 
+        self.human_like_check = tk.Checkbutton(config_frame, 
                                     text="Human-like clicking (random offset)",
                                     variable=self.human_like_var,
                                     bg="#2a2a2a", fg="#ffffff",
                                     selectcolor="#1a1a1a",
                                     activebackground="#2a2a2a",
+                                    disabledforeground="#666666",
                                     font=("Courier New", 9))
-        human_check.pack(anchor=tk.W, pady=2)
+        self.human_like_check.pack(anchor=tk.W, pady=2)
         
         # Quick skip checkbox
         self.quick_skip_var = tk.BooleanVar(value=self.config.get('quick_skip', False))
@@ -2406,6 +2687,9 @@ class BotGUI:
         
         # Update button state based on checkbox
         self.toggle_auto_fish_handling()
+        
+        # Update human-like clicking state based on classic fishing (no warning on startup)
+        self.toggle_classic_fishing(show_warning=False)
         
         # Statistics Section (Total across all windows)
         stats_frame = tk.LabelFrame(main, text="Total Statistics", 
@@ -2548,6 +2832,10 @@ class BotGUI:
                         self.config['quick_skip'] = saved_config['quick_skip']
                     if 'sound_alert_on_finish' in saved_config:
                         self.config['sound_alert_on_finish'] = saved_config['sound_alert_on_finish']
+                    if 'classic_fishing' in saved_config:
+                        self.config['classic_fishing'] = saved_config['classic_fishing']
+                    if 'classic_fishing_delay' in saved_config:
+                        self.config['classic_fishing_delay'] = saved_config['classic_fishing_delay']
                     # Restore bait keys
                     if 'bait_keys' in saved_config:
                         self.config['bait_keys'] = saved_config['bait_keys']
@@ -2590,6 +2878,8 @@ class BotGUI:
                 'human_like_clicking': self.config.get('human_like_clicking', True),
                 'quick_skip': self.config.get('quick_skip', False),
                 'sound_alert_on_finish': self.config.get('sound_alert_on_finish', True),
+                'classic_fishing': self.config.get('classic_fishing', False),
+                'classic_fishing_delay': self.config.get('classic_fishing_delay', 3.0),
                 'auto_fish_handling': self.config.get('auto_fish_handling', False),
                 'fish_actions': self.config.get('fish_actions', {}),
                 'bait_keys': selected_bait_keys,
@@ -2697,6 +2987,51 @@ class BotGUI:
             self.status_log_window.show()
         else:
             self.status_log_window.hide()
+    
+    def toggle_classic_fishing(self, show_warning: bool = True):
+        """Toggles the classic fishing mode and disables human-like clicking when enabled.
+        show_warning: If True, shows warning message when enabling. Set to False when loading from config."""
+        enabled = self.classic_fishing_var.get()
+        self.config['classic_fishing'] = enabled
+        
+        if enabled:
+            # Show warning message about classic fishing mode (only if user clicked, not on config load)
+            if show_warning:
+                messagebox.showwarning(
+                    "Classic Fishing Mode",
+                    "Classic Fishing Mode\n\n"
+                    "This mode only works with the OLD Metin2 fishing system!\n\n"
+                    "It will NOT work with the minigame fishing system.\n"
+                    "Make sure your server uses the classic fishing mechanics."
+                )
+            # Disable human-like clicking when classic fishing is enabled
+            self.human_like_check.config(state=tk.DISABLED)
+            self.classic_delay_entry.config(state=tk.NORMAL)
+        else:
+            # Re-enable human-like clicking when classic fishing is disabled
+            self.human_like_check.config(state=tk.NORMAL)
+        
+        self.save_config()
+    
+    def update_classic_delay(self, event=None):
+        """Updates the classic fishing delay from the entry field."""
+        try:
+            delay = float(self.classic_delay_var.get())
+            if delay < 0:
+                delay = 0
+            elif delay > 30:
+                delay = 30  # Max 30 seconds
+            self.config['classic_fishing_delay'] = delay
+            self.classic_delay_var.set(str(delay))
+            self.save_config()
+            
+            # Update running bots with new delay value
+            for bot_id, bot in self.bots.items():
+                if bot and bot.running:
+                    bot.config['classic_fishing_delay'] = delay
+        except ValueError:
+            # Reset to current config value if invalid
+            self.classic_delay_var.set(str(self.config.get('classic_fishing_delay', 3.0)))
     
     def toggle_auto_fish_handling(self):
         """Toggles the automatic fish handling feature and updates button state."""
@@ -2904,6 +3239,12 @@ class BotGUI:
         self.config['human_like_clicking'] = self.human_like_var.get()
         self.config['quick_skip'] = self.quick_skip_var.get()
         self.config['sound_alert_on_finish'] = self.sound_alert_var.get()
+        self.config['classic_fishing'] = self.classic_fishing_var.get()
+        # Update delay from entry field
+        try:
+            self.config['classic_fishing_delay'] = float(self.classic_delay_var.get())
+        except ValueError:
+            self.config['classic_fishing_delay'] = 3.0
         self.save_config()
         
         # Get selected bait keys
