@@ -1,0 +1,30 @@
+# Build artifacts
+build/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# PyInstaller
+*.manifest
+*.spec.bak
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# IDE settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Config files with user data
+bot_config.json
+
+# OS files
+Thumbs.db
+.DS_Store
