@@ -39,7 +39,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='MT2 Fishing Bot',
+    name='Fishing Puzzle Player v1.0.1',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -52,15 +52,4 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-)
-
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
-    name='MT2 Fishing Bot',
 )

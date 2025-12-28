@@ -1,4 +1,4 @@
-('C:\\Users\\boris\\Documents\\Fishing bot\\Minigame\\build\\build\\PYZ-00.pyz',
+('c:\\Users\\boris\\Documents\\Fishing bot\\Minigame\\build\\build\\PYZ-00.pyz',
  [('PIL',
    'C:\\Users\\boris\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\site-packages\\PIL\\__init__.py',
    'PYMODULE'),

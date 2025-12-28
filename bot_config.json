@@ -2,9 +2,9 @@
   "human_like_clicking": true,
   "quick_skip": true,
   "sound_alert_on_finish": true,
-  "classic_fishing": false,
-  "classic_fishing_delay": 3.0,
-  "auto_fish_handling": false,
+  "classic_fishing": true,
+  "classic_fishing_delay": 2.7,
+  "auto_fish_handling": true,
   "fish_actions": {
     "Aal_living.jpg": "keep",
     "Ayu_living.jpg": "open",

@@ -1049,7 +1049,16 @@ class FishingBot:
                 if best_match_val >= 0.7:  # Found the classic fish indicator
                     # Start timer IMMEDIATELY after detection (configurable delay)
                     delay = self.config.get('classic_fishing_delay', 3.0)
-                    time.sleep(delay-0.05)  # Subtract small polling delay
+                    # Use interruptible sleep that checks running/paused state
+                    delay_start = time.time()
+                    while time.time() - delay_start < (delay - 0.05):
+                        if not self.running:
+                            return False  # Bot stopped during delay
+                        if self.paused:
+                            time.sleep(0.1)
+                            delay_start = time.time()  # Reset delay when paused
+                            continue
+                        time.sleep(0.05)  # Small sleep increments
                     if self.on_status_update:
                         self.on_status_update(f"[W{self.bot_id+1}] Classic fish detected (confidence: {best_match_val:.2f}, scale: {best_scale:.1f}x, delay: {delay}s)")
                     return True
@@ -1178,21 +1187,52 @@ class FishingBot:
                     # Step 1: Wait for classic fish image to appear
                     fish_found = self.wait_for_classic_fish(timeout=40)
                     
+                    # Check if bot was stopped during wait
+                    if not self.running:
+                        break
+                    
                     if not fish_found:
-                        # Timeout waiting for fish - continue to next cast
+                        # Timeout waiting for fish - handle consecutive failures
+                        self.consecutive_failures += 1
                         if self.on_status_update:
-                            self.on_status_update(f"[W{self.bot_id+1}] No fish bite detected, recasting...")
+                            self.on_status_update(f"[W{self.bot_id+1}] No fish bite detected ({self.consecutive_failures}/2), recasting...")
+                        
+                        if self.consecutive_failures >= 2:
+                            self.adjust_bait_tier()
+                            if self.bait_counter <= 0:
+                                if self.on_status_update:
+                                    self.on_status_update(f"[W{self.bot_id+1}] Bait depleted after consecutive failures. Stopping bot.")
+                                self.running = False
+                                if self.on_bot_stop:
+                                    self.on_bot_stop(self.bot_id)
+                                break
+                            
+                        # Press CTRL+G once per failure to dismount horse if that's the issue
+                        # First failure: try to dismount if on horse
+                        # Second failure: you actually mounted in first attemp and now you need to unmount
+                        if self.on_status_update:
+                            self.on_status_update(f"[W{self.bot_id+1}] Pressing CTRL+G to dismount horse...")
+                        self.press_ctrl_key('g')
+                        time.sleep(0.15)
                         continue
+                    
+                    # Reset failure counter on successful fish detection
+                    self.consecutive_failures = 0
+                    
+                    # Handle pause before reeling in
+                    while self.paused and self.running:
+                        time.sleep(0.1)
+                    if not self.running:
+                        break
                     
                     # Timer already elapsed in wait_for_classic_fish - press space to reel in
                     # Acquire lock and activate window BEFORE pressing space (critical timing)
-                    with input_lock:
-                        self.window_manager.activate_window(force_activate=True)
-                        time.sleep(0.05)
-                        if self.keyboard_controller:
-                            self.keyboard_controller.press(Key.space)
-                            time.sleep(0.025)
-                            self.keyboard_controller.release(Key.space)
+                    self.press_key('space', "Reel in fish")
+                    time.sleep(0.05)
+                    
+                    # Handle caught item (if auto fish handling is enabled)
+                    self.handle_caught_item()
+                    
                     if self.on_status_update:
                         self.on_status_update(f"[W{self.bot_id+1}] Reeling in fish")
                     
@@ -1207,14 +1247,32 @@ class FishingBot:
                     if self.on_stats_update:
                         self.on_stats_update(self.bot_id, 0, self.total_games, self.bait_counter)
                     
-                    # Step 4: Quick skip or wait before next cast
+                    # Check if bot stopped before waiting
+                    if not self.running:
+                        break
+                    
+                    # Step 4: Quick skip or wait before next cast (with interruptible waits)
                     if self.bait_counter > 0:
                         if self.config.get('quick_skip', False):
-                            time.sleep(1)
+                            # Interruptible 1 second wait
+                            wait_end = time.time() + 0.5
+                            while time.time() < wait_end and self.running:
+                                if self.paused:
+                                    time.sleep(0.1)
+                                    continue
+                                time.sleep(0.05)
+                            if not self.running:
+                                break
                             self.quickskip()
                         else:
+                            # Interruptible random wait
                             wait_time = np.random.uniform(4, 4.5)
-                            time.sleep(wait_time)
+                            wait_end = time.time() + wait_time
+                            while time.time() < wait_end and self.running:
+                                if self.paused:
+                                    time.sleep(0.1)
+                                    continue
+                                time.sleep(0.05)
                 
             except Exception as e:
                 if self.on_status_update:
@@ -2312,7 +2370,7 @@ class BotGUI:
     
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Fishing puzzle player (Multi-Window)")
+        self.root.title("Fishing Puzzle Player v1.0.1")
         
         # Calculate window height based on DPI scaling
         base_height = 890
@@ -2427,7 +2485,7 @@ class BotGUI:
         title_container.pack(side=tk.LEFT, padx=10)
         
         # Title (always shown)
-        title = tk.Label(title_container, text="Fishing Puzzle Player", 
+        title = tk.Label(title_container, text="Fishing Puzzle Player v1.0.1", 
                         font=("Courier New", 16, "bold"), 
                         bg="#000000", fg="#FFD700")
         title.pack(anchor=tk.CENTER)
