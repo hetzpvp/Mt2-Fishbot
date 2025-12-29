@@ -731,7 +731,7 @@ class BotGUI:
         
         # Select Fishes button
         self.select_fishes_btn = tk.Button(fish_handling_row,
-                                          text="🐟 Select Fishes",
+                                          text="Select Fishes/Items",
                                           command=self.open_fish_selection_window,
                                           font=("Courier New", 8),
                                           bg="#3498db", fg="white",
@@ -1066,6 +1066,8 @@ class BotGUI:
         else:
             # Re-enable human-like clicking when classic fishing is disabled
             self.human_like_check.config(state=tk.NORMAL)
+            # Disable delay entry when classic fishing is disabled
+            self.classic_delay_entry.config(state=tk.DISABLED)
         
         self.save_config()
     
@@ -1291,6 +1293,14 @@ class BotGUI:
         self.last_action_time = current_time
         self.disable_buttons_for_cooldown()
         
+        # Check if bait keys are selected FIRST (before checking bait amounts)
+        selected_bait_keys = self.get_selected_bait_keys()
+        if not selected_bait_keys:
+            messagebox.showerror("No Bait Keys Selected", 
+                               "Please select at least one bait key!\n\n"
+                               "Available bait keys: 1, 2, 3, 4, F1, F2, F3, F4")
+            return
+        
         # Check if any selected window has 0 bait - force user to reset bait before starting
         windows_with_no_bait = [i + 1 for i in range(MAX_WINDOWS) 
                                 if self.window_selections[i].get() and self.window_stats[i]['bait'] <= 0]
@@ -1316,12 +1326,6 @@ class BotGUI:
         except ValueError:
             self.config['classic_fishing_delay'] = 3.0
         self.save_config()
-        
-        # Get selected bait keys
-        selected_bait_keys = self.get_selected_bait_keys()
-        if not selected_bait_keys:
-            messagebox.showerror("Error", "Please select at least one bait key!")
-            return
         
         # Get all available windows
         all_windows = WindowManager.get_all_windows()
@@ -1350,11 +1354,13 @@ class BotGUI:
             self.window_managers[bot_id] = wm
             
             # Create and configure bot
+            # Use current bait for this window (preserves remaining bait if bot was stopped)
+            current_bait = self.window_stats[bot_id]['bait'] if self.window_stats[bot_id]['bait'] > 0 else self.bait
             bot = FishingBot(
                 None, 
                 self.config.copy(), 
                 wm, 
-                bait_counter=self.bait, 
+                bait_counter=current_bait, 
                 bait_keys=selected_bait_keys.copy(),
                 bot_id=bot_id
             )
