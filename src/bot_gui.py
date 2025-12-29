@@ -596,25 +596,27 @@ class BotGUI:
         
         # Quick skip checkbox
         self.quick_skip_var = tk.BooleanVar(value=self.config.get('quick_skip', False))
-        quick_skip_check = tk.Checkbutton(config_frame, 
+        self.quick_skip_check = tk.Checkbutton(config_frame, 
                                          text="Quick skip (double press CTRL+G)",
                                          variable=self.quick_skip_var,
                                          bg="#2a2a2a", fg="#ffffff",
                                          selectcolor="#1a1a1a",
                                          activebackground="#2a2a2a",
+                                         disabledforeground="#666666",
                                          font=("Courier New", 9))
-        quick_skip_check.pack(anchor=tk.W, pady=2)
+        self.quick_skip_check.pack(anchor=tk.W, pady=2)
         
         # Sound alert checkbox
         self.sound_alert_var = tk.BooleanVar(value=self.config.get('sound_alert_on_finish', True))
-        sound_alert_check = tk.Checkbutton(config_frame, 
+        self.sound_alert_check = tk.Checkbutton(config_frame, 
                                           text="No bait alert",
                                           variable=self.sound_alert_var,
                                           bg="#2a2a2a", fg="#ffffff",
                                           selectcolor="#1a1a1a",
                                           activebackground="#2a2a2a",
+                                          disabledforeground="#666666",
                                           font=("Courier New", 9))
-        sound_alert_check.pack(anchor=tk.W, pady=2)
+        self.sound_alert_check.pack(anchor=tk.W, pady=2)
         
         # Bait Keys Selection Section
         bait_keys_frame = tk.LabelFrame(config_frame, text="Bait Keys (200 bait each)", 
@@ -631,6 +633,7 @@ class BotGUI:
         num_keys_frame.pack(fill=tk.X)
         
         self.bait_key_vars = {}
+        self.bait_key_checkboxes = {}  # Store references for enabling/disabling
         for key in ['1', '2', '3', '4']:
             var = tk.BooleanVar(value=key in saved_bait_keys)
             self.bait_key_vars[key] = var
@@ -639,9 +642,11 @@ class BotGUI:
                                bg="#2a2a2a", fg="#ffffff",
                                selectcolor="#1a1a1a",
                                activebackground="#2a2a2a",
+                               disabledforeground="#666666",
                                font=("Courier New", 9),
                                width=1)
             cb.pack(side=tk.LEFT, padx=(1, 18))
+            self.bait_key_checkboxes[key] = cb
         
         # Function keys row
         fn_keys_frame = tk.Frame(bait_keys_frame, bg="#2a2a2a")
@@ -655,9 +660,11 @@ class BotGUI:
                                bg="#2a2a2a", fg="#ffffff",
                                selectcolor="#1a1a1a",
                                activebackground="#2a2a2a",
+                               disabledforeground="#666666",
                                font=("Courier New", 9),
                                width=1)
             cb.pack(side=tk.LEFT, padx=(4, 14))
+            self.bait_key_checkboxes[key] = cb
         
         # Capacity label
         self.bait_capacity_label = tk.Label(bait_keys_frame, text="", 
@@ -689,15 +696,16 @@ class BotGUI:
         
         # Automatic fish handling checkbox
         self.auto_fish_var = tk.BooleanVar(value=self.config.get('auto_fish_handling', False))
-        auto_fish_check = tk.Checkbutton(fish_handling_row, 
+        self.auto_fish_check = tk.Checkbutton(fish_handling_row, 
                                         text="Enable",
                                         variable=self.auto_fish_var,
                                         command=self.toggle_auto_fish_handling,
                                         bg="#2a2a2a", fg="#ffffff",
                                         selectcolor="#1a1a1a",
                                         activebackground="#2a2a2a",
+                                        disabledforeground="#666666",
                                         font=("Courier New", 9))
-        auto_fish_check.pack(side=tk.LEFT, padx=2)
+        self.auto_fish_check.pack(side=tk.LEFT, padx=2)
         
         # Select Fishes button
         self.select_fishes_btn = tk.Button(fish_handling_row,
@@ -1347,6 +1355,9 @@ class BotGUI:
             messagebox.showerror("Error", "Please select at least one window!")
             return
         
+        # Disable configuration widgets while bots are running
+        self.set_config_widgets_state('disabled')
+        
         self.add_status(f"Started {started_count} bot(s)")
         
         # Keep bot reference for compatibility
@@ -1371,6 +1382,9 @@ class BotGUI:
         self.bots.clear()
         self.bot_threads.clear()
         self.bot = None
+        
+        # Re-enable configuration widgets when all bots stop
+        self.set_config_widgets_state('normal')
         
         self.add_status("All bots stopped")
     
@@ -1401,6 +1415,37 @@ class BotGUI:
         # Update active windows count
         active_count = len([b for b in self.bots.values() if b.running])
         self.active_windows_label.config(text=str(active_count))
+    
+    def set_config_widgets_state(self, state: str):
+        """Enables or disables all configuration widgets.
+        state: 'normal' to enable, 'disabled' to disable."""
+        # Classic fishing checkbox and delay entry
+        self.classic_fishing_check.config(state=state)
+        self.classic_delay_entry.config(state=state)
+        
+        # Human-like clicking checkbox
+        self.human_like_check.config(state=state)
+        
+        # Quick skip checkbox
+        self.quick_skip_check.config(state=state)
+        
+        # Sound alert checkbox
+        self.sound_alert_check.config(state=state)
+        
+        # Bait key checkboxes
+        for cb in self.bait_key_checkboxes.values():
+            cb.config(state=state)
+        
+        # Reset bait button
+        self.reset_btn.config(state=state)
+        
+        # Automatic fish handling checkbox and select fishes button
+        self.auto_fish_check.config(state=state)
+        # Only enable select fishes button if auto fish handling is enabled and we're enabling widgets
+        if state == 'normal' and self.auto_fish_var.get():
+            self.select_fishes_btn.config(state=tk.NORMAL)
+        else:
+            self.select_fishes_btn.config(state=tk.DISABLED)
     
     def on_bot_pause_toggle(self, bot_id: int, is_paused: bool):
         """Updates UI when a bot's pause state changes."""
@@ -1437,6 +1482,8 @@ class BotGUI:
         # Check if all bots stopped
         if not self.bots:
             self.bot = None
+            # Re-enable configuration widgets when all bots stop
+            self.set_config_widgets_state('normal')
         
         self.update_all_button_states()
     

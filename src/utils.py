@@ -14,10 +14,10 @@ input_lock = threading.Lock()
 MAX_WINDOWS = 8
 
 # Debug mode - enable/disable IgnoredPositionsWindow
-DEBUG_MODE_EN = True
+DEBUG_MODE_EN = False
 
 # Debug prints - enable/disable verbose debug print statements
-DEBUG_PRINTS = True
+DEBUG_PRINTS = False
 
 
 def get_resource_path(filename: str) -> str:

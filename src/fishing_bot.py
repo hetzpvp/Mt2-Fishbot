@@ -450,56 +450,61 @@ class FishingBot:
             return np.zeros((100, 100, 3), dtype=np.uint8)
     
     def atomic_capture_and_click(self) -> Tuple[bool, Optional[Tuple[int, int]]]:
-        """Captures screen and clicks fish if in circle. Two-phase: pre-check then lock+click.
+        """Captures screen and clicks fish if in circle. Optimized single-pass detection.
         Returns: (minigame_active, fish_position_clicked or None)"""
+        # Local references for speed
+        capture = self.capture_screen
+        detect = self.detector.detect_window_and_fish
+        circle_center = self._circle_center
+        radius_sq = self._circle_radius_sq
+        region_left = self.region.left
+        region_top = self.region.top
+        
         try:
             # ========== PHASE 1: Quick pre-check (NO LOCK) ==========
-            frame = self.capture_screen()
+            frame = capture()
+            window_active, fish_pos = detect(frame)
             
-            # Combined detection: single HSV conversion
-            window_active, fish_pos = self.detector.detect_window_and_fish(frame)
             if not window_active:
                 return (False, None)
             if not fish_pos:
                 return (True, None)
             
-            # Use cached circle values (no division)
-            if not self.is_fish_in_circle(fish_pos):
+            # Inline circle check for speed
+            fx, fy = fish_pos
+            cx, cy = circle_center
+            dx, dy = fx - cx, fy - cy
+            if (dx * dx + dy * dy) >= radius_sq:
                 return (True, None)
             
-            # Fish is in circle! Now get lock and capture FRESH position
-            
+            # Fish is in circle! Now get lock and click
             # ========== PHASE 2: Fresh capture + click (WITH LOCK) ==========
-            # Pre-compute region offset once (outside critical section)
-            region_left, region_top = self.region.left, self.region.top
-            
             with input_lock:
                 # Activate window
                 self.window_manager.activate_window(force_activate=True)
                 
                 # RE-CAPTURE fresh frame
-                frame = self.capture_screen()
+                frame = capture()
+                window_active, fish_pos = detect(frame)
                 
-                # Combined detection with single HSV conversion
-                window_active, fish_pos = self.detector.detect_window_and_fish(frame)
                 if not window_active:
                     return (False, None)
-                if not fish_pos or not self.is_fish_in_circle(fish_pos):
+                if not fish_pos:
                     return (True, None)
                 
-                # Click at FRESH position - inline coordinate conversion
-                x, y = fish_pos
-                win_left, win_top, _, _ = self.window_manager.get_window_rect()
-                screen_x = win_left + region_left + x
-                screen_y = win_top + region_top + y
+                # Inline circle check
+                fx, fy = fish_pos
+                dx, dy = fx - cx, fy - cy
+                if (dx * dx + dy * dy) >= radius_sq:
+                    return (True, None)
                 
-                # Optimized click sequence
-                pyautogui.moveTo(screen_x, screen_y, _pause=False)
-                time.sleep(0.012)  # Slightly reduced settle time
-                pyautogui.mouseDown(_pause=False)
-                time.sleep(0.008)  # Minimal down time
-                pyautogui.mouseUp(_pause=False)
-                time.sleep(0.035)  # Post-click settle
+                # Click at FRESH position
+                win_left, win_top, _, _ = self.window_manager.get_window_rect()
+                screen_x = win_left + region_left + fx
+                screen_y = win_top + region_top + fy
+                
+                # Ultra-fast click (no delays needed for most games)
+                pyautogui.click(screen_x, screen_y, _pause=False)
             # ========== LOCK RELEASED ==========
             
             return (True, fish_pos)
