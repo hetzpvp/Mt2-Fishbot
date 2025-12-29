@@ -18,7 +18,8 @@ from version import VERSION
 
 # File paths
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-MAIN_SCRIPT = os.path.join(SCRIPT_DIR, "Fishing puzzle player.py")
+SRC_DIR = os.path.join(SCRIPT_DIR, "src")
+MAIN_SCRIPT = os.path.join(SRC_DIR, "fishing_bot.py")
 SPEC_FILE = os.path.join(SCRIPT_DIR, "build.spec")
 
 # Patterns to find and replace
@@ -27,30 +28,40 @@ APP_NAME_VERSIONED = f"Fishing Puzzle Player v{VERSION}"
 
 
 def update_version_in_script():
-    """Updates the version string in the main Python script."""
-    print(f"Updating version in {MAIN_SCRIPT}...")
-    
-    with open(MAIN_SCRIPT, 'r', encoding='utf-8') as f:
-        content = f.read()
+    """Updates the version string in all Python scripts in src folder."""
+    print(f"Updating version in src folder...")
     
     # Pattern to match "Fishing Puzzle Player" or "Fishing puzzle player" with optional version (vX.X.X)
     # Case-insensitive matching for "puzzle player" part
     pattern = r'Fishing [Pp]uzzle [Pp]layer(?:\s+v[\d.]+)?'
     
-    # Count replacements
-    matches = re.findall(pattern, content)
-    if matches:
-        print(f"  Found {len(matches)} occurrence(s) to update")
-        for m in matches:
-            print(f"    - '{m}'")
+    # Find all Python files in src folder
+    py_files = [f for f in os.listdir(SRC_DIR) if f.endswith('.py')]
     
-    # Replace all occurrences
-    new_content = re.sub(pattern, APP_NAME_VERSIONED, content)
+    total_matches = 0
+    for py_file in py_files:
+        file_path = os.path.join(SRC_DIR, py_file)
+        
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        # Count replacements
+        matches = re.findall(pattern, content)
+        if matches:
+            print(f"  {py_file}: Found {len(matches)} occurrence(s)")
+            for m in matches:
+                print(f"    - '{m}'")
+            total_matches += len(matches)
+        
+        # Replace all occurrences
+        new_content = re.sub(pattern, APP_NAME_VERSIONED, content)
+        
+        if new_content != content:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(new_content)
     
-    if new_content != content:
-        with open(MAIN_SCRIPT, 'w', encoding='utf-8') as f:
-            f.write(new_content)
-        print(f"  Updated to: {APP_NAME_VERSIONED}")
+    if total_matches > 0:
+        print(f"  Updated {total_matches} occurrence(s) to: {APP_NAME_VERSIONED}")
     else:
         print("  No changes needed (already up to date)")
 
@@ -81,7 +92,7 @@ def clean_build_artifacts():
     """Removes build artifacts from previous builds."""
     print("Cleaning build artifacts...")
     
-    dirs_to_clean = ['build', 'dist', '__pycache__']
+    dirs_to_clean = ['build', 'dist', '__pycache__', os.path.join('src', '__pycache__')]
     
     for dir_name in dirs_to_clean:
         dir_path = os.path.join(SCRIPT_DIR, dir_name)

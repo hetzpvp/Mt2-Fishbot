@@ -3,12 +3,12 @@
 # Bundles the executable with the icon and GIF resources
 
 a = Analysis(
-    ['Fishing puzzle player.py'],
-    pathex=[],
+    ['src/fishing_bot.py'],
+    pathex=['src'],
     binaries=[],
     datas=[
-        ('monkey-eating.gif', '.'),
-        ('monkey.ico', '.'),
+        ('assets/monkey-eating.gif', '.'),
+        ('assets/monkey.ico', '.'),
         ('assets', 'assets'),
     ],
     hiddenimports=[
@@ -39,7 +39,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='Fishing Puzzle Player v1.0.1',
+    name='Fishing Puzzle Player v1.0.2',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -48,7 +48,7 @@ exe = EXE(
     runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
-    icon='monkey.ico',
+    icon='assets/monkey.ico',
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
