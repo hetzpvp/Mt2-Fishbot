@@ -47,9 +47,22 @@ class FishSelectionWindow:
         # Create window
         self.window = tk.Toplevel(parent)
         self.window.title("Fish & Item Selection")
-        self.window.geometry("570x615")
+        
+        # Calculate window dimensions based on DPI scaling
+        base_width = 570
+        base_height = 700
+        try:
+            dpi_scale = ctypes.windll.shcore.GetScaleFactorForDevice(0) / 100.0
+            # Scale dimensions proportionally for high DPI
+            window_width = int(base_width * max(1.0, dpi_scale * 0.9))
+            window_height = int(base_height * max(1.0, dpi_scale * 0.9))
+        except Exception:
+            window_width = base_width
+            window_height = base_height
+        
+        self.window.geometry(f"{window_width}x{window_height}")
         self.window.configure(bg="#1a1a1a")
-        self.window.resizable(False, False)
+        self.window.resizable(False, True)  # Allow vertical resize for DPI scaling
         
         # Try to load and set window icon
         icon_path = get_resource_path("monkey.ico")
@@ -83,7 +96,7 @@ class FishSelectionWindow:
         instructions_frame.pack(fill=tk.X, padx=5, pady=2)
         
         instructions = tk.Label(instructions_frame, 
-                               text="K=Keep (default)  | D=Drop  | O=Open (fish only)",
+                               text="K=Keep (default)  | D=Drop (coming soon)  | O=Open (fish only)",
                                font=("Courier New", 8),
                                bg="#2a2a2a", fg="#ffffff",
                                justify=tk.CENTER)
@@ -118,9 +131,10 @@ class FishSelectionWindow:
                  bg="#2ecc71", fg="white", font=("Courier New", 8),
                  cursor="hand2", padx=5).pack(side=tk.LEFT, padx=2)
         
+        # TODO: Re-enable Drop All button when drop functionality is implemented
         tk.Button(set_all_frame, text="Drop All", command=lambda: self.set_all_actions('drop'),
-                 bg="#e74c3c", fg="white", font=("Courier New", 8),
-                 cursor="hand2", padx=5).pack(side=tk.LEFT, padx=2)
+                 bg="#555555", fg="#888888", font=("Courier New", 8),
+                 cursor="arrow", padx=5, state=tk.DISABLED).pack(side=tk.LEFT, padx=2)
         
         tk.Button(set_all_frame, text="Open All (Fish)", command=self.set_all_fish_open,
                  bg="#3498db", fg="white", font=("Courier New", 8),
@@ -236,6 +250,7 @@ class FishSelectionWindow:
         current_action = self.current_actions.get(filename, 'keep')
         
         # Create action buttons: Fish get K D O, Items get K D only
+        # TODO: Re-enable 'drop' action when drop functionality is implemented
         buttons = {}
         if item_type == 'fish':
             button_actions = [('keep', 'K'), ('drop', 'D'), ('open', 'O')]
@@ -243,10 +258,15 @@ class FishSelectionWindow:
             button_actions = [('keep', 'K'), ('drop', 'D')]
         
         for idx, (action, symbol) in enumerate(button_actions):
+            # TODO: Remove disabled state for 'drop' when functionality is implemented
+            is_drop_disabled = (action == 'drop')
             btn = tk.Button(buttons_frame, text=symbol, width=3,
                            font=("Courier New", 6, "bold"),
-                           cursor="hand2",
+                           cursor="arrow" if is_drop_disabled else "hand2",
                            padx=2, pady=0,
+                           state=tk.DISABLED if is_drop_disabled else tk.NORMAL,
+                           bg="#555555" if is_drop_disabled else None,
+                           fg="#888888" if is_drop_disabled else None,
                            command=lambda f=filename, a=action: self.toggle_action(f, a))
             btn.grid(row=0, column=idx, padx=1, pady=0)
             buttons[action] = btn
@@ -363,7 +383,6 @@ class BotGUI:
                 print(f"Error loading icon: {e}")
         
         self.window_manager = WindowManager()
-        self.bot: Optional[FishingBot] = None  # For compatibility
         
         # Multi-window support: up to 8 bots
         self.bots: Dict[int, FishingBot] = {}  # bot_id -> FishingBot
@@ -384,6 +403,9 @@ class BotGUI:
         self.last_action_time = 0
         self.action_cooldown = 3.0  # seconds
         self.in_cooldown = False  # Flag to prevent button re-enabling during cooldown
+        
+        # Flag to prevent sound alert from playing multiple times
+        self._sound_alert_played = False
         
         # Config file path in the current working directory
         self.config_file = os.path.join(os.getcwd(), "bot_config.json")
@@ -1269,6 +1291,20 @@ class BotGUI:
         self.last_action_time = current_time
         self.disable_buttons_for_cooldown()
         
+        # Check if any selected window has 0 bait - force user to reset bait before starting
+        windows_with_no_bait = [i + 1 for i in range(MAX_WINDOWS) 
+                                if self.window_selections[i].get() and self.window_stats[i]['bait'] <= 0]
+        if windows_with_no_bait:
+            window_list = ", ".join(f"W{w}" for w in windows_with_no_bait)
+            messagebox.showerror("No Bait", 
+                               f"Bait counter is at 0 for: {window_list}\n\n"
+                               "Please click 'Reset All Bait' button to refill your bait "
+                               "before starting the bot.")
+            return
+        
+        # Reset sound alert flag for new session
+        self._sound_alert_played = False
+        
         # Get config
         self.config['human_like_clicking'] = self.human_like_var.get()
         self.config['quick_skip'] = self.quick_skip_var.get()
@@ -1324,7 +1360,6 @@ class BotGUI:
             )
             bot.on_status_update = self.add_status
             bot.on_stats_update = self.update_stats
-            bot.on_pause_toggle = self.on_bot_pause_toggle
             bot.on_bait_update = self.update_bait_from_bot
             bot.on_bot_stop = self.on_bot_stopped
             
@@ -1359,10 +1394,6 @@ class BotGUI:
         self.set_config_widgets_state('disabled')
         
         self.add_status(f"Started {started_count} bot(s)")
-        
-        # Keep bot reference for compatibility
-        if self.bots:
-            self.bot = list(self.bots.values())[0]
     
     def stop_all_bots(self):
         """Stops all running bots."""
@@ -1381,7 +1412,6 @@ class BotGUI:
         
         self.bots.clear()
         self.bot_threads.clear()
-        self.bot = None
         
         # Re-enable configuration widgets when all bots stop
         self.set_config_widgets_state('normal')
@@ -1447,15 +1477,6 @@ class BotGUI:
         else:
             self.select_fishes_btn.config(state=tk.DISABLED)
     
-    def on_bot_pause_toggle(self, bot_id: int, is_paused: bool):
-        """Updates UI when a bot's pause state changes."""
-        if bot_id in self.window_status_labels:
-            if is_paused:
-                self.window_status_labels[bot_id].config(text="🟡", fg="#f39c12")
-            else:
-                self.window_status_labels[bot_id].config(text="🟢", fg="#00ff00")
-        self.update_all_button_states()
-    
     def on_bot_stopped(self, bot_id: int):
         """Updates UI when a bot stops running."""
         if bot_id in self.window_status_labels:
@@ -1481,9 +1502,16 @@ class BotGUI:
         
         # Check if all bots stopped
         if not self.bots:
-            self.bot = None
             # Re-enable configuration widgets when all bots stop
             self.set_config_widgets_state('normal')
+            
+            # Play sound alert if all selected windows are out of bait (only once per session)
+            if self.config.get('sound_alert_on_finish', True) and not self._sound_alert_played:
+                total_bait = sum(self.window_stats[i]['bait'] for i in range(MAX_WINDOWS) if self.window_selections[i].get())
+                if total_bait <= 0:
+                    self._sound_alert_played = True
+                    from utils import play_rickroll_beep
+                    play_rickroll_beep()
         
         self.update_all_button_states()
     

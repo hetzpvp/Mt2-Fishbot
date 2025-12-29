@@ -74,13 +74,11 @@ class FishingBot:
         
         # Cached circle values for performance
         self._circle_center = None
-        self._circle_radius = 67
         self._circle_radius_sq = 67 * 67
         
         # Callbacks for GUI updates
         self.on_status_update = None
         self.on_stats_update = None
-        self.on_pause_toggle = None
         self.on_bait_update = None  # Callback for bait counter changes
         self.on_bot_stop = None  # Callback when bot stops
         
@@ -205,7 +203,6 @@ class FishingBot:
                 result_copy = result.copy()
                 
                 # Try to find first non-ignored match for this template
-                match_count = 0
                 while True:
                     _, max_val, _, max_loc = minMaxLoc(result_copy)
                     
@@ -216,7 +213,6 @@ class FishingBot:
                     pt_x, pt_y = max_loc
                     center_x = pt_x + half_w
                     center_y = pt_y + half_h
-                    match_count += 1
                     
                     # Check if this match is in ignore list
                     is_ignored = False
@@ -505,6 +501,7 @@ class FishingBot:
                 
                 # Ultra-fast click (no delays needed for most games)
                 pyautogui.click(screen_x, screen_y, _pause=False)
+                time.sleep(0.05)
             # ========== LOCK RELEASED ==========
             
             return (True, fish_pos)
@@ -513,21 +510,6 @@ class FishingBot:
             if self.on_status_update:
                 self.on_status_update(f"[W{self.bot_id+1}] Click error: {e}")
             return (True, None)
-    
-    def is_fish_in_circle(self, fish_pos: Tuple[int, int], 
-                          circle_info: Tuple[int, int, int] = None) -> bool:
-        """Checks if the detected fish is within the game circle.
-        Uses squared distance comparison to avoid expensive sqrt."""
-        fx, fy = fish_pos
-        if circle_info:
-            cx, cy, radius = circle_info
-            radius_sq = radius * radius
-        else:
-            # Use cached values for speed
-            cx, cy = self._circle_center
-            radius_sq = self._circle_radius_sq
-        dx, dy = fx - cx, fy - cy
-        return (dx * dx + dy * dy) < radius_sq
     
     def get_bait_key(self, bait_count: int) -> str:
         """Determines which keyboard key to press based on bait counter and selected keys."""
@@ -634,8 +616,9 @@ class FishingBot:
                 if self.on_status_update:
                     self.on_status_update(f"[W{self.bot_id+1}] Error pressing key '{key}': {e}")
     
-    def wait_for_minigame_window(self, timeout: float = 4.0) -> Optional[GameRegion]:
-        """Waits for and finds the fishing minigame window. Auto-calibrates region on first detection."""
+    def wait_for_minigame_window(self, timeout: float = 4.0) -> bool:
+        """Waits for and finds the fishing minigame window. Auto-calibrates region on first detection.
+        Returns True if minigame detected, False otherwise."""
         start_time = time.time()
         
         while self.running and time.time() - start_time < timeout:
@@ -655,7 +638,7 @@ class FishingBot:
                         self._update_region_cache()  # Update cached constants
                         if self.on_status_update:
                             self.on_status_update(f"[W{self.bot_id+1}] Auto-calibrated region: {w}x{h} at ({x},{y})")
-                        return self.region
+                        return True
                 else:
                     # Use standard detection after calibration
                     frame = self.capture_screen()
@@ -669,7 +652,7 @@ class FishingBot:
                     self.on_status_update(f"[W{self.bot_id+1}] Error: {e}")
                 time.sleep(0.05)
         
-        return None
+        return False
     
     def _scan_existing_inventory(self):
         """Scans inventory for all existing items and adds their positions to ignore list.
@@ -930,7 +913,7 @@ class FishingBot:
                         
                         # Small delay between attempts (minimized for responsiveness)
                         if human_like:
-                            time.sleep(np.random.uniform(0.15, 0.7))
+                            time.sleep(np.random.uniform(0.15, 0.4))
                         
                         try:
                             # Atomic operation: capture + detect + click all within lock
@@ -1068,8 +1051,6 @@ class FishingBot:
         
         if self.on_status_update:
             self.on_status_update(f"[W{self.bot_id+1}] Bot finished! Total games: {self.total_games}")
-        if self.bait_counter <= 0 and self.config.get('sound_alert_on_finish', True):
-            play_rickroll_beep()
         self.running = False
         if self.on_bot_stop:
             self.on_bot_stop(self.bot_id)
