@@ -499,9 +499,13 @@ class FishingBot:
                 screen_x = win_left + region_left + fx
                 screen_y = win_top + region_top + fy
                 
-                # Ultra-fast click (no delays needed for most games)
-                pyautogui.click(screen_x, screen_y, _pause=False)
-                time.sleep(0.05)
+                # Optimized click sequence
+                pyautogui.moveTo(screen_x, screen_y, _pause=False)
+                time.sleep(0.012)  # Slightly reduced settle time
+                pyautogui.mouseDown(_pause=False)
+                time.sleep(0.008)  # Minimal down time
+                pyautogui.mouseUp(_pause=False)
+                time.sleep(0.035)  # Post-click settle
             # ========== LOCK RELEASED ==========
             
             return (True, fish_pos)
@@ -950,8 +954,14 @@ class FishingBot:
                         if self.config.get('quick_skip', False):
                             self.quickskip()
                         else:
+                            # Interruptible wait that respects pause state
                             wait_time = np.random.uniform(4, 4.5)
-                            time.sleep(wait_time)
+                            wait_end = time.time() + wait_time
+                            while time.time() < wait_end and self.running:
+                                if self.paused:
+                                    time.sleep(0.1)
+                                    continue
+                                time.sleep(0.05)
                 else:
                     # Classic Fishing system - wait for fish indicator, then reel in
                     # Step 1: Wait for classic fish image to appear
