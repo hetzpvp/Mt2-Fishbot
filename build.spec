@@ -39,7 +39,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='Fishing Puzzle Player v1.0.2',
+    name='Fishing Puzzle Player v1.0.3',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

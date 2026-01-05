@@ -96,7 +96,7 @@ class FishSelectionWindow:
         instructions_frame.pack(fill=tk.X, padx=5, pady=2)
         
         instructions = tk.Label(instructions_frame, 
-                               text="K=Keep (default)  | D=Drop (coming soon)  | O=Open (fish only)",
+                               text="K=Keep (default)  | D=Drop (requires setup)  | O=Open (fish only)",
                                font=("Courier New", 8),
                                bg="#2a2a2a", fg="#ffffff",
                                justify=tk.CENTER)
@@ -131,10 +131,9 @@ class FishSelectionWindow:
                  bg="#2ecc71", fg="white", font=("Courier New", 8),
                  cursor="hand2", padx=5).pack(side=tk.LEFT, padx=2)
         
-        # TODO: Re-enable Drop All button when drop functionality is implemented
         tk.Button(set_all_frame, text="Drop All", command=lambda: self.set_all_actions('drop'),
-                 bg="#555555", fg="#888888", font=("Courier New", 8),
-                 cursor="arrow", padx=5, state=tk.DISABLED).pack(side=tk.LEFT, padx=2)
+                 bg="#e74c3c", fg="white", font=("Courier New", 8),
+                 cursor="hand2", padx=5).pack(side=tk.LEFT, padx=2)
         
         tk.Button(set_all_frame, text="Open All (Fish)", command=self.set_all_fish_open,
                  bg="#3498db", fg="white", font=("Courier New", 8),
@@ -250,7 +249,6 @@ class FishSelectionWindow:
         current_action = self.current_actions.get(filename, 'keep')
         
         # Create action buttons: Fish get K D O, Items get K D only
-        # TODO: Re-enable 'drop' action when drop functionality is implemented
         buttons = {}
         if item_type == 'fish':
             button_actions = [('keep', 'K'), ('drop', 'D'), ('open', 'O')]
@@ -258,15 +256,10 @@ class FishSelectionWindow:
             button_actions = [('keep', 'K'), ('drop', 'D')]
         
         for idx, (action, symbol) in enumerate(button_actions):
-            # TODO: Remove disabled state for 'drop' when functionality is implemented
-            is_drop_disabled = (action == 'drop')
             btn = tk.Button(buttons_frame, text=symbol, width=3,
                            font=("Courier New", 6, "bold"),
-                           cursor="arrow" if is_drop_disabled else "hand2",
+                           cursor="hand2",
                            padx=2, pady=0,
-                           state=tk.DISABLED if is_drop_disabled else tk.NORMAL,
-                           bg="#555555" if is_drop_disabled else None,
-                           fg="#888888" if is_drop_disabled else None,
                            command=lambda f=filename, a=action: self.toggle_action(f, a))
             btn.grid(row=0, column=idx, padx=1, pady=0)
             buttons[action] = btn
@@ -358,10 +351,10 @@ class BotGUI:
     
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Fishing Puzzle Player v1.0.2")
+        self.root.title("Fishing Puzzle Player v1.0.3")
         
         # Calculate window height based on DPI scaling
-        base_height = 890
+        base_height = 920
         try:
             dpi_scale = ctypes.windll.shcore.GetScaleFactorForDevice(0) / 100.0
             # Increase height proportionally for high DPI (add extra space)
@@ -371,7 +364,7 @@ class BotGUI:
         
         self.root.geometry(f"600x{window_height}")
         self.root.resizable(False, True)  # Allow vertical resize for DPI scaling
-        self.root.minsize(600, 750)
+        self.root.minsize(600, 780)
         self.root.configure(bg="#000000")
         
         # Try to load and set window icon
@@ -418,6 +411,8 @@ class BotGUI:
             'classic_fishing_delay': 3.0,  # Delay in seconds after fish detection
             'auto_fish_handling': False,
             'fish_actions': {},  # {filename: 'keep'|'drop'|'open'}
+            'drop_button_pos': None,  # (x, y) relative to window - drop/sell button
+            'confirm_button_pos': None,  # (x, y) relative to window - confirm button
         }
         
         # Bait counter
@@ -475,7 +470,7 @@ class BotGUI:
         title_container.pack(side=tk.LEFT, padx=10)
         
         # Title (always shown)
-        title = tk.Label(title_container, text="Fishing Puzzle Player v1.0.2", 
+        title = tk.Label(title_container, text="Fishing Puzzle Player v1.0.3", 
                         font=("Courier New", 16, "bold"), 
                         bg="#000000", fg="#FFD700")
         title.pack(anchor=tk.CENTER)
@@ -741,6 +736,57 @@ class BotGUI:
                                           padx=5, pady=2)
         self.select_fishes_btn.pack(side=tk.LEFT, padx=10)
         
+        # Drop Button Configuration Row
+        drop_config_row = tk.Frame(fish_handling_frame, bg="#2a2a2a")
+        drop_config_row.pack(fill=tk.X, pady=2)
+        
+        # Drop button position capture
+        self.drop_btn_pos_btn = tk.Button(drop_config_row,
+                                         text="Set Drop Button Coords",
+                                         command=lambda: self.start_position_capture('drop'),
+                                         font=("Courier New", 8),
+                                         bg="#555555", fg="white",
+                                         activebackground="#666666",
+                                         cursor="hand2",
+                                         state=tk.DISABLED,
+                                         padx=5, pady=2)
+        self.drop_btn_pos_btn.pack(side=tk.LEFT, padx=2)
+        
+        # Drop button position label
+        drop_pos = self.config.get('drop_button_pos')
+        drop_pos_text = f"({drop_pos[0]},{drop_pos[1]})" if drop_pos else "Not set"
+        self.drop_btn_pos_label = tk.Label(drop_config_row, text=drop_pos_text,
+                                          bg="#2a2a2a", 
+                                          fg="#00ff00" if drop_pos else "#e74c3c",
+                                          font=("Courier New", 8))
+        self.drop_btn_pos_label.pack(side=tk.LEFT, padx=2)
+        
+        # Confirm button position capture
+        self.confirm_btn_pos_btn = tk.Button(drop_config_row,
+                                            text="Set Confirm Button Coords",
+                                            command=lambda: self.start_position_capture('confirm'),
+                                            font=("Courier New", 8),
+                                            bg="#555555", fg="white",
+                                            activebackground="#666666",
+                                            cursor="hand2",
+                                            state=tk.DISABLED,
+                                            padx=5, pady=2)
+        self.confirm_btn_pos_btn.pack(side=tk.LEFT, padx=2)
+        
+        # Confirm button position label
+        confirm_pos = self.config.get('confirm_button_pos')
+        confirm_pos_text = f"({confirm_pos[0]},{confirm_pos[1]})" if confirm_pos else "Not set"
+        self.confirm_btn_pos_label = tk.Label(drop_config_row, text=confirm_pos_text,
+                                             bg="#2a2a2a", 
+                                             fg="#00ff00" if confirm_pos else "#e74c3c",
+                                             font=("Courier New", 8))
+        self.confirm_btn_pos_label.pack(side=tk.LEFT, padx=2)
+        
+        # Position capture state
+        self._position_capture_mode = None  # None, 'drop', or 'confirm'
+        self._position_capture_window = None  # Store the target window name
+        self._position_capture_listener = None
+        
         # Update button state based on checkbox
         self.toggle_auto_fish_handling()
         
@@ -903,6 +949,11 @@ class BotGUI:
                         self.config['auto_fish_handling'] = saved_config['auto_fish_handling']
                     if 'fish_actions' in saved_config:
                         self.config['fish_actions'] = saved_config['fish_actions']
+                    # Restore drop button positions
+                    if 'drop_button_pos' in saved_config:
+                        self.config['drop_button_pos'] = saved_config['drop_button_pos']
+                    if 'confirm_button_pos' in saved_config:
+                        self.config['confirm_button_pos'] = saved_config['confirm_button_pos']
                     # Store previously selected windows for later restoration (multi-window)
                     self.previous_windows = saved_config.get('selected_windows', [])
                     # Also support legacy single window
@@ -938,6 +989,8 @@ class BotGUI:
                 'classic_fishing_delay': self.config.get('classic_fishing_delay', 3.0),
                 'auto_fish_handling': self.config.get('auto_fish_handling', False),
                 'fish_actions': self.config.get('fish_actions', {}),
+                'drop_button_pos': self.config.get('drop_button_pos'),
+                'confirm_button_pos': self.config.get('confirm_button_pos'),
                 'bait_keys': selected_bait_keys,
                 'bait': self.bait,
                 'selected_windows': selected_windows,
@@ -1098,10 +1151,154 @@ class BotGUI:
         
         if enabled:
             self.select_fishes_btn.config(state=tk.NORMAL)
+            # Enable drop position buttons only if any fish is set to 'drop'
+            self._update_drop_buttons_state()
         else:
             self.select_fishes_btn.config(state=tk.DISABLED)
+            # Disable drop position buttons
+            if hasattr(self, 'drop_btn_pos_btn'):
+                self.drop_btn_pos_btn.config(state=tk.DISABLED)
+            if hasattr(self, 'confirm_btn_pos_btn'):
+                self.confirm_btn_pos_btn.config(state=tk.DISABLED)
         
         self.save_config()
+    
+    def _update_drop_buttons_state(self):
+        """Enables drop position buttons only if any fish/item is set to 'drop' action."""
+        fish_actions = self.config.get('fish_actions', {})
+        has_drop_action = any(action == 'drop' for action in fish_actions.values())
+        
+        if has_drop_action and self.auto_fish_var.get():
+            if hasattr(self, 'drop_btn_pos_btn'):
+                self.drop_btn_pos_btn.config(state=tk.NORMAL)
+            if hasattr(self, 'confirm_btn_pos_btn'):
+                self.confirm_btn_pos_btn.config(state=tk.NORMAL)
+        else:
+            if hasattr(self, 'drop_btn_pos_btn'):
+                self.drop_btn_pos_btn.config(state=tk.DISABLED)
+            if hasattr(self, 'confirm_btn_pos_btn'):
+                self.confirm_btn_pos_btn.config(state=tk.DISABLED)
+    
+    def start_position_capture(self, mode: str):
+        """Starts mouse position capture mode. User clicks in game window to set position.
+        mode: 'drop' or 'confirm'"""
+        # If already capturing for this mode, just reactivate the stored window
+        if self._position_capture_mode == mode and hasattr(self, '_position_capture_window') and self._position_capture_window:
+            try:
+                all_windows = WindowManager.get_all_windows()
+                window_dict = {name: win for name, win in all_windows}
+                if self._position_capture_window in window_dict:
+                    window_dict[self._position_capture_window].activate()
+                    self.add_status(f"Click on the {mode} button in the game window...")
+                    return
+            except Exception:
+                pass  # Fall through to normal capture startup
+        
+        # Check if at least one window is selected
+        selected_windows = [self.window_selections[i].get() for i in range(MAX_WINDOWS) if self.window_selections[i].get()]
+        if not selected_windows:
+            messagebox.showerror("No Window Selected", 
+                               "Please select at least one game window first!\n\n"
+                               "The position will be captured relative to the selected window.")
+            return
+        
+        self._position_capture_mode = mode
+        self._position_capture_window = selected_windows[0]  # Store the target window
+        
+        # Update button text to show capture mode is active
+        if mode == 'drop':
+            self.drop_btn_pos_btn.config(text="⏳ Click in game...", bg="#f39c12")
+        else:
+            self.confirm_btn_pos_btn.config(text="⏳ Click in game...", bg="#f39c12")
+        
+        self.add_status(f"Click on the {mode} button in the game window...")
+        
+        # Activate the first selected game window so user can click on it
+        try:
+            all_windows = WindowManager.get_all_windows()
+            window_dict = {name: win for name, win in all_windows}
+            if self._position_capture_window in window_dict:
+                window_dict[self._position_capture_window].activate()
+        except Exception as e:
+            self.add_status(f"Could not activate window: {e}")
+        
+        # Start mouse listener
+        try:
+            from pynput import mouse
+            
+            def on_click(x, y, button, pressed):
+                if pressed and button == mouse.Button.left:
+                    # Capture position relative to the first selected window
+                    self.root.after(0, lambda: self._capture_position_callback(x, y, mode))
+                    return False  # Stop listener
+            
+            self._position_capture_listener = mouse.Listener(on_click=on_click)
+            self._position_capture_listener.start()
+        except Exception as e:
+            self.add_status(f"Error starting mouse capture: {e}")
+            self._reset_position_capture_buttons()
+    
+    def _capture_position_callback(self, screen_x: int, screen_y: int, mode: str):
+        """Callback when position is captured. Converts screen coords to window-relative."""
+        try:
+            # Use the stored target window from position capture start
+            selected_name = getattr(self, '_position_capture_window', None)
+            
+            if not selected_name:
+                self.add_status("No window stored for capture!")
+                self._reset_position_capture_buttons()
+                return
+            
+            # Get window rect
+            all_windows = WindowManager.get_all_windows()
+            window_dict = {name: win for name, win in all_windows}
+            
+            if selected_name not in window_dict:
+                self.add_status(f"Window not found: {selected_name}")
+                self._reset_position_capture_buttons()
+                return
+            
+            selected_window = window_dict[selected_name]
+            wm = WindowManager()
+            wm.selected_window = selected_window
+            win_left, win_top, _, _ = wm.get_window_rect()
+            
+            # Calculate relative position
+            rel_x = screen_x - win_left
+            rel_y = screen_y - win_top
+            
+            # Store position in config
+            if mode == 'drop':
+                self.config['drop_button_pos'] = (rel_x, rel_y)
+                self.drop_btn_pos_label.config(text=f"({rel_x},{rel_y})", fg="#00ff00")
+                self.add_status(f"Drop button position set: ({rel_x}, {rel_y})")
+            else:
+                self.config['confirm_button_pos'] = (rel_x, rel_y)
+                self.confirm_btn_pos_label.config(text=f"({rel_x},{rel_y})", fg="#00ff00")
+                self.add_status(f"Confirm button position set: ({rel_x}, {rel_y})")
+            
+            self.save_config()
+            
+        except Exception as e:
+            self.add_status(f"Error capturing position: {e}")
+        finally:
+            self._reset_position_capture_buttons()
+    
+    def _reset_position_capture_buttons(self):
+        """Resets position capture buttons to their normal state."""
+        self._position_capture_mode = None
+        self._position_capture_window = None  # Clear stored window
+        if self._position_capture_listener:
+            try:
+                self._position_capture_listener.stop()
+            except:
+                pass
+            self._position_capture_listener = None
+        
+        if hasattr(self, 'drop_btn_pos_btn'):
+            self.drop_btn_pos_btn.config(text="Set Drop Button Coords", bg="#555555")
+        if hasattr(self, 'confirm_btn_pos_btn'):
+            self.confirm_btn_pos_btn.config(text="Set Confirm Button Coords", bg="#555555")
     
     def open_fish_selection_window(self):
         """Opens the fish selection window for configuring fish/item actions."""
@@ -1127,6 +1324,8 @@ class BotGUI:
         self.config['fish_actions'] = fish_actions
         self.save_config()
         self.add_status(f"Fish actions saved: {len(fish_actions)} items configured")
+        # Update drop buttons state based on whether any item is set to 'drop'
+        self._update_drop_buttons_state()
 
     def on_window_selected(self, window_id: int):
         """Updates bait display when a window is selected."""
@@ -1311,6 +1510,32 @@ class BotGUI:
                                "Please click 'Reset All Bait' button to refill your bait "
                                "before starting the bot.")
             return
+        
+        # Check if drop positions are configured when any item is set to 'drop'
+        if self.config.get('auto_fish_handling', False):
+            fish_actions = self.config.get('fish_actions', {})
+            items_to_drop = [name for name, action in fish_actions.items() if action == 'drop']
+            
+            if items_to_drop:
+                drop_pos = self.config.get('drop_button_pos')
+                confirm_pos = self.config.get('confirm_button_pos')
+                
+                missing_positions = []
+                if not drop_pos:
+                    missing_positions.append("Drop Button")
+                if not confirm_pos:
+                    missing_positions.append("Confirm Button")
+                
+                if missing_positions:
+                    messagebox.showerror("Drop Positions Not Configured", 
+                                       f"You have items set to 'drop' but the following positions are not configured:\n\n"
+                                       f"• {chr(10).join(missing_positions)}\n\n"
+                                       "Please configure the drop/sell/destroy and confirm button positions in the\n"
+                                       "'Automatic Fish Handling' section before starting the bot.\n\n"
+                                       "1. Drop an item in the game to open the drop/destroy/sell window\n"
+                                       "2. Click 'Set Drop Button Coords' and click on the drop/sell/destroy button in the game\n"
+                                       "3. Click 'Set Confirm Button Coords' and click on the confirm button in the game")
+                    return
         
         # Reset sound alert flag for new session
         self._sound_alert_played = False

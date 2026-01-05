@@ -302,28 +302,29 @@ class FishingBot:
             return
         
         try: 
+            # Activate our window first
+            with input_lock:
+                self.window_manager.activate_window(force_activate=True)
+            # Small delay for item to appear in inventory
+            time.sleep(0.2)
+            
+            # Capture inventory area
+            inventory_frame = self.capture_inventory_area()
+            
+            # Identify the item (ignoring known dead fish positions)
+            match = self.identify_item_in_inventory(inventory_frame, ignore_positions=self._ignored_positions)
+                        
+            if not match:
+                return  # No item found, that's OK (not every catch gives an item)
+            
+            filename, (inv_x, inv_y) = match
+            
+            action = fish_actions.get(filename, 'keep')
+
             # ========== ACQUIRE LOCK FOR ENTIRE DETECTION + ACTION SEQUENCE ==========
             # This prevents another bot from moving the mouse/clicking between our
             # detection and action, which could cause clicking on the wrong fish
             with input_lock:
-                # Activate our window first
-                self.window_manager.activate_window(force_activate=True)
-                # Small delay for item to appear in inventory
-                time.sleep(0.2)
-                
-                # Capture inventory area
-                inventory_frame = self.capture_inventory_area()
-                
-                # Identify the item (ignoring known dead fish positions)
-                match = self.identify_item_in_inventory(inventory_frame, ignore_positions=self._ignored_positions)
-                            
-                if not match:
-                    return  # No item found, that's OK (not every catch gives an item)
-                
-                filename, (inv_x, inv_y) = match
-                
-                action = fish_actions.get(filename, 'keep')
-                
                 if action == 'keep':
                     # Item stays in inventory - add to ignore list so we don't process it again
                     self._ignored_positions.add((inv_x, inv_y))
@@ -344,17 +345,111 @@ class FishingBot:
                     pyautogui.moveTo(screen_x, screen_y, _pause=False)
                     time.sleep(0.05)
                     pyautogui.click(button='right', _pause=False)
-                    time.sleep(0.2)  # Wait for game to process
+                    time.sleep(0.1)  # Wait for game to process
                     
                     # Move cursor to center of the window (safe position)
                     win_center_x = win_left + win_width // 2
                     win_center_y = win_top + 400  # Upper-middle area of window
                     pyautogui.moveTo(win_center_x, win_center_y, _pause=False)
                     
+                elif action == 'drop':
+                    # Drop functionality - validate config, do initial right-click test
+                    drop_pos = self.config.get('drop_button_pos')
+                    confirm_pos = self.config.get('confirm_button_pos')
+                    
+                    if not drop_pos or not confirm_pos:
+                        if self.on_status_update:
+                            self.on_status_update(f"[W{self.bot_id+1}] Drop positions not configured! Keeping: {filename}")
+                        self._ignored_positions.add((inv_x, inv_y))
+                        return
+                    
+                    if self.on_status_update:
+                        self.on_status_update(f"[W{self.bot_id+1}] Dropping: {filename.replace('_living.jpg', '').replace('_item.jpg', '')}")
+                    
+                    # Convert inventory-relative coords to screen coords
+                    win_left, win_top, win_width, win_height = self.window_manager.get_window_rect()
+                    screen_x = win_left + win_width - self._inventory_width + inv_x
+                    screen_y = win_top + self._inventory_y_offset + inv_y
+                    
+                    # Only right-click test for fish (to check if it can be opened)
+                    # Items (_item) go directly to drop sequence
+                    is_fish = '_living' in filename
+                    if is_fish:
+                        # Right-click sequence to test if fish can be opened (already inside lock)
+                        pyautogui.moveTo(screen_x, screen_y, _pause=False)
+                        time.sleep(0.05)
+                        pyautogui.click(button='right', _pause=False)
+                        time.sleep(0.1)  # Wait for game to process
+                    # Lock released after right-click - check happens outside
+                    
             # ========== LOCK RELEASED ==========
             
-            # Dead fish detection can happen outside lock (read-only captures)
-            if action == 'open':
+            # Dead fish detection and drop sequence happen outside main lock (read-only captures)
+            if action == 'drop':
+                # Determine if this is a fish (needs dead fish check) or item (drop directly)
+                is_fish = '_living' in filename
+                
+                if is_fish:
+                    time.sleep(0.1)  # Wait for game to process right-click
+                    
+                    inventory_frame_after = self.capture_inventory_area()
+                    
+                    # Check if the SAME fish is still at the SAME position
+                    still_there = self._is_item_at_position(inventory_frame_after, inv_x, inv_y)
+                else:
+                    # Items always need to be dropped (no right-click test)
+                    still_there = True
+                
+                # If fish is still there (can't be opened) or it's an item, perform drop sequence
+                if still_there:
+                    # Re-acquire lock only for the mouse operations
+                    with input_lock:
+                        # Re-activate window
+                        self.window_manager.activate_window(force_activate=True)
+                        
+                        # Re-fetch window rect in case it moved
+                        win_left, win_top, win_width, win_height = self.window_manager.get_window_rect()
+                        screen_x = win_left + win_width - self._inventory_width + inv_x
+                        screen_y = win_top + self._inventory_y_offset + inv_y
+                        
+                        # ========== DROP SEQUENCE ==========
+                        # Step 1: Left-click on the item to pick it up
+                        pyautogui.moveTo(screen_x, screen_y, _pause=False)
+                        time.sleep(np.random.uniform(0.03, 0.07))
+                        pyautogui.click(_pause=False)
+                        time.sleep(np.random.uniform(0.08, 0.15))
+                        
+                        # Step 2: Move cursor to middle of window
+                        win_center_x = win_left + win_width // 2
+                        win_center_y = win_top + win_height // 2
+                        pyautogui.moveTo(win_center_x, win_center_y, _pause=False)
+                        time.sleep(np.random.uniform(0.03, 0.07))
+                        
+                        # Step 3: Left-click to drop the item
+                        pyautogui.click(_pause=False)
+                        time.sleep(np.random.uniform(0.1, 0.2))
+                        
+                        # Step 4: Click the drop button (relative to window)
+                        drop_screen_x = win_left + drop_pos[0]
+                        drop_screen_y = win_top + drop_pos[1]
+                        pyautogui.moveTo(drop_screen_x, drop_screen_y, _pause=False)
+                        time.sleep(np.random.uniform(0.03, 0.07))
+                        pyautogui.click(_pause=False)
+                        time.sleep(np.random.uniform(0.1, 0.2))
+                        
+                        # Step 5: Click the confirm button (relative to window)
+                        confirm_screen_x = win_left + confirm_pos[0]
+                        confirm_screen_y = win_top + confirm_pos[1]
+                        pyautogui.moveTo(confirm_screen_x, confirm_screen_y, _pause=False)
+                        time.sleep(np.random.uniform(0.03, 0.07))
+                        pyautogui.click(_pause=False)
+                        
+                        # Move cursor to safe position (last mouse op before releasing lock)
+                        pyautogui.moveTo(win_center_x, win_center_y, _pause=False)
+                    # ========== DROP LOCK RELEASED ==========
+                    time.sleep(np.random.uniform(0.08, 0.15))  # Final settle outside lock
+            
+            elif action == 'open':
                 time.sleep(0.1)  # Wait for right click to register
                 
                 inventory_frame_after = self.capture_inventory_area()
@@ -371,12 +466,6 @@ class FishingBot:
                     # Only mark as dead if BOTH checks confirm it's still there
                     if still_there_safety:
                         self._ignored_positions.add((inv_x, inv_y))
-                
-            elif action == 'drop':
-                # TODO: Implement drop functionality later
-                if self.on_status_update:
-                    self.on_status_update(f"[W{self.bot_id+1}] Drop not implemented yet: {filename}")
-                pass
                 
         except Exception as e:
             pass
