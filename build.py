@@ -66,6 +66,34 @@ def update_version_in_script():
         print("  No changes needed (already up to date)")
 
 
+def update_bot_version_in_gui():
+    """Updates BOT_VERSION in bot_gui.py to match version.py."""
+    print(f"Updating BOT_VERSION in bot_gui.py...")
+    
+    bot_gui_path = os.path.join(SRC_DIR, "bot_gui.py")
+    
+    if not os.path.exists(bot_gui_path):
+        print(f"  Warning: {bot_gui_path} not found")
+        return
+    
+    with open(bot_gui_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+    
+    # Pattern to match: BOT_VERSION = "X.X.X"  # Version for config validation
+    # Captures the version number
+    pattern = r'BOT_VERSION\s*=\s*"[\d.]+"(\s*#\s*Version for config validation)?'
+    replacement = f'BOT_VERSION = "{VERSION}"  # Version for config validation'
+    
+    new_content = re.sub(pattern, replacement, content)
+    
+    if new_content != content:
+        with open(bot_gui_path, 'w', encoding='utf-8') as f:
+            f.write(new_content)
+        print(f"  Updated BOT_VERSION to: {VERSION}")
+    else:
+        print("  No changes needed (already up to date)")
+
+
 def update_version_in_spec():
     """Updates the exe name in the spec file to include version."""
     print(f"Updating version in {SPEC_FILE}...")
@@ -147,6 +175,7 @@ def main():
     
     # Update version strings
     update_version_in_script()
+    update_bot_version_in_gui()
     update_version_in_spec()
     
     # Run PyInstaller

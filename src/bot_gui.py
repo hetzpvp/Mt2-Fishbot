@@ -368,6 +368,8 @@ class FishSelectionWindow:
 class BotGUI:
     """GUI for the fishing bot - supports up to 8 simultaneous windows"""
     
+    BOT_VERSION = "1.0.3"  # Version for config validation
+    
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Fishing Puzzle Player v1.0.3")
@@ -423,6 +425,7 @@ class BotGUI:
         self.config_file = os.path.join(os.getcwd(), "bot_config.json")
         
         self.config = {
+            'version': self.BOT_VERSION,  # Bot version for config validation
             'human_like_clicking': True,
             'quick_skip': True,
             'sound_alert_on_finish': True,
@@ -951,12 +954,21 @@ class BotGUI:
     def load_config(self):
         """
         Loads configuration from the config file if it exists.
+        Validates version - if version is missing or different, config is recreated.
         Restores human_like_clicking, quick_skip, bait counter, bait keys, and window selections.
         """
         if os.path.exists(self.config_file):
             try:
                 with open(self.config_file, 'r') as f:
                     saved_config = json.load(f)
+                    
+                    # Check version - if missing or different, treat as invalid and skip loading
+                    saved_version = saved_config.get('version')
+                    if saved_version != self.BOT_VERSION:
+                        print(f"Config version mismatch (saved: {saved_version}, current: {self.BOT_VERSION}). Recreating config.")
+                        self.previous_windows = []
+                        return
+                    
                     # Restore config settings
                     if 'human_like_clicking' in saved_config:
                         self.config['human_like_clicking'] = saved_config['human_like_clicking']
@@ -998,7 +1010,7 @@ class BotGUI:
     def save_config(self):
         """
         Saves current configuration to the config file.
-        Saves human_like_clicking, quick_skip, bait counter, and selected windows.
+        Always saves the bot version for validation on next load.
         """
         try:
             # Get selected bait keys
@@ -1012,6 +1024,7 @@ class BotGUI:
                     selected_windows.append(win_name)
             
             config_data = {
+                'version': self.BOT_VERSION,  # Always save current version
                 'human_like_clicking': self.config.get('human_like_clicking', True),
                 'quick_skip': self.config.get('quick_skip', False),
                 'sound_alert_on_finish': self.config.get('sound_alert_on_finish', True),
