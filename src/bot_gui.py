@@ -37,10 +37,11 @@ class FishSelectionWindow:
         None: '#555555'       # Gray (not set)
     }
     
-    def __init__(self, parent, current_actions: dict, on_save_callback):
+    def __init__(self, parent, current_actions: dict, on_save_callback, config: dict = None):
         self.parent = parent
         self.current_actions = current_actions.copy()
         self.on_save_callback = on_save_callback
+        self.config = config or {}  # Store config for checking drop positions
         self.item_widgets = {}  # {filename: {'frame': frame, 'action_var': var, 'buttons': {}}}
         self.photo_images = []  # Keep references to prevent garbage collection
         
@@ -50,7 +51,7 @@ class FishSelectionWindow:
         
         # Calculate window dimensions based on DPI scaling
         base_width = 570
-        base_height = 700
+        base_height = 790
         try:
             dpi_scale = ctypes.windll.shcore.GetScaleFactorForDevice(0) / 100.0
             # Scale dimensions proportionally for high DPI
@@ -335,6 +336,24 @@ class FishSelectionWindow:
                                  "Fish: Keep, Drop, or Open\n"
                                  "Items: Keep or Drop")
             return
+        
+        # Check if any item is set to 'drop' and drop positions are not configured
+        items_to_drop = [name for name, action in self.current_actions.items() if action == 'drop']
+        if items_to_drop:
+            drop_pos = self.config.get('drop_button_pos')
+            confirm_pos = self.config.get('confirm_button_pos')
+            
+            # Only show warning if positions are not yet configured
+            if not drop_pos or not confirm_pos:
+                messagebox.showinfo("WARNING: Please configure button positions!", 
+                                   "The fishbot needs to know where to click in order to to drop/sell/destroy items.\n\n"
+                                   "Please configure the drop/sell/destroy and the confirm button positions in the\n"
+                                   "'Automatic Fish Handling' section before starting the bot.\n\n"
+                                   "STEPS TO CONFIGURE:\n"
+                                   "1. Drop an item to the floor and don't press anything (only to open the drop/destroy/sell window)\n"
+                                   "2. Click 'Set Drop Button Coords' and click on the drop/sell/destroy button in the game\n"
+                                   "3. Click 'Set Confirm Button Coords' and click on the confirm button to finalize dropping the item in game\n"
+                                   "4. Done! You can now start the bot safely.")
         
         # Call the callback with the actions
         if self.on_save_callback:
@@ -735,6 +754,17 @@ class BotGUI:
                                           state=tk.DISABLED,
                                           padx=5, pady=2)
         self.select_fishes_btn.pack(side=tk.LEFT, padx=10)
+        
+        # Help button for drop configuration guide
+        self.drop_help_btn = tk.Button(fish_handling_row,
+                                       text="❓ Help",
+                                       command=self.show_drop_config_guide,
+                                       font=("Courier New", 8),
+                                       bg="#9b59b6", fg="white",
+                                       activebackground="#8e44ad",
+                                       cursor="hand2",
+                                       padx=5, pady=2)
+        self.drop_help_btn.pack(side=tk.RIGHT, padx=2)
         
         # Drop Button Configuration Row
         drop_config_row = tk.Frame(fish_handling_frame, bg="#2a2a2a")
@@ -1163,6 +1193,18 @@ class BotGUI:
         
         self.save_config()
     
+    def show_drop_config_guide(self):
+        """Shows the drop configuration guide message."""
+        messagebox.showinfo("Drop Configuration Guide", 
+                           "The fishbot needs to know where to click in order to drop/sell/destroy items.\n\n"
+                           "Please configure the drop/sell/destroy and the confirm button positions in the\n"
+                           "'Automatic Fish Handling' section before starting the bot.\n\n"
+                           "STEPS TO CONFIGURE:\n"
+                           "1. Drop an item to the floor and don't press anything (only to open the drop/destroy/sell window)\n"
+                           "2. Click 'Set Drop Button Coords' and click on the drop/sell/destroy button in the game\n"
+                           "3. Click 'Set Confirm Button Coords' and click on the confirm button to finalize dropping the item in game\n"
+                           "4. Done! You can now start the bot safely.")
+    
     def _update_drop_buttons_state(self):
         """Enables drop position buttons only if any fish/item is set to 'drop' action."""
         fish_actions = self.config.get('fish_actions', {})
@@ -1316,7 +1358,8 @@ class BotGUI:
         self.fish_selection_window = FishSelectionWindow(
             self.root, 
             self.config.get('fish_actions', {}),
-            self.on_fish_actions_saved
+            self.on_fish_actions_saved,
+            self.config  # Pass config to check drop button positions
         )
     
     def on_fish_actions_saved(self, fish_actions: dict):
@@ -1527,14 +1570,17 @@ class BotGUI:
                     missing_positions.append("Confirm Button")
                 
                 if missing_positions:
-                    messagebox.showerror("Drop Positions Not Configured", 
-                                       f"You have items set to 'drop' but the following positions are not configured:\n\n"
+                    messagebox.showerror("Configure button positions!", 
+                                       "The fishbot needs to know where to click in order to to drop/sell/destroy items.\n\n"
+                                       f"The following buttons is still not configured:\n\n"
                                        f"• {chr(10).join(missing_positions)}\n\n"
-                                       "Please configure the drop/sell/destroy and confirm button positions in the\n"
+                                       "Please configure the drop/sell/destroy and the confirm button positions in the\n"
                                        "'Automatic Fish Handling' section before starting the bot.\n\n"
-                                       "1. Drop an item in the game to open the drop/destroy/sell window\n"
+                                       "STEPS TO CONFIGURE:\n"
+                                       "1. Drop an item to the floor and don't press anything (only to open the drop/destroy/sell window)\n"
                                        "2. Click 'Set Drop Button Coords' and click on the drop/sell/destroy button in the game\n"
-                                       "3. Click 'Set Confirm Button Coords' and click on the confirm button in the game")
+                                       "3. Click 'Set Confirm Button Coords' and click on the confirm button to finalize dropping the item in game\n"
+                                       "4. Done! You can now start the bot safely.")
                     return
         
         # Reset sound alert flag for new session
