@@ -368,11 +368,11 @@ class FishSelectionWindow:
 class BotGUI:
     """GUI for the fishing bot - supports up to 8 simultaneous windows"""
     
-    BOT_VERSION = "1.0.3"  # Version for config validation
+    BOT_VERSION = "1.0.3"  # Version for config validation and GUI display
     
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Fishing Puzzle Player v1.0.3")
+        self.root.title(f"Fishing Puzzle Player v{self.BOT_VERSION}")
         
         # Calculate window height based on DPI scaling
         base_height = 920
@@ -492,7 +492,7 @@ class BotGUI:
         title_container.pack(side=tk.LEFT, padx=10)
         
         # Title (always shown)
-        title = tk.Label(title_container, text="Fishing Puzzle Player v1.0.3", 
+        title = tk.Label(title_container, text=f"Fishing Puzzle Player v{self.BOT_VERSION}", 
                         font=("Courier New", 16, "bold"), 
                         bg="#000000", fg="#FFD700")
         title.pack(anchor=tk.CENTER)

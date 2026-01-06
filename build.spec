@@ -2,6 +2,8 @@
 # PyInstaller spec file for MT2 Fishing Bot
 # Bundles the executable with the icon and GIF resources
 
+import os
+
 a = Analysis(
     ['src/fishing_bot.py'],
     pathex=['src'],
@@ -48,7 +50,7 @@ exe = EXE(
     runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
-    icon='assets/monkey.ico',
+    icon=os.path.join(SPECPATH, 'assets/monkey.ico'),
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,

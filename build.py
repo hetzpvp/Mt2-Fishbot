@@ -27,45 +27,6 @@ APP_NAME_BASE = "Fishing Puzzle Player"
 APP_NAME_VERSIONED = f"Fishing Puzzle Player v{VERSION}"
 
 
-def update_version_in_script():
-    """Updates the version string in all Python scripts in src folder."""
-    print(f"Updating version in src folder...")
-    
-    # Pattern to match "Fishing Puzzle Player" or "Fishing puzzle player" with optional version (vX.X.X)
-    # Case-insensitive matching for "puzzle player" part
-    pattern = r'Fishing [Pp]uzzle [Pp]layer(?:\s+v[\d.]+)?'
-    
-    # Find all Python files in src folder
-    py_files = [f for f in os.listdir(SRC_DIR) if f.endswith('.py')]
-    
-    total_matches = 0
-    for py_file in py_files:
-        file_path = os.path.join(SRC_DIR, py_file)
-        
-        with open(file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        
-        # Count replacements
-        matches = re.findall(pattern, content)
-        if matches:
-            print(f"  {py_file}: Found {len(matches)} occurrence(s)")
-            for m in matches:
-                print(f"    - '{m}'")
-            total_matches += len(matches)
-        
-        # Replace all occurrences
-        new_content = re.sub(pattern, APP_NAME_VERSIONED, content)
-        
-        if new_content != content:
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(new_content)
-    
-    if total_matches > 0:
-        print(f"  Updated {total_matches} occurrence(s) to: {APP_NAME_VERSIONED}")
-    else:
-        print("  No changes needed (already up to date)")
-
-
 def update_bot_version_in_gui():
     """Updates BOT_VERSION in bot_gui.py to match version.py."""
     print(f"Updating BOT_VERSION in bot_gui.py...")
@@ -90,28 +51,6 @@ def update_bot_version_in_gui():
         with open(bot_gui_path, 'w', encoding='utf-8') as f:
             f.write(new_content)
         print(f"  Updated BOT_VERSION to: {VERSION}")
-    else:
-        print("  No changes needed (already up to date)")
-
-
-def update_version_in_spec():
-    """Updates the exe name in the spec file to include version."""
-    print(f"Updating version in {SPEC_FILE}...")
-    
-    with open(SPEC_FILE, 'r', encoding='utf-8') as f:
-        content = f.read()
-    
-    # Update the name in EXE section
-    # Pattern matches: name='Fishing Puzzle Player' with optional version
-    pattern = r"name='Fishing Puzzle Player(?:\s+v[\d.]+)?'"
-    replacement = f"name='{APP_NAME_VERSIONED}'"
-    
-    new_content = re.sub(pattern, replacement, content)
-    
-    if new_content != content:
-        with open(SPEC_FILE, 'w', encoding='utf-8') as f:
-            f.write(new_content)
-        print(f"  Updated exe name to: {APP_NAME_VERSIONED}")
     else:
         print("  No changes needed (already up to date)")
 
@@ -173,10 +112,9 @@ def main():
         clean_build_artifacts()
         print()
     
-    # Update version strings
-    update_version_in_script()
+    # Update BOT_VERSION from version.py
     update_bot_version_in_gui()
-    update_version_in_spec()
+    print()
     
     # Run PyInstaller
     success = run_pyinstaller()
