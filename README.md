@@ -81,7 +81,7 @@ Free fishing minigame bot for Metin2. No subscriptions, no licenses.
 
 ---
 
-## Donations
+## Donations :|
 
 **BTC:** `3AGrrTf1v9QZsMPEoezYTRbf9JyW4nQtHu`
 
