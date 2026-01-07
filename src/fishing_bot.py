@@ -52,6 +52,19 @@ class FishingBot:
     _template_border_crop = 7  # Pixels to crop from each edge of templates
     _classic_fish_template = None  # Cache for classic fish detection template
     
+    # Color templates for fish that look identical in grayscale
+    _confusable_fish = {
+        'Goldfish_living.jpg',
+        'Large_zander_living.jpg',
+        'Red_Dye_item.jpg',
+        'White_Dye_item.jpg',
+        'Yellow_Dye_item.jpg',
+        'Brown_Dye_item.jpg',
+        'Black_Dye_item.jpg',
+        'Bleach_item.jpg',
+    }
+    _color_template_cache = None  # Cache for colored versions of confusable fish
+    
     def __init__(self, region: GameRegion, config: dict, window_manager: WindowManager, 
                  bait_counter: int = 800, bait_keys: list = None, bot_id: int = 0):
         # Core components
@@ -142,6 +155,107 @@ class FishingBot:
             self.on_status_update(f"[W{self.bot_id+1}] Loaded {len(FishingBot._template_cache)} item templates (grayscale, cropped {border}px)")
         return FishingBot._template_cache
     
+    def _load_color_template_cache(self) -> Dict[str, tuple]:
+        """Loads color versions of confusable fish templates for disambiguation.
+        Returns dict of {filename: (bgr_template, half_width, half_height)}"""
+        if FishingBot._color_template_cache is not None:
+            return FishingBot._color_template_cache
+        
+        FishingBot._color_template_cache = {}
+        assets_path = get_resource_path("assets")
+        
+        if not os.path.exists(assets_path):
+            return FishingBot._color_template_cache
+        
+        border = FishingBot._template_border_crop
+        
+        for filename in FishingBot._confusable_fish:
+            try:
+                img_path = os.path.join(assets_path, filename)
+                if os.path.exists(img_path):
+                    template = cv2.imread(img_path)
+                    if template is not None:
+                        # Crop border from all edges (same as grayscale templates)
+                        h, w = template.shape[:2]
+                        if h > border * 2 and w > border * 2:
+                            template = template[border:h-border, border:w-border]
+                        
+                        h, w = template.shape[:2]
+                        FishingBot._color_template_cache[filename] = (template, w >> 1, h >> 1)
+            except Exception:
+                continue
+        
+        if self.on_status_update and FishingBot._color_template_cache:
+            self.on_status_update(f"[W{self.bot_id+1}] Loaded {len(FishingBot._color_template_cache)} color templates for disambiguation")
+        
+        return FishingBot._color_template_cache
+    
+    def _disambiguate_confusable_fish(self, inventory_frame_color: np.ndarray, inv_x: int, inv_y: int, matched_filename: str) -> str:
+        """Disambiguates between fish that look identical in grayscale using color comparison.
+        Returns the correct filename after color-based verification.
+        
+        Args:
+            inventory_frame_color: BGR color inventory frame
+            inv_x, inv_y: Center position of the detected fish in inventory
+            matched_filename: The filename that was matched in grayscale
+        
+        Returns:
+            Correct filename after color verification
+        """
+        color_templates = self._load_color_template_cache()
+        if not color_templates:
+            return matched_filename  # Fallback to original match
+        
+        # Get dimensions from matched template to extract region
+        gray_templates = self._load_template_cache()
+        if matched_filename not in gray_templates:
+            return matched_filename
+        
+        _, half_w, half_h = gray_templates[matched_filename]
+        
+        # Extract region around the detected fish (use template size)
+        inv_h, inv_w = inventory_frame_color.shape[:2]
+        x1 = max(0, inv_x - half_w - 5)
+        y1 = max(0, inv_y - half_h - 5)
+        x2 = min(inv_w, inv_x + half_w + 5)
+        y2 = min(inv_h, inv_y + half_h + 5)
+        
+        region = inventory_frame_color[y1:y2, x1:x2]
+        if region.size == 0:
+            return matched_filename
+        
+        best_match = matched_filename
+        best_confidence = 0.0
+        
+        # Compare against all confusable fish color templates
+        for filename in FishingBot._confusable_fish:
+            if filename not in color_templates:
+                continue
+            
+            color_template, _, _ = color_templates[filename]
+            t_h, t_w = color_template.shape[:2]
+            r_h, r_w = region.shape[:2]
+            
+            # Skip if template is larger than region
+            if t_h > r_h or t_w > r_w:
+                continue
+            
+            try:
+                # Color template matching (BGR)
+                result = cv2.matchTemplate(region, color_template, cv2.TM_CCOEFF_NORMED)
+                _, max_val, _, _ = cv2.minMaxLoc(result)
+                
+                if max_val > best_confidence:
+                    best_confidence = max_val
+                    best_match = filename
+            except Exception:
+                continue
+        
+        if best_match != matched_filename and self.on_status_update:
+            self.on_status_update(f"[W{self.bot_id+1}] Color disambiguation: {matched_filename} -> {best_match} (conf: {best_confidence:.2f})")
+        
+        return best_match
+    
     def capture_inventory_area(self) -> np.ndarray:
         """Captures the inventory area (right 270px of the game window, starting at y=300)."""
         try:
@@ -172,12 +286,14 @@ class FishingBot:
         Returns (filename, (x, y)) of best match or None if no match found.
         Coordinates are relative to inventory area.
         ignore_positions: set of (x, y) tuples to skip (dead fish locations).
-        If first match is ignored, tries to find another match within same template."""
+        If first match is ignored, tries to find another match within same template.
+        
+        For confusable fish (Goldfish vs Large_zander), uses color-based disambiguation."""
         templates = self._load_template_cache()
         if not templates:
             return None
         
-        # Convert inventory to grayscale once
+        # Convert inventory to grayscale once (keep color frame for disambiguation)
         inventory_gray = cv2.cvtColor(inventory_frame, cv2.COLOR_BGR2GRAY)
         inv_h, inv_w = inventory_gray.shape
         
@@ -187,6 +303,7 @@ class FishingBot:
         TM_CCOEFF_NORMED = cv2.TM_CCOEFF_NORMED
         CONFIDENCE_THRESHOLD = 0.80  # Lowered from 0.8 for better detection
         EARLY_EXIT_THRESHOLD = 0.90  # Near-perfect match, skip remaining templates
+        confusable_fish = FishingBot._confusable_fish
         
         best_match = None
         best_confidence = CONFIDENCE_THRESHOLD  # Start at threshold (only accept better)
@@ -225,10 +342,18 @@ class FishingBot:
                     # If not ignored and better than current best, accept it
                     if not is_ignored and max_val > best_confidence:
                         best_confidence = max_val
-                        best_match = (filename, (center_x, center_y))
+                        matched_filename = filename
                         
-                        # Early exit on near-perfect match
-                        if best_confidence >= EARLY_EXIT_THRESHOLD:
+                        # Disambiguate confusable fish using color comparison
+                        if filename in confusable_fish:
+                            matched_filename = self._disambiguate_confusable_fish(
+                                inventory_frame, center_x, center_y, filename
+                            )
+                        
+                        best_match = (matched_filename, (center_x, center_y))
+                        
+                        # Early exit on near-perfect match (but NOT for confusable fish)
+                        if best_confidence >= EARLY_EXIT_THRESHOLD and filename not in confusable_fish:
                             return best_match
                         break  # Found good match for this template, move to next template
                     
@@ -415,39 +540,39 @@ class FishingBot:
                         # ========== DROP SEQUENCE ==========
                         # Step 1: Left-click on the item to pick it up
                         pyautogui.moveTo(screen_x, screen_y, _pause=False)
-                        time.sleep(np.random.uniform(0.03, 0.07))
+                        time.sleep(np.random.uniform(0.1, 0.15))
                         pyautogui.click(_pause=False)
-                        time.sleep(np.random.uniform(0.08, 0.15))
+                        time.sleep(np.random.uniform(0.1, 0.15))
                         
                         # Step 2: Move cursor to middle of window
                         win_center_x = win_left + win_width // 2
                         win_center_y = win_top + win_height // 2
                         pyautogui.moveTo(win_center_x, win_center_y, _pause=False)
-                        time.sleep(np.random.uniform(0.03, 0.07))
+                        time.sleep(np.random.uniform(0.1, 0.15))
                         
                         # Step 3: Left-click to drop the item
                         pyautogui.click(_pause=False)
-                        time.sleep(np.random.uniform(0.1, 0.2))
+                        time.sleep(np.random.uniform(0.1, 0.15))
                         
                         # Step 4: Click the drop button (relative to window)
                         drop_screen_x = win_left + drop_pos[0]
                         drop_screen_y = win_top + drop_pos[1]
                         pyautogui.moveTo(drop_screen_x, drop_screen_y, _pause=False)
-                        time.sleep(np.random.uniform(0.03, 0.07))
+                        time.sleep(np.random.uniform(0.1, 0.15))
                         pyautogui.click(_pause=False)
-                        time.sleep(np.random.uniform(0.1, 0.2))
+                        time.sleep(np.random.uniform(0.1, 0.15))
                         
                         # Step 5: Click the confirm button (relative to window)
                         confirm_screen_x = win_left + confirm_pos[0]
                         confirm_screen_y = win_top + confirm_pos[1]
                         pyautogui.moveTo(confirm_screen_x, confirm_screen_y, _pause=False)
-                        time.sleep(np.random.uniform(0.03, 0.07))
+                        time.sleep(np.random.uniform(0.1, 0.15))
                         pyautogui.click(_pause=False)
                         
                         # Move cursor to safe position (last mouse op before releasing lock)
                         pyautogui.moveTo(win_center_x, win_center_y, _pause=False)
                     # ========== DROP LOCK RELEASED ==========
-                    time.sleep(np.random.uniform(0.08, 0.15))  # Final settle outside lock
+                    time.sleep(np.random.uniform(0.1, 0.15))  # Final settle outside lock
             
             elif action == 'open':
                 time.sleep(0.1)  # Wait for right click to register
@@ -759,51 +884,59 @@ class FishingBot:
             # Activate window before capturing
             self.window_manager.activate_window(force_activate=True)
             time.sleep(0.3)  # Give window time to come into focus
-            
+
             inventory_frame = self.capture_inventory_area()
             inventory_gray = cv2.cvtColor(inventory_frame, cv2.COLOR_BGR2GRAY)
             inv_h, inv_w = inventory_gray.shape
-            
+
             # Local references for speed
             match_template = cv2.matchTemplate
             minMaxLoc = cv2.minMaxLoc
             TM_CCOEFF_NORMED = cv2.TM_CCOEFF_NORMED
             CONFIDENCE_THRESHOLD = 0.80
-            
+            confusable_fish = FishingBot._confusable_fish
+
             found_count = 0
-            
+
             for filename, (template, half_w, half_h) in templates.items():
                 t_h, t_w = template.shape
-                
+
                 if t_h > inv_h or t_w > inv_w:
                     continue
-                
+
                 try:
                     result = match_template(inventory_gray, template, TM_CCOEFF_NORMED)
-                    
+
                     # Find ALL matches using iterative minMaxLoc with masking
                     while True:
                         _, max_val, _, max_loc = minMaxLoc(result)
-                        
+
                         # Stop if best remaining match is below threshold
                         if max_val < CONFIDENCE_THRESHOLD:
                             break
-                        
+
                         pt_x, pt_y = max_loc
                         center_x = pt_x + half_w
                         center_y = pt_y + half_h
-                        
+
                         # Check if position already in ignore list (within 10px radius)
                         is_duplicate = False
                         for ix, iy in self._ignored_positions:
                             if abs(center_x - ix) < 10 and abs(center_y - iy) < 10:
                                 is_duplicate = True
                                 break
-                        
+
+                        # Color disambiguation for confusable fish
+                        matched_filename = filename
+                        if not is_duplicate and filename in confusable_fish:
+                            matched_filename = self._disambiguate_confusable_fish(
+                                inventory_frame, center_x, center_y, filename
+                            )
+
                         if not is_duplicate:
                             self._ignored_positions.add((center_x, center_y))
                             found_count += 1
-                        
+
                         # Mask out this match area to find next one (set to -1 so it won't be found again)
                         # Mask a region around the match point
                         mask_x1 = max(0, pt_x - t_w // 2)
@@ -811,13 +944,13 @@ class FishingBot:
                         mask_x2 = min(result.shape[1], pt_x + t_w // 2 + 1)
                         mask_y2 = min(result.shape[0], pt_y + t_h // 2 + 1)
                         result[mask_y1:mask_y2, mask_x1:mask_x2] = -1.0
-                        
+
                 except Exception:
                     continue
-            
+
             if self.on_status_update:
                 self.on_status_update(f"[W{self.bot_id+1}] Inventory scan: found {found_count} existing items (ignoring)")
-                
+
         except Exception as e:
             if self.on_status_update:
                 self.on_status_update(f"[W{self.bot_id+1}] Error scanning inventory: {e}")

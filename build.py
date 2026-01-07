@@ -55,6 +55,31 @@ def update_bot_version_in_gui():
         print("  No changes needed (already up to date)")
 
 
+def update_version_in_spec():
+    """Updates version in build.spec to match version.py."""
+    print(f"Updating version in build.spec...")
+    
+    if not os.path.exists(SPEC_FILE):
+        print(f"  Warning: {SPEC_FILE} not found")
+        return
+    
+    with open(SPEC_FILE, 'r', encoding='utf-8') as f:
+        content = f.read()
+    
+    # Pattern to match: name='Fishing Puzzle Player vX.X.X',
+    pattern = r"name='Fishing Puzzle Player v[\d.]+'"
+    replacement = f"name='Fishing Puzzle Player v{VERSION}'"
+    
+    new_content = re.sub(pattern, replacement, content)
+    
+    if new_content != content:
+        with open(SPEC_FILE, 'w', encoding='utf-8') as f:
+            f.write(new_content)
+        print(f"  Updated build.spec version to: {VERSION}")
+    else:
+        print("  No changes needed (already up to date)")
+
+
 def clean_build_artifacts():
     """Removes build artifacts from previous builds."""
     print("Cleaning build artifacts...")
@@ -114,6 +139,10 @@ def main():
     
     # Update BOT_VERSION from version.py
     update_bot_version_in_gui()
+    print()
+    
+    # Update version in build.spec
+    update_version_in_spec()
     print()
     
     # Run PyInstaller

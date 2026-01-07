@@ -368,7 +368,7 @@ class FishSelectionWindow:
 class BotGUI:
     """GUI for the fishing bot - supports up to 8 simultaneous windows"""
     
-    BOT_VERSION = "1.0.3"  # Version for config validation and GUI display
+    BOT_VERSION = "1.0.4"  # Version for config validation and GUI display
     
     def __init__(self):
         self.root = tk.Tk()

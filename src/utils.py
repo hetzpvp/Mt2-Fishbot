@@ -51,6 +51,43 @@ def get_resource_path(filename: str) -> str:
         return os.path.join(base_dir, filename)
 
 
+def set_window_icon(window, icon_path: str):
+    """Sets window icon using multiple methods for maximum compatibility.
+    
+    This function ensures the icon appears in both the window title bar and Windows taskbar.
+    Uses both iconbitmap() and iconphoto() for better PyInstaller compatibility.
+    
+    Args:
+        window: Tkinter window (Tk or Toplevel)
+        icon_path: Path to .ico file
+    """
+    if not os.path.exists(icon_path):
+        return
+    
+    try:
+        # Method 1: Use iconbitmap for title bar (Windows-specific)
+        window.iconbitmap(icon_path)
+        window.iconbitmap(default=icon_path)
+    except Exception:
+        pass
+    
+    try:
+        # Method 2: Use iconphoto for taskbar (cross-platform, more reliable with PyInstaller)
+        # Convert .ico to PhotoImage using PIL
+        from PIL import Image, ImageTk
+        
+        # Load .ico and convert to PhotoImage
+        icon_image = Image.open(icon_path)
+        # Use the largest size available in the .ico
+        if hasattr(icon_image, 'size'):
+            photo = ImageTk.PhotoImage(icon_image)
+            window.iconphoto(True, photo)
+            # Keep a reference to prevent garbage collection
+            window._icon_photo = photo
+    except Exception:
+        pass
+
+
 def play_rickroll_beep():
     """Plays a Rick Roll-themed beep sequence with smooth ADSR envelopes.
     Uses numpy to generate WAV audio with professional envelope curves."""
