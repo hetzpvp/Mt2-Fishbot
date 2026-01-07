@@ -51,7 +51,7 @@ class FishSelectionWindow:
         
         # Calculate window dimensions based on DPI scaling
         base_width = 570
-        base_height = 790
+        base_height = 880
         try:
             dpi_scale = ctypes.windll.shcore.GetScaleFactorForDevice(0) / 100.0
             # Scale dimensions proportionally for high DPI
