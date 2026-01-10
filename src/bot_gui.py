@@ -1582,18 +1582,11 @@ class BotGUI:
         
         if enabled:
             self.select_fishes_btn.config(state=tk.NORMAL)
-            # Enable drop position buttons so user can configure them
-            if hasattr(self, 'drop_btn_pos_btn'):
-                self.drop_btn_pos_btn.config(state=tk.NORMAL)
-            if hasattr(self, 'confirm_btn_pos_btn'):
-                self.confirm_btn_pos_btn.config(state=tk.NORMAL)
         else:
             self.select_fishes_btn.config(state=tk.DISABLED)
-            # Disable drop position buttons
-            if hasattr(self, 'drop_btn_pos_btn'):
-                self.drop_btn_pos_btn.config(state=tk.DISABLED)
-            if hasattr(self, 'confirm_btn_pos_btn'):
-                self.confirm_btn_pos_btn.config(state=tk.DISABLED)
+        
+        # Update drop button states based on whether any fish is set to 'drop'
+        self._update_drop_buttons_state()
         
         self.save_config()
     
@@ -1986,6 +1979,9 @@ class BotGUI:
         self.config['fish_actions'] = fish_actions
         self.save_config()
         self.add_status(f"Fish actions saved: {len(fish_actions)} items configured")
+        
+        # Update drop button states based on whether any fish is set to 'drop'
+        self._update_drop_buttons_state()
 
     def on_window_selected(self, window_id: int):
         """Updates bait display when a window is selected."""
@@ -2170,7 +2166,7 @@ class BotGUI:
             window_list = ", ".join(f"W{w}" for w in windows_with_no_bait)
             messagebox.showerror("No Bait", 
                                f"Bait counter is at 0 for: {window_list}\n\n"
-                               "Please click 'Reset All Bait' button to refill your bait "
+                               "Please click 'Reset Client Bait' button to refill your bait "
                                "before starting the bot.")
             return
         
