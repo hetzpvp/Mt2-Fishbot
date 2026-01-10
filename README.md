@@ -20,9 +20,9 @@ Free fishing minigame bot for Metin2. No subscriptions, no licenses.
 
 ## Download
 
-**Download:** [MediaFire](https://www.mediafire.com/file/za6qd36l0t6ckxn/Fishing_Puzzle_Player_v1.0.5.exe/file)
+**Download:** [MediaFire](https://www.mediafire.com/file/a4o7c3feivrykgj/Fishing_Puzzle_Player_v1.0.5.exe/file)
 
-**VirusTotal:** [Scan Results](https://www.virustotal.com/gui/url/f37b520c11db5fbbc30132767833eb9abcd84aabe13b6a0d0ba5289bf7793055?nocache=1)
+**VirusTotal:** [Scan Results](https://www.virustotal.com/gui/url/fd0a2c0b995da4c5e91ac829862de9685cd737a880ec1c8a60d617ba1e11fecd?nocache=1)
 
 ---
 
