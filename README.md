@@ -14,17 +14,17 @@ Free fishing minigame bot for Metin2. No subscriptions, no licenses.
 
 ## Tutorial/Demo
 
-[![Watch Tutorial](https://img.youtube.com/vi/ZKCqTx8AKsU/maxresdefault.jpg)](https://www.youtube.com/watch?v=ZKCqTx8AKsU)
+[![Watch Tutorial](https://img.youtube.com/vi/M0THxnio894/maxresdefault.jpg)](https://youtu.be/M0THxnio894)
 
-**Watch the full tutorial:** [YouTube Video](https://www.youtube.com/watch?v=ZKCqTx8AKsU)
+**Watch the full tutorial:** [YouTube Video](https://youtu.be/M0THxnio894)
 
 ---
 
 ## Download
 
-**Download:** [MediaFire](https://www.mediafire.com/file/mwhayph3ga5h5wx/Fishing_Puzzle_Player_v1.0.4.exe/file)
+**Download:** [MediaFire](https://www.mediafire.com/file/za6qd36l0t6ckxn/Fishing_Puzzle_Player_v1.0.5.exe/file)
 
-**VirusTotal:** [Scan Results](https://www.virustotal.com/gui/url/14393d15da07fe1873005ef3a6a5f25bdf12fa599fc6370e5c179ac7b7e63b68?nocache=1)
+**VirusTotal:** [Scan Results](https://www.virustotal.com/gui/url/f37b520c11db5fbbc30132767833eb9abcd84aabe13b6a0d0ba5289bf7793055?nocache=1)
 
 ---
 
@@ -35,7 +35,8 @@ Free fishing minigame bot for Metin2. No subscriptions, no licenses.
 - Works on any server with the new or classic fishing system
 - Configurable bait keys (1-4, F1-F4)
 - Auto fish handling (keep/drop/open)
-- Quick skip with horse (CTRL+G)
+- Quick skip with horse (CTRL+G) or armor slot
+- Configurable classic fishing delay
 - F5 pause/resume
 
 ---
@@ -47,7 +48,8 @@ Free fishing minigame bot for Metin2. No subscriptions, no licenses.
 1. Execute the bot as administrator
 2. Select target Metin2 windows
 3. Enable/disable features and select bait hotkeys
-   - ⚠️ Quick skip requires a horse!
+   - ⚠️ Quick skip (Horse mode) requires a horse!
+   - ⚠️ Quick skip (Armor mode) requires armor equipped and coordinates set!
    - ⚠️ Automatic fish handling requires inventory to be opened and as empty as possible!
 4. Place bait within each selected hotkey
 5. Start the bot!
@@ -58,12 +60,18 @@ Free fishing minigame bot for Metin2. No subscriptions, no licenses.
 ## Settings
 
 - **Classic fishing minigame** - Enable for servers with the classic fishing system
+  - Configurable delay (seconds) after fish detection
 - **Human-like clicking** - Random click offsets
-- **Quick skip** - Auto-skip between games (requires horse)
+- **Quick skip** - Auto-skip between games
+  - **Horse mode:** Press CTRL+G twice (requires horse)
+  - **Armor mode:** Right-click armor slot (requires coordinates set)
 - **Auto fish handling** - Configure keep/drop/open per fish type
   - ⚠️ Requires inventory to be open
   - Keep inventory as empty as possible
-- **Show status log** - View bot activity
+  - Set drop/sell/destroy and confirm button coordinates
+- **Bait keys** - Select up to 8 keys (1-4, F1-F4), 200 bait each
+- **GUI customization** - Choose from multiple accent colors or enable RGB wave effect
+- **Show status log** - View bot activity (debug mode)
 
 ---
 
@@ -83,8 +91,6 @@ Free fishing minigame bot for Metin2. No subscriptions, no licenses.
 
 ## TODO
 
-- [ ] Implement item drop logic
-- [ ] Auto fish handling across all inventory pages
 - [ ] Fish skipping based on chat message (skip minigame)
 
 ---

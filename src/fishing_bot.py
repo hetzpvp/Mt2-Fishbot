@@ -34,12 +34,14 @@ try:
     from pynput import keyboard
     from pynput.keyboard import Controller, Key
 except ImportError:
-    print("ERROR: pynput not installed! Install with: pip install pynput")
+    from utils import DEBUG_PRINTS
+    if DEBUG_PRINTS:
+        print("ERROR: pynput not installed! Install with: pip install pynput")
     keyboard = None
     Controller = None
     Key = None
 
-from utils import get_resource_path, input_lock, play_rickroll_beep
+from utils import get_resource_path, input_lock, play_rickroll_beep, DEBUG_PRINTS
 from window_manager import WindowManager, GameRegion
 from fish_detector import FishDetector
 
@@ -88,6 +90,10 @@ class FishingBot:
         # Cached circle values for performance
         self._circle_center = None
         self._circle_radius_sq = 67 * 67
+        
+        # Lock fairness: prevent one thread from hogging the lock
+        self._consecutive_lock_acquisitions = 0
+        self._lock_acquisition_limit = 3  # Max consecutive acquisitions before yielding
         
         # Callbacks for GUI updates
         self.on_status_update = None
@@ -540,7 +546,7 @@ class FishingBot:
                         # ========== DROP SEQUENCE ==========
                         # Step 1: Left-click on the item to pick it up
                         pyautogui.moveTo(screen_x, screen_y, _pause=False)
-                        time.sleep(np.random.uniform(0.1, 0.15))
+                        time.sleep(np.random.uniform(0.05, 0.07))
                         pyautogui.click(_pause=False)
                         time.sleep(np.random.uniform(0.1, 0.15))
                         
@@ -548,7 +554,7 @@ class FishingBot:
                         win_center_x = win_left + win_width // 2
                         win_center_y = win_top + win_height // 2
                         pyautogui.moveTo(win_center_x, win_center_y, _pause=False)
-                        time.sleep(np.random.uniform(0.1, 0.15))
+                        time.sleep(np.random.uniform(0.05, 0.07))
                         
                         # Step 3: Left-click to drop the item
                         pyautogui.click(_pause=False)
@@ -558,7 +564,7 @@ class FishingBot:
                         drop_screen_x = win_left + drop_pos[0]
                         drop_screen_y = win_top + drop_pos[1]
                         pyautogui.moveTo(drop_screen_x, drop_screen_y, _pause=False)
-                        time.sleep(np.random.uniform(0.1, 0.15))
+                        time.sleep(np.random.uniform(0.05, 0.07))
                         pyautogui.click(_pause=False)
                         time.sleep(np.random.uniform(0.1, 0.15))
                         
@@ -566,8 +572,9 @@ class FishingBot:
                         confirm_screen_x = win_left + confirm_pos[0]
                         confirm_screen_y = win_top + confirm_pos[1]
                         pyautogui.moveTo(confirm_screen_x, confirm_screen_y, _pause=False)
-                        time.sleep(np.random.uniform(0.1, 0.15))
+                        time.sleep(np.random.uniform(0.05, 0.07))
                         pyautogui.click(_pause=False)
+                        time.sleep(np.random.uniform(0.1, 0.15))
                         
                         # Move cursor to safe position (last mouse op before releasing lock)
                         pyautogui.moveTo(win_center_x, win_center_y, _pause=False)
@@ -685,6 +692,8 @@ class FishingBot:
             cx, cy = circle_center
             dx, dy = fx - cx, fy - cy
             if (dx * dx + dy * dy) >= radius_sq:
+                # Fish not in circle - reset consecutive lock counter
+                self._consecutive_lock_acquisitions = 0
                 return (True, None)
             
             # Fish is in circle! Now get lock and click
@@ -698,14 +707,17 @@ class FishingBot:
                 window_active, fish_pos = detect(frame)
                 
                 if not window_active:
+                    self._consecutive_lock_acquisitions = 0
                     return (False, None)
                 if not fish_pos:
+                    self._consecutive_lock_acquisitions = 0
                     return (True, None)
                 
                 # Inline circle check
                 fx, fy = fish_pos
                 dx, dy = fx - cx, fy - cy
                 if (dx * dx + dy * dy) >= radius_sq:
+                    self._consecutive_lock_acquisitions = 0
                     return (True, None)
                 
                 # Click at FRESH position
@@ -720,7 +732,15 @@ class FishingBot:
                 time.sleep(0.008)  # Minimal down time
                 pyautogui.mouseUp(_pause=False)
                 time.sleep(0.035)  # Post-click settle
+                
+                # Increment consecutive lock acquisition counter
+                self._consecutive_lock_acquisitions += 1
             # ========== LOCK RELEASED ==========
+            
+            # Fairness: yield to other threads if this thread has been acquiring lock too often
+            if self._consecutive_lock_acquisitions >= self._lock_acquisition_limit:
+                self._consecutive_lock_acquisitions = 0
+                time.sleep(0.05)  # 50ms yield to allow other threads to compete for lock
             
             return (True, fish_pos)
             
@@ -797,13 +817,47 @@ class FishingBot:
                     self.on_status_update(f"[W{self.bot_id+1}] Error pressing CTRL+{key}: {e}")
     
     def quickskip(self):
-        """Performs quick skip by double pressing CTRL+G."""
-        if self.on_status_update:
-            self.on_status_update(f"[W{self.bot_id+1}] Quick skip...")
-        self.press_ctrl_key('g')
-        time.sleep(0.15)  # Longer delay for game to process first CTRL+G
-        self.press_ctrl_key('g')
-        time.sleep(0.15)  # Delay after second press before next action
+        """Performs quick skip - uses different method based on mode (horse or armour)."""
+        # Get quick skip mode from config (default to 'horse' if not set)
+        quick_skip_mode = self.config.get('quick_skip_mode', 'horse')
+        
+        if quick_skip_mode == 'horse':
+            # Horse mode: double press CTRL+G
+            if self.on_status_update:
+                self.on_status_update(f"[W{self.bot_id+1}] Quick skip (Horse mode - CTRL+G)...")
+            self.press_ctrl_key('g')
+            time.sleep(0.1)  # Longer delay for game to process first CTRL+G
+            self.press_ctrl_key('g')
+            time.sleep(0.1)  # Delay after second press before next action
+        else:
+            # Armour mode: right-click on armor slot to equip/unequip
+            if self.on_status_update:
+                self.on_status_update(f"[W{self.bot_id+1}] Quick skip (Armor mode - right-click)...")
+            
+            armor_pos = self.config.get('armor_slot_pos')
+            if not armor_pos:
+                if self.on_status_update:
+                    self.on_status_update(f"[W{self.bot_id+1}] Armor slot position not set! Falling back to wait.")
+                time.sleep(0.3)  # Fallback delay
+                return
+            
+            # Acquire lock for mouse operation
+            with input_lock:
+                # Activate window
+                self.window_manager.activate_window(force_activate=True)
+                time.sleep(0.03)
+                
+                # Convert armor slot position (relative to window) to screen coordinates
+                win_left, win_top, _, _ = self.window_manager.get_window_rect()
+                screen_x = win_left + armor_pos[0]
+                screen_y = win_top + armor_pos[1]
+                
+                # Right-click on armor slot
+                pyautogui.moveTo(screen_x, screen_y, _pause=False)
+                time.sleep(0.1)
+                time.sleep(np.random.uniform(0.1, 0.15))
+                pyautogui.click(button='right', _pause=False)
+                time.sleep(np.random.uniform(0.05, 0.07))  # Wait for armor equip/unequip animation
     
     def press_key(self, key: str, description: str = ""):
         """Presses a keyboard key using pynput. Uses input lock for thread safety."""

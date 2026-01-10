@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import List, Tuple
 
 import pygetwindow as gw
+from utils import DEBUG_PRINTS
 
 
 class WindowManager:
@@ -47,7 +48,8 @@ class WindowManager:
                 except Exception:
                     pass
         except Exception as e:
-            print(f"Error getting windows: {e}")
+            if DEBUG_PRINTS:
+                print(f"Error getting windows: {e}")
         
         # Combine all windows (prioritize Metin2 windows)
         all_windows = priority_windows + windows
@@ -105,7 +107,8 @@ class WindowManager:
                 except:
                     pass
         except Exception as e:
-            print(f"Error activating window: {e}")
+            if DEBUG_PRINTS:
+                print(f"Error activating window: {e}")
     
     def get_window_rect(self) -> Tuple[int, int, int, int]:
         """Gets the selected window's position and size (left, top, width, height)"""
@@ -119,7 +122,8 @@ class WindowManager:
             height = self.selected_window.height
             return (left, top, width, height)
         except Exception as e:
-            print(f"Error getting window rect: {e}")
+            if DEBUG_PRINTS:
+                print(f"Error getting window rect: {e}")
             return (0, 0, 0, 0)
 
 

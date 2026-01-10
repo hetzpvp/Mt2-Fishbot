@@ -20,7 +20,7 @@ try:
 except ImportError:
     keyboard = None
 
-from utils import get_resource_path, MAX_WINDOWS, DEBUG_MODE_EN
+from utils import get_resource_path, MAX_WINDOWS, DEBUG_MODE_EN, DEBUG_PRINTS
 from window_manager import WindowManager
 from fishing_bot import FishingBot
 from debug_windows import IgnoredPositionsWindow, FishDetectorDebugWindow, StatusLogWindow
@@ -37,33 +37,37 @@ class FishSelectionWindow:
         None: '#555555'       # Gray (not set)
     }
     
-    def __init__(self, parent, current_actions: dict, on_save_callback, config: dict = None):
+    def __init__(self, parent, current_actions: dict, on_save_callback, config: dict = None, accent_color: str = "#FFBB00", rgb_wave_active: bool = False, rgb_wave_hue: int = 0):
         self.parent = parent
         self.current_actions = current_actions.copy()
         self.on_save_callback = on_save_callback
         self.config = config or {}  # Store config for checking drop positions
+        self.accent_color = accent_color  # Store dynamic accent color
+        self.rgb_wave_active = rgb_wave_active  # RGB wave effect state
+        self.rgb_wave_hue = rgb_wave_hue  # Current hue for RGB wave
         self.item_widgets = {}  # {filename: {'frame': frame, 'action_var': var, 'buttons': {}}}
         self.photo_images = []  # Keep references to prevent garbage collection
+        self.buttons_to_update = []  # Store button references for RGB wave updates
         
         # Create window
         self.window = tk.Toplevel(parent)
         self.window.title("Fish & Item Selection")
         
         # Calculate window dimensions based on DPI scaling
-        base_width = 570
-        base_height = 880
+        base_width = 560
+        base_height = 630
         try:
             dpi_scale = ctypes.windll.shcore.GetScaleFactorForDevice(0) / 100.0
             # Scale dimensions proportionally for high DPI
-            window_width = int(base_width * max(1.0, dpi_scale * 0.9))
-            window_height = int(base_height * max(1.0, dpi_scale * 0.9))
+            window_width = int(base_width * max(1.0, dpi_scale * 0.89))
+            window_height = int(base_height * max(1.0, dpi_scale * 0.88))
         except Exception:
             window_width = base_width
             window_height = base_height
         
         self.window.geometry(f"{window_width}x{window_height}")
         self.window.configure(bg="#1a1a1a")
-        self.window.resizable(False, True)  # Allow vertical resize for DPI scaling
+        self.window.resizable(False, False)  # Allow vertical resize for DPI scaling
         
         # Try to load and set window icon
         icon_path = get_resource_path("monkey.ico")
@@ -71,7 +75,8 @@ class FishSelectionWindow:
             try:
                 self.window.iconbitmap(icon_path)
             except Exception as e:
-                print(f"Error loading icon: {e}")
+                if DEBUG_PRINTS:
+                    print(f"Error loading icon: {e}")
         
         # Make window modal
         self.window.transient(parent)
@@ -80,32 +85,27 @@ class FishSelectionWindow:
         self.setup_ui()
         self.load_items()
         
+        # Start RGB wave if active
+        if self.rgb_wave_active:
+            self.update_rgb_wave()
+        
     def setup_ui(self):
         """Creates the fish selection window UI"""
-        # Header
-        header = tk.Frame(self.window, bg="#000000", height=35)
-        header.pack(fill=tk.X)
-        header.pack_propagate(False)
-        
-        title = tk.Label(header, text="Fish & Item Actions", 
-                        font=("Courier New", 11, "bold"),
-                        bg="#000000", fg="#FFD700")
-        title.pack(pady=6)
-        
+    
         # Instructions
         instructions_frame = tk.Frame(self.window, bg="#2a2a2a")
-        instructions_frame.pack(fill=tk.X, padx=5, pady=2)
+        instructions_frame.pack(fill=tk.X, padx=3, pady=0)
         
         instructions = tk.Label(instructions_frame, 
-                               text="K=Keep (default)  | D=Drop (requires setup)  | O=Open (fish only)",
+                               text="K=Keep | D=Open&Drop | O=Open ",
                                font=("Courier New", 8),
                                bg="#2a2a2a", fg="#ffffff",
                                justify=tk.CENTER)
-        instructions.pack(pady=2)
+        instructions.pack(pady=1)
         
         # Scrollable container
         container = tk.Frame(self.window, bg="#1a1a1a")
-        container.pack(fill=tk.BOTH, expand=True, padx=5, pady=2)
+        container.pack(fill=tk.BOTH, expand=True, padx=3, pady=1)
         
         # Canvas without scrollbar
         self.canvas = tk.Canvas(container, bg="#1a1a1a", highlightthickness=0)
@@ -122,35 +122,45 @@ class FishSelectionWindow:
         
         # Bottom buttons
         button_frame = tk.Frame(self.window, bg="#1a1a1a")
-        button_frame.pack(fill=tk.X, padx=5, pady=5)
+        button_frame.pack(fill=tk.X, padx=5, pady=10)
         
         # Set All buttons
         set_all_frame = tk.Frame(button_frame, bg="#1a1a1a")
         set_all_frame.pack(side=tk.LEFT)
         
-        tk.Button(set_all_frame, text="Keep All", command=lambda: self.set_all_actions('keep'),
-                 bg="#2ecc71", fg="white", font=("Courier New", 8),
-                 cursor="hand2", padx=5).pack(side=tk.LEFT, padx=2)
+        keep_all_btn = tk.Button(set_all_frame, text="Keep All", command=lambda: self.set_all_actions('keep'),
+                 bg="#777777", fg=self.accent_color, font=("Courier New", 8),
+                 cursor="hand2", padx=3, pady=10)
+        keep_all_btn.pack(side=tk.LEFT, padx=2)
+        self.buttons_to_update.append(keep_all_btn)
         
-        tk.Button(set_all_frame, text="Drop All", command=lambda: self.set_all_actions('drop'),
-                 bg="#e74c3c", fg="white", font=("Courier New", 8),
-                 cursor="hand2", padx=5).pack(side=tk.LEFT, padx=2)
+        drop_all_btn = tk.Button(set_all_frame, text="Drop All", command=lambda: self.set_all_actions('drop'),
+                 bg="#777777", fg=self.accent_color, font=("Courier New", 8),
+                 cursor="hand2", padx=3, pady=10)
+        drop_all_btn.pack(side=tk.LEFT, padx=2)
+        self.buttons_to_update.append(drop_all_btn)
         
-        tk.Button(set_all_frame, text="Open All (Fish)", command=self.set_all_fish_open,
-                 bg="#3498db", fg="white", font=("Courier New", 8),
-                 cursor="hand2", padx=5).pack(side=tk.LEFT, padx=2)
+        open_all_btn = tk.Button(set_all_frame, text="Open All (Fish)", command=self.set_all_fish_open,
+                 bg="#777777", fg=self.accent_color, font=("Courier New", 8),
+                 cursor="hand2", padx=3, pady=10)
+        open_all_btn.pack(side=tk.LEFT, padx=2)
+        self.buttons_to_update.append(open_all_btn)
         
         # Save/Cancel buttons
         save_cancel_frame = tk.Frame(button_frame, bg="#1a1a1a")
         save_cancel_frame.pack(side=tk.RIGHT)
         
-        tk.Button(save_cancel_frame, text="Cancel", command=self.window.destroy,
-                 bg="#555555", fg="white", font=("Courier New", 9, "bold"),
-                 cursor="hand2", padx=15, pady=5).pack(side=tk.LEFT, padx=5)
+        cancel_btn = tk.Button(save_cancel_frame, text="Cancel", command=self.window.destroy,
+                 bg="#555555", fg=self.accent_color, font=("Courier New", 9, "bold"),
+                 cursor="hand2", padx=10, pady=10)
+        cancel_btn.pack(side=tk.LEFT, padx=3)
+        self.buttons_to_update.append(cancel_btn)
         
-        tk.Button(save_cancel_frame, text="Save", command=self.save_and_close,
-                 bg="#2ecc71", fg="white", font=("Courier New", 9, "bold"),
-                 cursor="hand2", padx=15, pady=5).pack(side=tk.LEFT, padx=5)
+        save_btn = tk.Button(save_cancel_frame, text="Save", command=self.save_and_close,
+                bg="#555555", fg=self.accent_color, font=("Courier New", 9, "bold"),
+                 cursor="hand2", padx=10, pady=10)
+        save_btn.pack(side=tk.LEFT, padx=3)
+        self.buttons_to_update.append(save_btn)
     
     def load_items(self):
         """Loads fish and item images from the assets folder"""
@@ -183,7 +193,7 @@ class FishSelectionWindow:
         current_type = None
         row = 0
         col = 0
-        items_per_row = 6
+        items_per_row = 7
         
         for item_type, filename in files:
             # Add section header if type changes
@@ -195,7 +205,7 @@ class FishSelectionWindow:
                 section_label = tk.Label(self.scrollable_frame, 
                                         text=f"{'Fish' if item_type == 'fish' else 'Items'}",
                                         font=("Courier New", 9, "bold"),
-                                        bg="#1a1a1a", fg="#FFD700")
+                                        bg="#1a1a1a", fg="#FFBB00")
                 section_label.grid(row=row, column=0, columnspan=items_per_row, sticky="w", pady=(8, 2), padx=3)
                 row += 1
                 current_type = item_type
@@ -211,8 +221,8 @@ class FishSelectionWindow:
     def create_item_widget(self, filename: str, assets_path: str, row: int, col: int, item_type: str):
         """Creates a widget for a single fish/item"""
         # Item container
-        item_frame = tk.Frame(self.scrollable_frame, bg="#2a2a2a", padx=2, pady=2)
-        item_frame.grid(row=row, column=col, padx=2, pady=2, sticky="nsew")
+        item_frame = tk.Frame(self.scrollable_frame, bg="#2a2a2a", padx=1, pady=1)
+        item_frame.grid(row=row, column=col, padx=1, pady=1, sticky="nsew")
         
         # Load and resize image
         try:
@@ -223,7 +233,7 @@ class FishSelectionWindow:
             self.photo_images.append(photo)  # Keep reference
             
             img_label = tk.Label(item_frame, image=photo, bg="#2a2a2a")
-            img_label.pack(pady=1)
+            img_label.pack(pady=0)
         except Exception as e:
             # Fallback if image can't be loaded
             img_label = tk.Label(item_frame, text="?", font=("Courier New", 12),
@@ -244,7 +254,7 @@ class FishSelectionWindow:
         
         # Action buttons frame (single row layout)
         buttons_frame = tk.Frame(item_frame, bg="#2a2a2a")
-        buttons_frame.pack(pady=1)
+        buttons_frame.pack(pady=0)
         
         # Store current action - DEFAULT to 'keep' if not previously set
         current_action = self.current_actions.get(filename, 'keep')
@@ -260,9 +270,9 @@ class FishSelectionWindow:
             btn = tk.Button(buttons_frame, text=symbol, width=3,
                            font=("Courier New", 6, "bold"),
                            cursor="hand2",
-                           padx=2, pady=0,
+                           padx=1, pady=0,
                            command=lambda f=filename, a=action: self.toggle_action(f, a))
-            btn.grid(row=0, column=idx, padx=1, pady=0)
+            btn.grid(row=0, column=idx, padx=0, pady=0)
             buttons[action] = btn
         
         # Store widget references
@@ -351,7 +361,7 @@ class FishSelectionWindow:
                                    "'Automatic Fish Handling' section before starting the bot.\n\n"
                                    "STEPS TO CONFIGURE:\n"
                                    "1. Drop an item to the floor and don't press anything (only to open the drop/destroy/sell window)\n"
-                                   "2. Click 'Set Drop Button Coords' and click on the drop/sell/destroy button in the game\n"
+                                   "2. Click 'Set Drop/Sell/Destroy Button Coords' and click on the drop/sell/destroy button in the game\n"
                                    "3. Click 'Set Confirm Button Coords' and click on the confirm button to finalize dropping the item in game\n"
                                    "4. Done! You can now start the bot safely.")
         
@@ -363,29 +373,63 @@ class FishSelectionWindow:
         self.canvas.unbind_all("<MouseWheel>")
         
         self.window.destroy()
+    
+    def update_rgb_wave(self):
+        """Updates button colors with RGB wave effect (synced with main GUI)"""
+        if not self.rgb_wave_active:
+            return
+        
+        try:
+            # Convert HSV to RGB (hue cycles 0-360)
+            import colorsys
+            h = self.rgb_wave_hue / 360.0
+            r, g, b = colorsys.hsv_to_rgb(h, 1.0, 1.0)
+            
+            # Convert to hex color
+            color_hex = f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}"
+            
+            # Update all button foreground colors
+            for btn in self.buttons_to_update:
+                try:
+                    btn.config(fg=color_hex)
+                except:
+                    pass
+            
+            # Increment hue for next update
+            self.rgb_wave_hue = (self.rgb_wave_hue + 3) % 360
+            
+            # Schedule next update (60ms for smooth transition)
+            if self.rgb_wave_active:
+                self.window.after(60, self.update_rgb_wave)
+        except:
+            pass
 
 
 class BotGUI:
     """GUI for the fishing bot - supports up to 8 simultaneous windows"""
     
-    BOT_VERSION = "1.0.4"  # Version for config validation and GUI display
+    BOT_VERSION = "1.0.5"  # Version for config validation and GUI display
+    ACCENT_COLOR = "#FFBB00"  # Gold color used throughout the GUI
     
     def __init__(self):
         self.root = tk.Tk()
         self.root.title(f"Fishing Puzzle Player v{self.BOT_VERSION}")
         
         # Calculate window height based on DPI scaling
-        base_height = 920
+        base_height = 430
+        base_width = 660
         try:
             dpi_scale = ctypes.windll.shcore.GetScaleFactorForDevice(0) / 100.0
             # Increase height proportionally for high DPI (add extra space)
-            window_height = int(base_height * max(1.0, dpi_scale * 0.9))
+            window_height = int(base_height * max(1.43, dpi_scale * 1.3))
+            window_width = int(base_width * max(1.0, dpi_scale * 0.96))
         except Exception:
             window_height = base_height
+            window_width = base_width
         
-        self.root.geometry(f"600x{window_height}")
-        self.root.resizable(False, True)  # Allow vertical resize for DPI scaling
-        self.root.minsize(600, 780)
+        self.root.geometry(f"{window_width}x{window_height}")
+        self.root.resizable(False, False)  # Allow vertical resize for DPI scaling
+        self.root.minsize(660, 430)
         self.root.configure(bg="#000000")
         
         # Try to load and set window icon
@@ -394,7 +438,8 @@ class BotGUI:
             try:
                 self.root.iconbitmap(icon_path)
             except Exception as e:
-                print(f"Error loading icon: {e}")
+                if DEBUG_PRINTS:
+                    print(f"Error loading icon: {e}")
         
         self.window_manager = WindowManager()
         
@@ -435,6 +480,9 @@ class BotGUI:
             'fish_actions': {},  # {filename: 'keep'|'drop'|'open'}
             'drop_button_pos': None,  # (x, y) relative to window - drop/sell button
             'confirm_button_pos': None,  # (x, y) relative to window - confirm button
+            'armor_slot_pos': None,  # (x, y) relative to window - armor slot for quick skip
+            'accent_color': "#FFBB00",  # Selected accent color
+            'rgb_wave_active': False,  # RGB wave effect state
         }
         
         # Bait counter
@@ -443,10 +491,20 @@ class BotGUI:
         # Fish selection window reference
         self.fish_selection_window = None
         
+        # RGB wave effect state
+        self.rgb_wave_active = False
+        self.rgb_wave_hue = 0
+        
         # Load config from file if it exists
         self.load_config()
         
         self.setup_ui()
+        
+        # Start RGB wave if it was previously active
+        if self.config.get('rgb_wave_active', False):
+            self.rgb_wave_active = True
+            self.rgb_wave_hue = 0
+            self.update_rgb_wave()
         
     def setup_ui(self):
         """Creates the GUI elements"""
@@ -471,7 +529,8 @@ class BotGUI:
                     frame.thumbnail((200, 120), Image.Resampling.LANCZOS)
                     self.photo_images.append(ImageTk.PhotoImage(frame))
             except Exception as e:
-                print(f"Error loading GIF: {e}")
+                if DEBUG_PRINTS:
+                    print(f"Error loading GIF: {e}")
         
         # Header (always created)
         header = tk.Frame(self.root, bg="#000000", height=100 if self.photo_images else 45)
@@ -494,13 +553,13 @@ class BotGUI:
         # Title (always shown)
         title = tk.Label(title_container, text=f"Fishing Puzzle Player v{self.BOT_VERSION}", 
                         font=("Courier New", 16, "bold"), 
-                        bg="#000000", fg="#FFD700")
+                        bg="#000000", fg=BotGUI.ACCENT_COLOR)
         title.pack(anchor=tk.CENTER)
         
         # Discord info
         discord_label = tk.Label(title_container, text="Discord: boristei", 
                                 font=("Courier New", 10), 
-                                bg="#000000", fg="#FFD700")
+                                bg="#000000", fg=BotGUI.ACCENT_COLOR)
         discord_label.pack(anchor=tk.CENTER)
         
         # Right GIF (only if loaded)
@@ -513,27 +572,26 @@ class BotGUI:
         
         # Main container
         main = tk.Frame(self.root, bg="#1a1a1a")
-        main.pack(fill=tk.BOTH, expand=True, padx=8, pady=5)
+        main.pack(fill=tk.BOTH, expand=True, padx=5, pady=1)
+        
+        # Top section container - holds windows_frame and side panel
+        top_section = tk.Frame(main, bg="#1a1a1a")
+        top_section.pack(fill=tk.X, pady=1)
         
         # Multi-Window Selection Section
-        windows_frame = tk.LabelFrame(main, text="Game Windows (up to 8)", 
+        windows_frame = tk.LabelFrame(top_section, text="Game Windows (up to 8)", 
                                      font=("Courier New", 10, "bold"),
-                                     bg="#2a2a2a", fg="#FFD700",
-                                     padx=8, pady=5)
-        windows_frame.pack(fill=tk.X, pady=3)
+                                     bg="#2a2a2a", fg=BotGUI.ACCENT_COLOR,
+                                     padx=5, pady=1)
+        windows_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
-        # Refresh button at top
-        refresh_row = tk.Frame(windows_frame, bg="#2a2a2a")
-        refresh_row.pack(fill=tk.X, pady=2)
+        # Container for left (combos) and right (refresh button) sections
+        windows_container = tk.Frame(windows_frame, bg="#2a2a2a")
+        windows_container.pack(fill=tk.X)
         
-        tk.Button(refresh_row, text="🔄 Refresh Windows",
-                 command=self.refresh_windows,
-                 bg="#2a2a2a", fg="#FFD700",
-                 activebackground="#3a3a3a", activeforeground="#FFD700",
-                 font=("Courier New", 9),
-                 cursor="hand2",
-                 relief=tk.FLAT,
-                 padx=8, pady=1).pack(side=tk.LEFT, padx=3)
+        # Left section: Window combos
+        combos_section = tk.Frame(windows_container, bg="#2a2a2a")
+        combos_section.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
         # Window combos storage
         self.window_combos = {}
@@ -541,10 +599,10 @@ class BotGUI:
         self.window_bait_labels = {}
         self.window_games_labels = {}
         
-        # Create 4 window selection rows
+        # Create 8 window selection rows
         for i in range(MAX_WINDOWS):
-            row_frame = tk.Frame(windows_frame, bg="#2a2a2a")
-            row_frame.pack(fill=tk.X, pady=2)
+            row_frame = tk.Frame(combos_section, bg="#2a2a2a")
+            row_frame.pack(fill=tk.X, pady=1)
             
             # Window label
             tk.Label(row_frame, text=f"W{i+1}:", 
@@ -569,14 +627,14 @@ class BotGUI:
             
             # Bait counter
             bait_label = tk.Label(row_frame, text="B:---", 
-                                 bg="#2a2a2a", fg="#FFD700",
+                                 bg="#2a2a2a", fg=BotGUI.ACCENT_COLOR,
                                  font=("Courier New", 8))
             bait_label.pack(side=tk.LEFT, padx=3)
             self.window_bait_labels[i] = bait_label
             
             # Games counter
             games_label = tk.Label(row_frame, text="G:0", 
-                                  bg="#2a2a2a", fg="#00ff00",
+                                  bg="#2a2a2a", fg=BotGUI.ACCENT_COLOR,
                                   font=("Courier New", 8))
             games_label.pack(side=tk.LEFT, padx=3)
             self.window_games_labels[i] = games_label
@@ -584,19 +642,168 @@ class BotGUI:
             # Initialize stats
             self.window_stats[i] = {'hits': 0, 'games': 0, 'bait': self.bait}
         
+        # Middle section: Refresh button
+        refresh_section = tk.Frame(windows_container, bg="#2a2a2a")
+        refresh_section.pack(side=tk.LEFT, padx=(5, 0))
+        
+        self.refresh_windows_btn = tk.Button(refresh_section, text="Refresh\nWindows",
+                 command=self.refresh_windows,
+                 bg="#666666", fg=BotGUI.ACCENT_COLOR,
+                 activebackground="#777777", activeforeground=BotGUI.ACCENT_COLOR,
+                 disabledforeground="black",
+                 font=("Courier New", 9, "bold"),
+                 cursor="hand2",
+                 relief=tk.RAISED,
+                 borderwidth=2,
+                 width=8,
+                 padx=5, pady=3)
+        self.refresh_windows_btn.pack(padx=10,pady=(8, 0))
+        
+        # Reset All Bait button
+        self.reset_btn = tk.Button(refresh_section,
+                                  text="Reset\nClient\nBait",
+                                  command=self.reset_bait,
+                                  font=("Courier New", 9, "bold"),
+                                  bg="#666666", fg=BotGUI.ACCENT_COLOR,
+                                  disabledforeground="#000000",
+                                  activebackground="#777777",
+                                  cursor="hand2",
+                                  width=8,
+                                  padx=5, pady=3)
+        self.reset_btn.pack(padx=10,pady=(8, 0))
+        
+        # Statistics Section (Total across all windows)
+        stats_section_frame = tk.LabelFrame(top_section, text="Total Statistics", 
+                                           font=("Courier New", 9, "bold"),
+                                           bg="#2a2a2a", fg=BotGUI.ACCENT_COLOR,
+                                           padx=5, pady=1)
+        stats_section_frame.pack(side=tk.LEFT, fill=tk.BOTH, padx=(5, 0))
+        
+        stats_grid = tk.Frame(stats_section_frame, bg="#2a2a2a")
+        stats_grid.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+        
+        # Configure grid to distribute evenly
+        stats_grid.grid_rowconfigure(0, weight=1)
+        stats_grid.grid_rowconfigure(1, weight=1)
+        stats_grid.grid_rowconfigure(2, weight=1)
+        stats_grid.grid_rowconfigure(3, weight=1)
+        
+        # Total games across all windows
+        tk.Label(stats_grid, text="Total\nGames", 
+                bg="#2a2a2a", fg="#ffffff",
+                font=("Courier New", 8), anchor=tk.W, justify=tk.LEFT).grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.total_games_label = tk.Label(stats_grid, text="0", 
+                                         bg="#2a2a2a", fg=BotGUI.ACCENT_COLOR,
+                                         font=("Courier New", 8, "bold"))
+        self.total_games_label.grid(row=0, column=1, sticky=tk.W, padx=5, pady=2)
+        
+        # Active windows count
+        tk.Label(stats_grid, text="Active\nWindows", 
+                bg="#2a2a2a", fg="#ffffff",
+                font=("Courier New", 8), anchor=tk.W, justify=tk.LEFT).grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.active_windows_label = tk.Label(stats_grid, text="0", 
+                                            bg="#2a2a2a", fg=BotGUI.ACCENT_COLOR,
+                                            font=("Courier New", 8, "bold"))
+        self.active_windows_label.grid(row=1, column=1, sticky=tk.W, padx=5, pady=2)
+        
+        # Total bait
+        tk.Label(stats_grid, text="Total\nbait", 
+                bg="#2a2a2a", fg="#ffffff",
+                font=("Courier New", 8), anchor=tk.W, justify=tk.LEFT).grid(row=2, column=0, sticky=tk.W, pady=2)
+        # Calculate total bait across selected windows only
+        total_bait = sum(self.window_stats[i]['bait'] for i in range(MAX_WINDOWS) if self.window_selections[i].get())
+        self.bait_label = tk.Label(stats_grid, text=str(total_bait), 
+                                  bg="#2a2a2a", fg=BotGUI.ACCENT_COLOR,
+                                  font=("Courier New", 8, "bold"))
+        self.bait_label.grid(row=2, column=1, sticky=tk.W, padx=5, pady=2)
+        
+        # Bait capacity
+        self.bait_capacity_text_label = tk.Label(stats_grid, text="", 
+                                                 bg="#2a2a2a", fg="#ffffff",
+                                                 font=("Courier New", 8), anchor=tk.W, justify=tk.LEFT)
+        self.bait_capacity_text_label.grid(row=3, column=0, sticky=tk.W, pady=2)
+        
+        self.bait_capacity_number_label = tk.Label(stats_grid, text="", 
+                                                   bg="#2a2a2a", fg=BotGUI.ACCENT_COLOR,
+                                                   font=("Courier New", 8, "bold"))
+        self.bait_capacity_number_label.grid(row=3, column=1, sticky=tk.W, padx=5, pady=2)
+        
+        # Side Panel - Completely separate frame
+        side_panel_frame = tk.LabelFrame(top_section, text="GUI", 
+                                        font=("Courier New", 9, "bold"),
+                                        bg="#2a2a2a", fg=BotGUI.ACCENT_COLOR,
+                                        padx=5, pady=5)
+        side_panel_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(5, 0))
+        
+        # Color squares container
+        colors_container = tk.Frame(side_panel_frame, bg="#2a2a2a")
+        colors_container.pack(pady=5)
+        
+        # Define colors: current accent, 4 random colors, and gradient placeholder
+        color_list = [
+            "#FFBB00",  # Current accent color (gold)
+            "#e74c3c",  # Red
+            "#3498db",  # Blue
+            "#04fc6b",  # Green
+            "#b14ed8",  # Purple
+            "rainbow"   # Placeholder for gradient
+        ]
+        
+        # Create 6 color squares (vertical layout)
+        for i, color in enumerate(color_list):
+            row = i
+            col = 0
+            
+            if color == "rainbow":
+                # Create a gradient canvas for the last square (clickable)
+                gradient_canvas = tk.Canvas(colors_container, width=25, height=25, 
+                                           bg="#2a2a2a", highlightthickness=1,
+                                           highlightbackground="#555555", cursor="hand2")
+                gradient_canvas.grid(row=row, column=col, padx=2, pady=2)
+                
+                # Draw RGB gradient (vertical)
+                for y in range(25):
+                    # Calculate RGB values for gradient
+                    if y < 9:
+                        r, g, b = 255, int(255 * y / 8), 0
+                    elif y < 17:
+                        r, g, b = int(255 * (17 - y) / 8), 255, 0
+                    else:
+                        r, g, b = 0, int(255 * (25 - y) / 8), int(255 * (y - 17) / 8)
+                    
+                    color_hex = f"#{r:02x}{g:02x}{b:02x}"
+                    gradient_canvas.create_line(0, y, 25, y, fill=color_hex, width=1)
+                
+                # Make clickable to toggle RGB wave effect
+                gradient_canvas.bind("<Button-1>", lambda e: self.toggle_rgb_wave())
+            else:
+                # Create solid color square (clickable)
+                color_frame = tk.Frame(colors_container, bg=color, width=25, height=25,
+                                      relief=tk.RAISED, borderwidth=2, cursor="hand2")
+                color_frame.grid(row=row, column=col, padx=2, pady=2)
+                color_frame.grid_propagate(False)
+                
+                # Make clickable to change accent color
+                color_frame.bind("<Button-1>", lambda e, c=color: self.change_accent_color(c))
+        
         # Bot Configuration Section
         config_frame = tk.LabelFrame(main, text="Bot Configuration", 
                                     font=("Courier New", 10, "bold"),
-                                    bg="#2a2a2a", fg="#FFD700",
-                                    padx=8, pady=5)
-        config_frame.pack(fill=tk.X, pady=3)
+                                    bg="#2a2a2a", fg=BotGUI.ACCENT_COLOR,
+                                    padx=5, pady=1)
+        config_frame.pack(fill=tk.X, pady=(2, 5))
+        
+        # Main container for side-by-side layout
+        config_content = tk.Frame(config_frame, bg="#2a2a2a")
+        config_content.pack(fill=tk.X)
+        
+        # LEFT SECTION: Bot options (Classic Fishing, Human-like, Quick skip, Sound alert)
+        left_options_frame = tk.Frame(config_content, bg="#2a2a2a")
+        left_options_frame.pack(side=tk.LEFT, anchor=tk.N, padx=(0, 10))
         
         # Classic Fishing checkbox (no minigame) - FIRST option
-        classic_frame = tk.Frame(config_frame, bg="#2a2a2a")
-        classic_frame.pack(anchor=tk.W, fill=tk.X, pady=2)
-        
         self.classic_fishing_var = tk.BooleanVar(value=self.config.get('classic_fishing', False))
-        self.classic_fishing_check = tk.Checkbutton(classic_frame, 
+        self.classic_fishing_check = tk.Checkbutton(left_options_frame, 
                                               text="Classic Fishing",
                                               variable=self.classic_fishing_var,
                                               command=self.toggle_classic_fishing,
@@ -604,50 +811,41 @@ class BotGUI:
                                               selectcolor="#1a1a1a",
                                               activebackground="#2a2a2a",
                                               font=("Courier New", 9))
-        self.classic_fishing_check.pack(side=tk.LEFT)
+        self.classic_fishing_check.pack(anchor=tk.W, pady=1)
         
-        # Delay input for classic fishing
-        tk.Label(classic_frame, text="Delay:", bg="#2a2a2a", fg="#aaaaaa",
-                font=("Courier New", 8)).pack(side=tk.LEFT, padx=(10, 2))
+        # Delay input for classic fishing (below checkbox)
+        classic_delay_frame = tk.Frame(left_options_frame, bg="#2a2a2a")
+        classic_delay_frame.pack(anchor=tk.W, pady=(0, 1))
+        
+        tk.Label(classic_delay_frame, text="Delay:", bg="#2a2a2a", fg="#aaaaaa",
+                font=("Courier New", 8)).pack(side=tk.LEFT, padx=(0, 2))
         
         self.classic_delay_var = tk.StringVar(value=str(self.config.get('classic_fishing_delay', 3.0)))
-        self.classic_delay_entry = tk.Entry(classic_frame, textvariable=self.classic_delay_var,
+        self.classic_delay_entry = tk.Entry(classic_delay_frame, textvariable=self.classic_delay_var,
                                            width=5, bg="#1a1a1a", fg="#00ff00",
                                            font=("Courier New", 9), insertbackground="#00ff00")
         self.classic_delay_entry.pack(side=tk.LEFT)
         self.classic_delay_entry.bind('<FocusOut>', self.update_classic_delay)
         self.classic_delay_entry.bind('<Return>', self.update_classic_delay)
         
-        tk.Label(classic_frame, text="sec", bg="#2a2a2a", fg="#aaaaaa",
+        tk.Label(classic_delay_frame, text="sec", bg="#2a2a2a", fg="#aaaaaa",
                 font=("Courier New", 8)).pack(side=tk.LEFT, padx=(2, 0))
         
         # Human-like clicking
         self.human_like_var = tk.BooleanVar(value=self.config.get('human_like_clicking', True))
-        self.human_like_check = tk.Checkbutton(config_frame, 
-                                    text="Human-like clicking (random offset)",
+        self.human_like_check = tk.Checkbutton(left_options_frame, 
+                                    text="Human-like clicking",
                                     variable=self.human_like_var,
                                     bg="#2a2a2a", fg="#ffffff",
                                     selectcolor="#1a1a1a",
                                     activebackground="#2a2a2a",
                                     disabledforeground="#666666",
                                     font=("Courier New", 9))
-        self.human_like_check.pack(anchor=tk.W, pady=2)
-        
-        # Quick skip checkbox
-        self.quick_skip_var = tk.BooleanVar(value=self.config.get('quick_skip', False))
-        self.quick_skip_check = tk.Checkbutton(config_frame, 
-                                         text="Quick skip (double press CTRL+G)",
-                                         variable=self.quick_skip_var,
-                                         bg="#2a2a2a", fg="#ffffff",
-                                         selectcolor="#1a1a1a",
-                                         activebackground="#2a2a2a",
-                                         disabledforeground="#666666",
-                                         font=("Courier New", 9))
-        self.quick_skip_check.pack(anchor=tk.W, pady=2)
+        self.human_like_check.pack(anchor=tk.W, pady=1)
         
         # Sound alert checkbox
         self.sound_alert_var = tk.BooleanVar(value=self.config.get('sound_alert_on_finish', True))
-        self.sound_alert_check = tk.Checkbutton(config_frame, 
+        self.sound_alert_check = tk.Checkbutton(left_options_frame, 
                                           text="No bait alert",
                                           variable=self.sound_alert_var,
                                           bg="#2a2a2a", fg="#ffffff",
@@ -655,20 +853,28 @@ class BotGUI:
                                           activebackground="#2a2a2a",
                                           disabledforeground="#666666",
                                           font=("Courier New", 9))
-        self.sound_alert_check.pack(anchor=tk.W, pady=2)
+        self.sound_alert_check.pack(anchor=tk.W, pady=1)
         
-        # Bait Keys Selection Section
-        bait_keys_frame = tk.LabelFrame(config_frame, text="Bait Keys (200 bait each)", 
+        # MIDDLE SECTION: Bait Keys Selection
+        bait_keys_frame = tk.LabelFrame(config_content, text="Bait Keys (200 bait each)", 
                                         font=("Courier New", 9),
-                                        bg="#2a2a2a", fg="#FFD700",
-                                        padx=4, pady=3)
-        bait_keys_frame.pack(fill=tk.X, pady=2)
+                                        bg="#2a2a2a", fg=BotGUI.ACCENT_COLOR,
+                                        padx=3, pady=3)
+        bait_keys_frame.pack(side=tk.LEFT, anchor=tk.N, padx=(10, 0))
         
         # Get saved bait keys or default to ['1', '2', '3', '4']
         saved_bait_keys = self.config.get('bait_keys', ['1', '2', '3', '4'])
         
+        # Main container for keys and right section
+        bait_content = tk.Frame(bait_keys_frame, bg="#2a2a2a")
+        bait_content.pack(fill=tk.X)
+        
+        # Left section: Keys
+        keys_container = tk.Frame(bait_content, bg="#2a2a2a")
+        keys_container.pack(side=tk.LEFT)
+        
         # Number keys row
-        num_keys_frame = tk.Frame(bait_keys_frame, bg="#2a2a2a")
+        num_keys_frame = tk.Frame(keys_container, bg="#2a2a2a")
         num_keys_frame.pack(fill=tk.X)
         
         self.bait_key_vars = {}
@@ -684,11 +890,11 @@ class BotGUI:
                                disabledforeground="#666666",
                                font=("Courier New", 9),
                                width=1)
-            cb.pack(side=tk.LEFT, padx=(1, 18))
+            cb.pack(side=tk.LEFT, padx=(0, 13),pady=0)
             self.bait_key_checkboxes[key] = cb
         
         # Function keys row
-        fn_keys_frame = tk.Frame(bait_keys_frame, bg="#2a2a2a")
+        fn_keys_frame = tk.Frame(keys_container, bg="#2a2a2a")
         fn_keys_frame.pack(fill=tk.X)
         
         for key in ['F1', 'F2', 'F3', 'F4']:
@@ -702,40 +908,132 @@ class BotGUI:
                                disabledforeground="#666666",
                                font=("Courier New", 9),
                                width=1)
-            cb.pack(side=tk.LEFT, padx=(4, 14))
+            cb.pack(side=tk.LEFT, padx=(2, 11),pady=0)
             self.bait_key_checkboxes[key] = cb
         
-        # Capacity label
-        self.bait_capacity_label = tk.Label(bait_keys_frame, text="", 
-                                           bg="#2a2a2a", fg="#00ff00",
-                                           font=("Courier New", 8))
-        self.bait_capacity_label.pack(anchor=tk.W, pady=1)
+        # Now that bait_key_vars exists, update capacity for the first time
+        self.update_bait_capacity()
         
-        # Reset All Bait button
-        self.reset_btn = tk.Button(bait_keys_frame,
-                                  text="Reset All Bait",
-                                  command=self.reset_bait,
-                                  font=("Courier New", 8),
-                                  bg="#e74c3c", fg="white",
-                                  activebackground="#c0392b",
-                                  cursor="hand2",
-                                  padx=3, pady=2)
-        self.reset_btn.pack(anchor=tk.W, pady=2)
+        # RIGHT SECTION: Quick Skip (moved after Bait Keys to be closer)
+        quick_skip_frame = tk.LabelFrame(config_content, text="Quick Skip", 
+                                        font=("Courier New", 9),
+                                        bg="#2a2a2a", fg=BotGUI.ACCENT_COLOR,
+                                        padx=5, pady=5)
+        quick_skip_frame.pack(side=tk.LEFT, anchor=tk.N, padx=(5, 0), fill=tk.BOTH, expand=True)
+        
+        # Use grid layout for better control
+        quick_skip_frame.grid_rowconfigure(0, weight=0)
+        quick_skip_frame.grid_rowconfigure(1, weight=0)
+        quick_skip_frame.grid_rowconfigure(2, weight=0)
+        quick_skip_frame.grid_columnconfigure(0, weight=1)
+        quick_skip_frame.grid_columnconfigure(1, weight=0)
+        
+        # Help button (grid position: top right)
+        self.quick_skip_help_btn = tk.Button(quick_skip_frame,
+                                             text="❓",
+                                             command=self.show_quick_skip_guide,
+                                             font=("Courier New", 9),
+                                             bg=BotGUI.ACCENT_COLOR, fg="white",
+                                             activebackground=BotGUI.ACCENT_COLOR,
+                                             cursor="hand2",
+                                             padx=8, pady=1)
+        self.quick_skip_help_btn.grid(row=0, column=1, sticky=tk.NE, padx=(10, 0), pady=0)
+        
+        # Quick skip enable checkbox (row 0, column 0)
+        self.quick_skip_var = tk.BooleanVar(value=self.config.get('quick_skip', False))
+        self.quick_skip_check = tk.Checkbutton(quick_skip_frame, 
+                                         text="Enable",
+                                         variable=self.quick_skip_var,
+                                         command=self.toggle_quick_skip_modes,
+                                         bg="#2a2a2a", fg="#ffffff",
+                                         selectcolor="#1a1a1a",
+                                         activebackground="#2a2a2a",
+                                         disabledforeground="#666666",
+                                         font=("Courier New", 9))
+        self.quick_skip_check.grid(row=0, column=0, sticky=tk.W, pady=0)
+        
+        # Quick skip mode selection (row 1, column 0)
+        quick_skip_modes_frame = tk.Frame(quick_skip_frame, bg="#2a2a2a")
+        quick_skip_modes_frame.grid(row=1, column=0, sticky=tk.W, pady=0)
+        
+        # Mode variables
+        current_mode = self.config.get('quick_skip_mode', 'horse')
+        self.quick_skip_mode_horse_var = tk.BooleanVar(value=(current_mode == 'horse'))
+        self.quick_skip_mode_armor_var = tk.BooleanVar(value=(current_mode == 'armor'))
+        
+        # Horse mode checkbox
+        self.quick_skip_mode_horse_check = tk.Checkbutton(quick_skip_modes_frame,
+                                                     text="Horse",
+                                                     variable=self.quick_skip_mode_horse_var,
+                                                     command=lambda: self.select_quick_skip_mode('horse'),
+                                                     bg="#2a2a2a", fg="#ffffff",
+                                                     selectcolor="#1a1a1a",
+                                                     activebackground="#2a2a2a",
+                                                     disabledforeground="#666666",
+                                                     font=("Courier New", 8))
+        self.quick_skip_mode_horse_check.pack(side=tk.LEFT, padx=(0, 10))
+        
+        # armor mode checkbox
+        self.quick_skip_mode_armor_check = tk.Checkbutton(quick_skip_modes_frame,
+                                                      text="Armor",
+                                                      variable=self.quick_skip_mode_armor_var,
+                                                      command=lambda: self.select_quick_skip_mode('armor'),
+                                                      bg="#2a2a2a", fg="#ffffff",
+                                                      selectcolor="#1a1a1a",
+                                                      activebackground="#2a2a2a",
+                                                      disabledforeground="#666666",
+                                                      font=("Courier New", 8))
+        self.quick_skip_mode_armor_check.pack(side=tk.LEFT)
+        
+        # Armor slot position setup (row 2, column 0-1, spans both columns)
+        armor_slot_frame = tk.Frame(quick_skip_frame, bg="#2a2a2a")
+        armor_slot_frame.grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
+        
+        # Armor slot position button
+        self.armor_slot_btn = tk.Button(armor_slot_frame,
+                                       text="Set Armor Slot Coords",
+                                       command=lambda: self.start_position_capture('armor'),
+                                       font=("Courier New", 8),
+                                       bg="#666666", fg=BotGUI.ACCENT_COLOR,
+                                       disabledforeground="#000000",
+                                       activebackground="#777777",
+                                       cursor="hand2",
+                                       state=tk.DISABLED,
+                                       padx=4, pady=1,
+                                       width=20)
+        self.armor_slot_btn.pack(side=tk.LEFT, padx=(0, 3))
+        
+        # Armor slot position label
+        armor_pos = self.config.get('armor_slot_pos')
+        armor_pos_text = f"({armor_pos[0]},{armor_pos[1]})" if armor_pos else "Not set"
+        self.armor_slot_label = tk.Label(armor_slot_frame, text=armor_pos_text,
+                                        bg="#2a2a2a", 
+                                        fg="#ffffff" if armor_pos else "#e74c3c",
+                                        font=("Courier New", 9),
+                                        width=10, anchor=tk.W)
+        self.armor_slot_label.pack(side=tk.LEFT)
+        
+        # Initialize mode checkboxes state based on quick_skip enabled/disabled
+        self.toggle_quick_skip_modes()
         
         # Automatic Fish Handling Section
         fish_handling_frame = tk.LabelFrame(config_frame, text="Automatic Fish Handling", 
                                            font=("Courier New", 9),
-                                           bg="#2a2a2a", fg="#FFD700",
-                                           padx=4, pady=3)
-        fish_handling_frame.pack(fill=tk.X, pady=2)
+                                           bg="#2a2a2a", fg=BotGUI.ACCENT_COLOR,
+                                           padx=4, pady=1)
+        fish_handling_frame.pack(fill=tk.X, pady=(2, 5))
         
-        # Enable checkbox and button row
+        # Main row containing all elements
         fish_handling_row = tk.Frame(fish_handling_frame, bg="#2a2a2a")
-        fish_handling_row.pack(fill=tk.X)
+        fish_handling_row.pack(fill=tk.X, pady=1)
+        
+        # LEFT SECTION: Enable checkbox and Select Fishes button (stacked vertically)
+        left_section = tk.Frame(fish_handling_row, bg="#2a2a2a")
+        left_section.pack(side=tk.LEFT, anchor=tk.W)
         
         # Automatic fish handling checkbox
         self.auto_fish_var = tk.BooleanVar(value=self.config.get('auto_fish_handling', False))
-        self.auto_fish_check = tk.Checkbutton(fish_handling_row, 
+        self.auto_fish_check = tk.Checkbutton(left_section, 
                                         text="Enable",
                                         variable=self.auto_fish_var,
                                         command=self.toggle_auto_fish_handling,
@@ -744,76 +1042,103 @@ class BotGUI:
                                         activebackground="#2a2a2a",
                                         disabledforeground="#666666",
                                         font=("Courier New", 9))
-        self.auto_fish_check.pack(side=tk.LEFT, padx=2)
+        self.auto_fish_check.pack(anchor=tk.W, pady=1)
         
-        # Select Fishes button
-        self.select_fishes_btn = tk.Button(fish_handling_row,
+        # Select Fishes button (below checkbox)
+        self.select_fishes_btn = tk.Button(left_section,
                                           text="Select Fishes/Items",
                                           command=self.open_fish_selection_window,
                                           font=("Courier New", 8),
-                                          bg="#3498db", fg="white",
-                                          activebackground="#2980b9",
+                                          bg="#777777", fg=BotGUI.ACCENT_COLOR,
+                                          disabledforeground="#000000",
+                                          activebackground="#888888",
                                           cursor="hand2",
                                           state=tk.DISABLED,
-                                          padx=5, pady=2)
-        self.select_fishes_btn.pack(side=tk.LEFT, padx=10)
+                                          padx=5, pady=1)
+        self.select_fishes_btn.pack(anchor=tk.W, pady=1)
         
-        # Help button for drop configuration guide
-        self.drop_help_btn = tk.Button(fish_handling_row,
-                                       text="❓ Help",
+        # RIGHT SECTION: Help button
+        right_section = tk.Frame(fish_handling_row, bg="#2a2a2a")
+        right_section.pack(side=tk.RIGHT, anchor=tk.NE)
+        
+        # Help button for drop configuration guide (slightly bigger)
+        self.drop_help_btn = tk.Button(right_section,
+                                       text="❓",
                                        command=self.show_drop_config_guide,
-                                       font=("Courier New", 8),
-                                       bg="#9b59b6", fg="white",
-                                       activebackground="#8e44ad",
+                                       font=("Courier New", 9),
+                                       bg=BotGUI.ACCENT_COLOR, fg="white",
+                                       activebackground=BotGUI.ACCENT_COLOR,
                                        cursor="hand2",
-                                       padx=5, pady=2)
-        self.drop_help_btn.pack(side=tk.RIGHT, padx=2)
+                                       padx=8, pady=1)
+        self.drop_help_btn.pack(pady=0)
+        
+        # MIDDLE SECTION: Button Coordinates (centered)
+        middle_section = tk.Frame(fish_handling_row, bg="#2a2a2a")
+        middle_section.pack(expand=True)
+        
+        # Coordinates container (label on left, buttons on right)
+        coords_container = tk.Frame(middle_section, bg="#2a2a2a")
+        coords_container.pack(anchor=tk.CENTER)
+        
+        # Buttons container (on the right)
+        buttons_container = tk.Frame(coords_container, bg="#2a2a2a")
+        buttons_container.pack(side=tk.LEFT)
         
         # Drop Button Configuration Row
-        drop_config_row = tk.Frame(fish_handling_frame, bg="#2a2a2a")
-        drop_config_row.pack(fill=tk.X, pady=2)
+        drop_config_row = tk.Frame(buttons_container, bg="#2a2a2a")
+        drop_config_row.pack(pady=1)
         
         # Drop button position capture
         self.drop_btn_pos_btn = tk.Button(drop_config_row,
-                                         text="Set Drop Button Coords",
+                                         text="Set Drop/Sell/Destroy Coords",
                                          command=lambda: self.start_position_capture('drop'),
                                          font=("Courier New", 8),
-                                         bg="#555555", fg="white",
-                                         activebackground="#666666",
+                                         bg="#666666", fg=BotGUI.ACCENT_COLOR,
+                                         disabledforeground="#000000",
+                                         activebackground="#777777",
                                          cursor="hand2",
                                          state=tk.DISABLED,
-                                         padx=5, pady=2)
-        self.drop_btn_pos_btn.pack(side=tk.LEFT, padx=2)
+                                         padx=4, pady=1,
+                                         width=28)
+        self.drop_btn_pos_btn.pack(side=tk.LEFT, padx=(0, 3))
         
         # Drop button position label
         drop_pos = self.config.get('drop_button_pos')
         drop_pos_text = f"({drop_pos[0]},{drop_pos[1]})" if drop_pos else "Not set"
         self.drop_btn_pos_label = tk.Label(drop_config_row, text=drop_pos_text,
                                           bg="#2a2a2a", 
-                                          fg="#00ff00" if drop_pos else "#e74c3c",
-                                          font=("Courier New", 8))
-        self.drop_btn_pos_label.pack(side=tk.LEFT, padx=2)
+                                          fg="#ffffff" if drop_pos else "#e74c3c",
+                                          font=("Courier New", 9),
+                                          width=10, anchor=tk.W)
+        self.drop_btn_pos_label.pack(side=tk.LEFT)
+        
+        # Confirm Button Configuration Row
+        confirm_config_row = tk.Frame(buttons_container, bg="#2a2a2a")
+        confirm_config_row.pack(pady=1)
         
         # Confirm button position capture
-        self.confirm_btn_pos_btn = tk.Button(drop_config_row,
+        self.confirm_btn_pos_btn = tk.Button(confirm_config_row,
                                             text="Set Confirm Button Coords",
                                             command=lambda: self.start_position_capture('confirm'),
                                             font=("Courier New", 8),
-                                            bg="#555555", fg="white",
-                                            activebackground="#666666",
+                                            bg="#666666", fg=BotGUI.ACCENT_COLOR,
+                                            disabledforeground="#000000",
+                                            activebackground="#777777",
                                             cursor="hand2",
                                             state=tk.DISABLED,
-                                            padx=5, pady=2)
-        self.confirm_btn_pos_btn.pack(side=tk.LEFT, padx=2)
+                                            padx=4, pady=1,
+                                            width=28)
+        self.confirm_btn_pos_btn.pack(side=tk.LEFT, padx=(0, 3))
         
         # Confirm button position label
         confirm_pos = self.config.get('confirm_button_pos')
         confirm_pos_text = f"({confirm_pos[0]},{confirm_pos[1]})" if confirm_pos else "Not set"
-        self.confirm_btn_pos_label = tk.Label(drop_config_row, text=confirm_pos_text,
+        self.confirm_btn_pos_label = tk.Label(confirm_config_row, text=confirm_pos_text,
                                              bg="#2a2a2a", 
-                                             fg="#00ff00" if confirm_pos else "#e74c3c",
-                                             font=("Courier New", 8))
-        self.confirm_btn_pos_label.pack(side=tk.LEFT, padx=2)
+                                             fg="#ffffff" if confirm_pos else "#e74c3c",
+                                             font=("Courier New", 9),
+                                             width=10, anchor=tk.W)
+        self.confirm_btn_pos_label.pack(side=tk.LEFT)
         
         # Position capture state
         self._position_capture_mode = None  # None, 'drop', or 'confirm'
@@ -826,48 +1151,6 @@ class BotGUI:
         # Update human-like clicking state based on classic fishing (no warning on startup)
         self.toggle_classic_fishing(show_warning=False)
         
-        # Statistics Section (Total across all windows)
-        stats_frame = tk.LabelFrame(main, text="Total Statistics", 
-                                   font=("Courier New", 10, "bold"),
-                                   bg="#2a2a2a", fg="#FFD700",
-                                   padx=8, pady=5)
-        stats_frame.pack(fill=tk.X, pady=3)
-        
-        stats_grid = tk.Frame(stats_frame, bg="#2a2a2a")
-        stats_grid.pack(fill=tk.X)
-        
-        # Total games across all windows
-        tk.Label(stats_grid, text="Total Games:", 
-                bg="#2a2a2a", fg="#ffffff",
-                font=("Courier New", 9)).grid(row=0, column=0, sticky=tk.W, pady=1)
-        self.total_games_label = tk.Label(stats_grid, text="0", 
-                                         bg="#2a2a2a", fg="#FFD700",
-                                         font=("Courier New", 9, "bold"))
-        self.total_games_label.grid(row=0, column=1, sticky=tk.W, padx=15, pady=1)
-        
-        # Active windows count
-        tk.Label(stats_grid, text="Active Windows:", 
-                bg="#2a2a2a", fg="#ffffff",
-                font=("Courier New", 9)).grid(row=0, column=2, sticky=tk.W, padx=15, pady=1)
-        self.active_windows_label = tk.Label(stats_grid, text="0", 
-                                            bg="#2a2a2a", fg="#00ff00",
-                                            font=("Courier New", 9, "bold"))
-        self.active_windows_label.grid(row=0, column=3, sticky=tk.W, padx=5, pady=1)
-        
-        # Reset all bait button
-        tk.Label(stats_grid, text="Total bait:", 
-                bg="#2a2a2a", fg="#ffffff",
-                font=("Courier New", 9)).grid(row=1, column=0, sticky=tk.W, pady=1)
-        # Calculate total bait across selected windows only
-        total_bait = sum(self.window_stats[i]['bait'] for i in range(MAX_WINDOWS) if self.window_selections[i].get())
-        self.bait_label = tk.Label(stats_grid, text=str(total_bait), 
-                                  bg="#2a2a2a", fg="#FFD700",
-                                  font=("Courier New", 9, "bold"))
-        self.bait_label.grid(row=1, column=1, sticky=tk.W, padx=15, pady=1)
-        
-        # Now that bait_label exists, update capacity for the first time
-        self.update_bait_capacity()
-        
         # Create separate status log window (only if DEBUG_MODE_EN is true)
         self.status_log_window = None
         if DEBUG_MODE_EN:
@@ -876,31 +1159,33 @@ class BotGUI:
         
         # Control Buttons Section
         button_frame = tk.Frame(main, bg="#1a1a1a")
-        button_frame.pack(fill=tk.X, pady=5)
+        button_frame.pack(fill=tk.X, pady=1)
         
         # Start/Pause button (combines start, pause, resume functionality)
         self.start_pause_btn = tk.Button(button_frame, 
                                        text="▶ Start All",
                                        command=self.start_or_pause_bots,
-                                       font=("Courier New", 11, "bold"),
-                                       bg="#2ecc71", fg="white",
-                                       activebackground="#27ae60",
+                                       font=("Courier New", 13, "bold"),
+                                       bg="#888888", fg=BotGUI.ACCENT_COLOR,
+                                       disabledforeground="#000000",
+                                       activebackground="#999999",
                                        cursor="hand2",
                                        state=tk.NORMAL,
-                                       padx=40, pady=8)
-        self.start_pause_btn.pack(side=tk.LEFT, expand=True, padx=3)
+                                       padx=40, pady=4)
+        self.start_pause_btn.pack(side=tk.LEFT, expand=True, padx=3,pady=4)
         
         # Stop All button
         self.stop_all_btn = tk.Button(button_frame, 
                                       text="⏹ Stop All",
                                       command=self.stop_all_bots,
-                                      font=("Courier New", 11, "bold"),
-                                      bg="#e74c3c", fg="white",
-                                      activebackground="#c0392b",
+                                      font=("Courier New", 13, "bold"),
+                                      bg="#888888", fg=BotGUI.ACCENT_COLOR,
+                                      disabledforeground="#000000",
+                                      activebackground="#999999",
                                       cursor="hand2",
                                       state=tk.DISABLED,
-                                      padx=40, pady=8)
-        self.stop_all_btn.pack(side=tk.LEFT, expand=True, padx=3)
+                                      padx=40, pady=4)
+        self.stop_all_btn.pack(side=tk.LEFT, expand=True, padx=3,pady=4)
         
         self.add_status("Welcome! Select up to 8 windows and click Start All to begin.")
         self.add_status("Press F5 to pause/resume all bots.")
@@ -923,7 +1208,8 @@ class BotGUI:
                 total_bait = sum(self.window_stats[i]['bait'] for i in range(MAX_WINDOWS) if self.window_selections[i].get())
                 self.bait_label.config(text=str(total_bait))
             except Exception as e:
-                print(f"Error restoring window selection: {e}")
+                if DEBUG_PRINTS:
+                    print(f"Error restoring window selection: {e}")
         
         # Donations Section (at the very bottom)
         donations_frame = tk.Frame(self.root, bg="#000000")
@@ -932,23 +1218,50 @@ class BotGUI:
         donations_text_frame = tk.Frame(donations_frame, bg="#000000")
         donations_text_frame.pack(pady=2)
         
+        # Try to load BTC icon
+        btc_icon_path = get_resource_path("btc_icon.png")
+        if DEBUG_PRINTS:
+            print(f"Looking for BTC icon at: {btc_icon_path}")
+            print(f"BTC icon exists: {os.path.exists(btc_icon_path)}")
+        
+        if os.path.exists(btc_icon_path):
+            try:
+                btc_img = Image.open(btc_icon_path)
+                # Resize icon to small size (14x14)
+                btc_img = btc_img.resize((14, 14), Image.Resampling.LANCZOS)
+                self.btc_icon_photo = ImageTk.PhotoImage(btc_img)
+                
+                # Create icon label
+                btc_icon_label = tk.Label(donations_text_frame, image=self.btc_icon_photo, bg="#000000")
+                btc_icon_label.pack(side=tk.LEFT, padx=(1, 1))
+                if DEBUG_PRINTS:
+                    print("BTC icon loaded successfully!")
+            except Exception as e:
+                if DEBUG_PRINTS:
+                    print(f"Error loading BTC icon: {e}")
+                import traceback
+                traceback.print_exc()
+        else:
+            if DEBUG_PRINTS:
+                print(f"BTC icon not found at {btc_icon_path}")
+        
         self.btc_address = "3AGrrTf1v9QZsMPEoezYTRbf9JyW4nQtHu"
-        donations_label = tk.Label(donations_text_frame, 
-                                  text=f"Donations in BTC: {self.btc_address}",
+        self.donations_label = tk.Label(donations_text_frame, 
+                                  text=f"Donations: {self.btc_address}",
                                   font=("Courier New", 9),
-                                  bg="#000000", fg="#FFD700",
+                                  bg="#000000", fg=BotGUI.ACCENT_COLOR,
                                   wraplength=600, justify=tk.CENTER)
-        donations_label.pack(side=tk.LEFT, padx=3)
+        self.donations_label.pack(side=tk.LEFT, padx=3)
         
         copy_btn = tk.Button(donations_text_frame,
                             text="📋",
                             command=self.copy_btc_address,
                             font=("Courier New", 10),
-                            bg="#000000", fg="#FFD700",
-                            activebackground="#1a1a1a", activeforeground="#FFD700",
+                            bg="#000000", fg=BotGUI.ACCENT_COLOR,
+                            activebackground="#1a1a1a", activeforeground=BotGUI.ACCENT_COLOR,
                             relief=tk.FLAT,
                             cursor="hand2",
-                            padx=3, pady=0)
+                            padx=3, pady=1)
         copy_btn.pack(side=tk.LEFT, padx=2)
     
     def load_config(self):
@@ -965,7 +1278,8 @@ class BotGUI:
                     # Check version - if missing or different, treat as invalid and skip loading
                     saved_version = saved_config.get('version')
                     if saved_version != self.BOT_VERSION:
-                        print(f"Config version mismatch (saved: {saved_version}, current: {self.BOT_VERSION}). Recreating config.")
+                        if DEBUG_PRINTS:
+                            print(f"Config version mismatch (saved: {saved_version}, current: {self.BOT_VERSION}). Recreating config.")
                         self.previous_windows = []
                         return
                     
@@ -974,6 +1288,8 @@ class BotGUI:
                         self.config['human_like_clicking'] = saved_config['human_like_clicking']
                     if 'quick_skip' in saved_config:
                         self.config['quick_skip'] = saved_config['quick_skip']
+                    if 'quick_skip_mode' in saved_config:
+                        self.config['quick_skip_mode'] = saved_config['quick_skip_mode']
                     if 'sound_alert_on_finish' in saved_config:
                         self.config['sound_alert_on_finish'] = saved_config['sound_alert_on_finish']
                     if 'classic_fishing' in saved_config:
@@ -996,13 +1312,23 @@ class BotGUI:
                         self.config['drop_button_pos'] = saved_config['drop_button_pos']
                     if 'confirm_button_pos' in saved_config:
                         self.config['confirm_button_pos'] = saved_config['confirm_button_pos']
+                    if 'armor_slot_pos' in saved_config:
+                        self.config['armor_slot_pos'] = saved_config['armor_slot_pos']
+                    # Restore accent color
+                    if 'accent_color' in saved_config:
+                        self.config['accent_color'] = saved_config['accent_color']
+                        BotGUI.ACCENT_COLOR = saved_config['accent_color']
+                    # Restore RGB wave state
+                    if 'rgb_wave_active' in saved_config:
+                        self.config['rgb_wave_active'] = saved_config['rgb_wave_active']
                     # Store previously selected windows for later restoration (multi-window)
                     self.previous_windows = saved_config.get('selected_windows', [])
                     # Also support legacy single window
                     if not self.previous_windows and saved_config.get('selected_window'):
                         self.previous_windows = [saved_config.get('selected_window')]
             except Exception as e:
-                print(f"Error loading config: {e}")
+                if DEBUG_PRINTS:
+                    print(f"Error loading config: {e}")
                 self.previous_windows = []
         else:
             self.previous_windows = []
@@ -1027,6 +1353,7 @@ class BotGUI:
                 'version': self.BOT_VERSION,  # Always save current version
                 'human_like_clicking': self.config.get('human_like_clicking', True),
                 'quick_skip': self.config.get('quick_skip', False),
+                'quick_skip_mode': self.config.get('quick_skip_mode', 'horse'),
                 'sound_alert_on_finish': self.config.get('sound_alert_on_finish', True),
                 'classic_fishing': self.config.get('classic_fishing', False),
                 'classic_fishing_delay': self.config.get('classic_fishing_delay', 3.0),
@@ -1034,6 +1361,9 @@ class BotGUI:
                 'fish_actions': self.config.get('fish_actions', {}),
                 'drop_button_pos': self.config.get('drop_button_pos'),
                 'confirm_button_pos': self.config.get('confirm_button_pos'),
+                'armor_slot_pos': self.config.get('armor_slot_pos'),
+                'accent_color': BotGUI.ACCENT_COLOR,
+                'rgb_wave_active': self.rgb_wave_active,
                 'bait_keys': selected_bait_keys,
                 'bait': self.bait,
                 'selected_windows': selected_windows,
@@ -1042,7 +1372,8 @@ class BotGUI:
             with open(self.config_file, 'w') as f:
                 json.dump(config_data, f, indent=2)
         except Exception as e:
-            print(f"Error saving config: {e}")
+            if DEBUG_PRINTS:
+                print(f"Error saving config: {e}")
     
     def get_selected_bait_keys(self) -> list:
         """Returns list of selected bait keys in order."""
@@ -1058,9 +1389,10 @@ class BotGUI:
         selected_keys = self.get_selected_bait_keys()
         capacity = len(selected_keys) * 200
         if capacity > 0:
-            self.bait_capacity_label.config(
-                text=f"Max capacity: {capacity} bait ({len(selected_keys)} keys)",
-                fg="#00ff00"
+            self.bait_capacity_text_label.config(text="Bait\nper\nclient")
+            self.bait_capacity_number_label.config(
+                text=str(capacity),
+                fg=BotGUI.ACCENT_COLOR
             )
             # Reset bait to new capacity
             self.bait = capacity
@@ -1081,10 +1413,9 @@ class BotGUI:
             
             self.save_config()
         else:
-            # No keys selected - set bait to 0
-            self.bait = 0
-            self.bait_capacity_label.config(
-                text="⚠ Select at least one bait key!",
+            self.bait_capacity_text_label.config(text="Bait\nper\nclient")
+            self.bait_capacity_number_label.config(
+                text=str(capacity),
                 fg="#e74c3c"
             )
             self.bait_label.config(text="0")
@@ -1140,6 +1471,63 @@ class BotGUI:
         else:
             self.status_log_window.hide()
     
+    def toggle_quick_skip_modes(self):
+        """Enables or disables the quick skip mode checkboxes based on the main quick skip checkbox."""
+        enabled = self.quick_skip_var.get()
+        state = tk.NORMAL if enabled else tk.DISABLED
+        
+        self.quick_skip_mode_horse_check.config(state=state)
+        self.quick_skip_mode_armor_check.config(state=state)
+        
+        # Armor slot button should only be enabled if quick_skip is enabled AND armor mode is selected
+        armor_selected = self.quick_skip_mode_armor_var.get()
+        armor_btn_state = tk.NORMAL if (enabled and armor_selected) else tk.DISABLED
+        self.armor_slot_btn.config(state=armor_btn_state)
+        
+        # Save config
+        self.config['quick_skip'] = enabled
+        self.save_config()
+    
+    def select_quick_skip_mode(self, mode: str):
+        """Selects a quick skip mode and unchecks the other mode (mutually exclusive)."""
+        if mode == 'horse':
+            self.quick_skip_mode_horse_var.set(True)
+            self.quick_skip_mode_armor_var.set(False)
+            self.config['quick_skip_mode'] = 'horse'
+            
+            # Disable armor slot button when horse mode is selected
+            self.armor_slot_btn.config(state=tk.DISABLED)
+            
+            # Show warning for horse mode
+            messagebox.showinfo("Quick Skip - Horse Mode", 
+                               "This mode uses CTRL+G to quickly skip the fishing animation.\n\n"
+                               "HOW IT WORKS:\n"
+                               "• After catching a fish, the bot presses CTRL+G twice\n"
+                               "REQUIREMENTS:\n"
+                               "• You must have a horse in your inventory\n"
+                               "• CTRL+G must be bound to mount/dismount horse in your game settings\n\n"
+                               "TIP: This is the default and most commonly used quick skip method.")
+        else:  # armor
+            self.quick_skip_mode_armor_var.set(True)
+            self.quick_skip_mode_horse_var.set(False)
+            self.config['quick_skip_mode'] = 'armor'
+            
+            # Enable armor slot button when armor mode is selected (if quick_skip is enabled)
+            if self.quick_skip_var.get():
+                self.armor_slot_btn.config(state=tk.NORMAL)
+            
+            # Show warning for armor mode with setup instructions
+            messagebox.showinfo("Quick Skip - Armor Mode", 
+                               "This mode right-clicks on your armor slot to quickly skip the fishing animation.\n\n"
+                               "HOW IT WORKS:\n"
+                               "• After catching a fish, the bot right-clicks on your armor slot\n"
+                               "STEPS TO CONFIGURE:\n"
+                               "1. Make sure your character has armor equipped\n"
+                               "2. Click 'Set Armor Slot Coords' button\n"
+                               "3. Click on the armor slot in your game inventory\n"
+                               "4. Done! You can now start the bot with armor quick skip enabled.")
+        self.save_config()
+    
     def toggle_classic_fishing(self, show_warning: bool = True):
         """Toggles the classic fishing mode and disables human-like clicking when enabled.
         show_warning: If True, shows warning message when enabling. Set to False when loading from config."""
@@ -1194,8 +1582,11 @@ class BotGUI:
         
         if enabled:
             self.select_fishes_btn.config(state=tk.NORMAL)
-            # Enable drop position buttons only if any fish is set to 'drop'
-            self._update_drop_buttons_state()
+            # Enable drop position buttons so user can configure them
+            if hasattr(self, 'drop_btn_pos_btn'):
+                self.drop_btn_pos_btn.config(state=tk.NORMAL)
+            if hasattr(self, 'confirm_btn_pos_btn'):
+                self.confirm_btn_pos_btn.config(state=tk.NORMAL)
         else:
             self.select_fishes_btn.config(state=tk.DISABLED)
             # Disable drop position buttons
@@ -1214,10 +1605,33 @@ class BotGUI:
                            "'Automatic Fish Handling' section before starting the bot.\n\n"
                            "STEPS TO CONFIGURE:\n"
                            "1. Drop an item to the floor and don't press anything (only to open the drop/destroy/sell window)\n"
-                           "2. Click 'Set Drop Button Coords' and click on the drop/sell/destroy button in the game\n"
+                           "2. Click 'Set Drop/Sell/Destroy Button Coords' and click on the drop/sell/destroy button in the game\n"
                            "3. Click 'Set Confirm Button Coords' and click on the confirm button to finalize dropping the item in game\n"
                            "4. Done! You can now start the bot safely.")
     
+    def show_quick_skip_guide(self):
+        """Shows the quick skip guide message based on selected mode."""
+        # Determine which mode is selected
+        if self.quick_skip_mode_horse_var.get():
+            messagebox.showinfo("Quick Skip - Horse Mode", 
+                               "This mode uses CTRL+G to quickly skip the fishing animation.\n\n"
+                               "HOW IT WORKS:\n"
+                               "• After catching a fish, the bot presses CTRL+G twice\n"
+                               "REQUIREMENTS:\n"
+                               "• You must have a horse in your inventory\n"
+                               "• CTRL+G must be bound to mount/dismount horse in your game settings\n\n"
+                               "TIP: This is the default and most commonly used quick skip method.")
+        else:
+            messagebox.showinfo("Quick Skip - Armor Mode", 
+                               "This mode right-clicks on your armor slot to quickly skip the fishing animation.\n\n"
+                               "HOW IT WORKS:\n"
+                               "• After catching a fish, the bot right-clicks on your armor slot\n"
+                               "STEPS TO CONFIGURE:\n"
+                               "1. Make sure your character has armor equipped\n"
+                               "2. Click 'Set Armor Slot Coords' button\n"
+                               "3. Click on the armor slot in your game inventory\n"
+                               "4. Done! You can now start the bot with armor quick skip enabled.")
+                
     def _update_drop_buttons_state(self):
         """Enables drop position buttons only if any fish/item is set to 'drop' action."""
         fish_actions = self.config.get('fish_actions', {})
@@ -1234,16 +1648,177 @@ class BotGUI:
             if hasattr(self, 'confirm_btn_pos_btn'):
                 self.confirm_btn_pos_btn.config(state=tk.DISABLED)
     
+    def change_accent_color(self, new_color: str, from_rgb_wave: bool = False):
+        """Changes the accent color throughout the GUI."""
+        # Stop RGB wave effect if it's running (but not if called from RGB wave itself)
+        if not from_rgb_wave:
+            self.rgb_wave_active = False
+        
+        # Update the class constant
+        BotGUI.ACCENT_COLOR = new_color
+        
+        # Update all LabelFrame titles and Labels recursively
+        def update_widget_colors(widget):
+            # Update LabelFrame foreground
+            if isinstance(widget, tk.LabelFrame):
+                try:
+                    widget.config(fg=new_color)
+                except:
+                    pass
+            # Update Label foreground for title and discord labels
+            elif isinstance(widget, tk.Label):
+                try:
+                    text = str(widget.cget('text'))
+                    if 'Fishing Puzzle Player' in text or 'Discord:' in text or 'BTC' in text:
+                        widget.config(fg=new_color)
+                except:
+                    pass
+            # Update Button foreground for copy button
+            elif isinstance(widget, tk.Button):
+                try:
+                    if widget.cget('text') == "📋":
+                        widget.config(fg=new_color, activeforeground=new_color)
+                except:
+                    pass
+            
+            # Recursively update children
+            try:
+                for child in widget.winfo_children():
+                    update_widget_colors(child)
+            except:
+                pass
+        
+        # Start recursive update from root
+        update_widget_colors(self.root)
+        
+        # Update all specific buttons and labels with ACCENT_COLOR
+        if hasattr(self, 'refresh_windows_btn'):
+            self.refresh_windows_btn.config(fg=new_color, activeforeground=new_color)
+        if hasattr(self, 'bait_capacity_number_label'):
+            # Only update if capacity is not 0 (when 0, it should stay red)
+            capacity = self.get_max_bait_capacity()
+            if capacity > 0:
+                self.bait_capacity_number_label.config(fg=new_color)
+        if hasattr(self, 'reset_btn'):
+            self.reset_btn.config(fg=new_color)
+        if hasattr(self, 'select_fishes_btn'):
+            self.select_fishes_btn.config(fg=new_color)
+        if hasattr(self, 'drop_btn_pos_btn'):
+            self.drop_btn_pos_btn.config(fg=new_color)
+        if hasattr(self, 'confirm_btn_pos_btn'):
+            self.confirm_btn_pos_btn.config(fg=new_color)
+        if hasattr(self, 'armor_slot_btn'):
+            self.armor_slot_btn.config(fg=new_color)
+        if hasattr(self, 'quick_skip_help_btn'):
+            self.quick_skip_help_btn.config(bg=new_color, activebackground=new_color)
+        if hasattr(self, 'drop_help_btn'):
+            self.drop_help_btn.config(bg=new_color, activebackground=new_color)
+        if hasattr(self, 'total_games_label'):
+            self.total_games_label.config(fg=new_color)
+        if hasattr(self, 'active_windows_label'):
+            self.active_windows_label.config(fg=new_color)
+        if hasattr(self, 'bait_label'):
+            self.bait_label.config(fg=new_color)
+        if hasattr(self, 'start_pause_btn'):
+            self.start_pause_btn.config(fg=new_color)
+        if hasattr(self, 'stop_all_btn'):
+            self.stop_all_btn.config(fg=new_color)
+        if hasattr(self, 'donations_label'):
+            self.donations_label.config(fg=new_color)
+        
+        # Update window bait labels
+        for i in range(MAX_WINDOWS):
+            if i in self.window_bait_labels:
+                self.window_bait_labels[i].config(fg=new_color)
+        
+        # Update window games labels
+        for i in range(MAX_WINDOWS):
+            if i in self.window_games_labels:
+                self.window_games_labels[i].config(fg=new_color)
+        
+        # Save to config
+        self.config['accent_color'] = new_color
+        if not from_rgb_wave:
+            self.config['rgb_wave_active'] = False
+        self.save_config()
+        
+        self.add_status(f"Accent color changed to {new_color}")
+    
+    def toggle_rgb_wave(self):
+        """Toggles the RGB wave effect on/off."""
+        self.rgb_wave_active = not self.rgb_wave_active
+        
+        if self.rgb_wave_active:
+            # Show performance warning
+            messagebox.showwarning(
+                "RGB Wave Effect",
+                "RGB Wave Effect enabled!\n\n"
+                "Note: This feature may cause a slight performance drop due to continuous color updates.\n\n"
+                "If you experience any issues, you can disable it by clicking the rainbow square again."
+            )
+            self.add_status("RGB wave effect activated")
+            self.rgb_wave_hue = 0
+            self.update_rgb_wave()
+        else:
+            self.add_status("RGB wave effect deactivated")
+        
+        # Save to config
+        self.config['rgb_wave_active'] = self.rgb_wave_active
+        self.save_config()
+    
+    def update_rgb_wave(self):
+        """Updates the accent color with RGB wave effect."""
+        if not self.rgb_wave_active:
+            return
+        
+        # Convert HSV to RGB (hue cycles 0-360)
+        import colorsys
+        h = self.rgb_wave_hue / 360.0
+        r, g, b = colorsys.hsv_to_rgb(h, 1.0, 1.0)
+        
+        # Convert to hex color
+        color_hex = f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}"
+        
+        # Update accent color (from RGB wave, don't stop the wave)
+        self.change_accent_color(color_hex, from_rgb_wave=True)
+        
+        # Increment hue for next update
+        self.rgb_wave_hue = (self.rgb_wave_hue + 3) % 360
+        
+        # Schedule next update (60ms for smooth transition)
+        if self.rgb_wave_active:
+            self.root.after(60, self.update_rgb_wave)
+    
     def start_position_capture(self, mode: str):
         """Starts mouse position capture mode. User clicks in game window to set position.
         mode: 'drop' or 'confirm'"""
-        # If already capturing for this mode, just reactivate the stored window
+        # If already capturing for this mode, just reactivate the stored window (and minimize others)
         if self._position_capture_mode == mode and hasattr(self, '_position_capture_window') and self._position_capture_window:
             try:
                 all_windows = WindowManager.get_all_windows()
                 window_dict = {name: win for name, win in all_windows}
+                
+                # Minimize all other selected windows first
+                for i in range(MAX_WINDOWS):
+                    window_name = self.window_selections[i].get()
+                    if window_name and window_name != self._position_capture_window:
+                        if window_name in window_dict:
+                            try:
+                                window_dict[window_name].minimize()
+                            except Exception:
+                                pass  # Ignore if minimize fails
+                
+                # Small delay to ensure windows are minimized
+                time.sleep(0.1)
+                
+                # Then activate the target window
                 if self._position_capture_window in window_dict:
-                    window_dict[self._position_capture_window].activate()
+                    target_window = window_dict[self._position_capture_window]
+                    # Restore if minimized
+                    if target_window.isMinimized:
+                        target_window.restore()
+                        time.sleep(0.1)
+                    target_window.activate()
                     self.add_status(f"Click on the {mode} button in the game window...")
                     return
             except Exception:
@@ -1263,17 +1838,39 @@ class BotGUI:
         # Update button text to show capture mode is active
         if mode == 'drop':
             self.drop_btn_pos_btn.config(text="⏳ Click in game...", bg="#f39c12")
-        else:
+        elif mode == 'confirm':
             self.confirm_btn_pos_btn.config(text="⏳ Click in game...", bg="#f39c12")
+        else:  # armor
+            self.armor_slot_btn.config(text="⏳ Click in game...", bg="#f39c12")
         
         self.add_status(f"Click on the {mode} button in the game window...")
         
-        # Activate the first selected game window so user can click on it
+        # Activate the first selected game window and minimize all others
         try:
             all_windows = WindowManager.get_all_windows()
             window_dict = {name: win for name, win in all_windows}
+            
+            # Minimize all other selected windows first
+            for i in range(MAX_WINDOWS):
+                window_name = self.window_selections[i].get()
+                if window_name and window_name != self._position_capture_window:
+                    if window_name in window_dict:
+                        try:
+                            window_dict[window_name].minimize()
+                        except Exception:
+                            pass  # Ignore if minimize fails
+            
+            # Small delay to ensure windows are minimized
+            time.sleep(0.1)
+            
+            # Then activate the target window
             if self._position_capture_window in window_dict:
-                window_dict[self._position_capture_window].activate()
+                target_window = window_dict[self._position_capture_window]
+                # Restore if minimized
+                if target_window.isMinimized:
+                    target_window.restore()
+                    time.sleep(0.1)
+                target_window.activate()
         except Exception as e:
             self.add_status(f"Could not activate window: {e}")
         
@@ -1325,12 +1922,16 @@ class BotGUI:
             # Store position in config
             if mode == 'drop':
                 self.config['drop_button_pos'] = (rel_x, rel_y)
-                self.drop_btn_pos_label.config(text=f"({rel_x},{rel_y})", fg="#00ff00")
+                self.drop_btn_pos_label.config(text=f"({rel_x},{rel_y})", fg="#ffffff")
                 self.add_status(f"Drop button position set: ({rel_x}, {rel_y})")
-            else:
+            elif mode == 'confirm':
                 self.config['confirm_button_pos'] = (rel_x, rel_y)
-                self.confirm_btn_pos_label.config(text=f"({rel_x},{rel_y})", fg="#00ff00")
+                self.confirm_btn_pos_label.config(text=f"({rel_x},{rel_y})", fg="#ffffff")
                 self.add_status(f"Confirm button position set: ({rel_x}, {rel_y})")
+            else:  # armor
+                self.config['armor_slot_pos'] = (rel_x, rel_y)
+                self.armor_slot_label.config(text=f"({rel_x},{rel_y})", fg="#ffffff")
+                self.add_status(f"Armor slot position set: ({rel_x}, {rel_y})")
             
             self.save_config()
             
@@ -1351,9 +1952,11 @@ class BotGUI:
             self._position_capture_listener = None
         
         if hasattr(self, 'drop_btn_pos_btn'):
-            self.drop_btn_pos_btn.config(text="Set Drop Button Coords", bg="#555555")
+            self.drop_btn_pos_btn.config(text="Set Drop/Sell/Destroy Coords", bg="#555555")
         if hasattr(self, 'confirm_btn_pos_btn'):
             self.confirm_btn_pos_btn.config(text="Set Confirm Button Coords", bg="#555555")
+        if hasattr(self, 'armor_slot_btn'):
+            self.armor_slot_btn.config(text="Set Armor Slot Coords", bg="#666666")
     
     def open_fish_selection_window(self):
         """Opens the fish selection window for configuring fish/item actions."""
@@ -1372,7 +1975,10 @@ class BotGUI:
             self.root, 
             self.config.get('fish_actions', {}),
             self.on_fish_actions_saved,
-            self.config  # Pass config to check drop button positions
+            self.config,  # Pass config to check drop button positions
+            BotGUI.ACCENT_COLOR,  # Pass current accent color
+            self.rgb_wave_active,  # Pass RGB wave state
+            self.rgb_wave_hue  # Pass current hue
         )
     
     def on_fish_actions_saved(self, fish_actions: dict):
@@ -1380,8 +1986,6 @@ class BotGUI:
         self.config['fish_actions'] = fish_actions
         self.save_config()
         self.add_status(f"Fish actions saved: {len(fish_actions)} items configured")
-        # Update drop buttons state based on whether any item is set to 'drop'
-        self._update_drop_buttons_state()
 
     def on_window_selected(self, window_id: int):
         """Updates bait display when a window is selected."""
@@ -1419,8 +2023,8 @@ class BotGUI:
                 self.gif_label_left.config(image=self.photo_images[self.current_frame])
             if self.gif_label_right:
                 self.gif_label_right.config(image=self.photo_images[self.current_frame])
-            # Schedule next frame update (50ms for smooth animation)
-            self.root.after(50, self.animate_gif)
+            # Schedule next frame update (30ms for faster animation)
+            self.root.after(30, self.animate_gif)
     
     def on_global_key_press(self, key):
         """Global key press handler for F5 pause/resume all bots."""
@@ -1509,7 +2113,6 @@ class BotGUI:
         """Resets the bait counter to max capacity for selected windows, 0 for unselected"""
         max_bait = self.get_max_bait_capacity()
         self.bait = max_bait
-        self.bait_label.config(text=str(max_bait))
         
         # Reset all bots' bait counters
         for bot_id, bot in self.bots.items():
@@ -1527,6 +2130,10 @@ class BotGUI:
                 else:
                     self.window_stats[i]['bait'] = 0
                     self.window_bait_labels[i].config(text="B:---")
+        
+        # Update total bait label (sum of all selected windows)
+        total_bait = sum(self.window_stats[i]['bait'] for i in range(MAX_WINDOWS) if self.window_selections[i].get())
+        self.bait_label.config(text=str(total_bait))
         
         self.add_status(f"All bait counters reset to {max_bait}")
         self.save_config()
@@ -1591,10 +2198,27 @@ class BotGUI:
                                        "'Automatic Fish Handling' section before starting the bot.\n\n"
                                        "STEPS TO CONFIGURE:\n"
                                        "1. Drop an item to the floor and don't press anything (only to open the drop/destroy/sell window)\n"
-                                       "2. Click 'Set Drop Button Coords' and click on the drop/sell/destroy button in the game\n"
+                                       "2. Click 'Set Drop/Sell/Destroy Button Coords' and click on the drop/sell/destroy button in the game\n"
                                        "3. Click 'Set Confirm Button Coords' and click on the confirm button to finalize dropping the item in game\n"
                                        "4. Done! You can now start the bot safely.")
                     return
+        
+        # Check if armor slot position is configured when quick skip is enabled with armor mode
+        if self.config.get('quick_skip', False) and self.config.get('quick_skip_mode', 'horse') == 'armor':
+            armor_pos = self.config.get('armor_slot_pos')
+            if not armor_pos:
+                messagebox.showerror("Quick Skip - Armor Mode", 
+                               "This mode right-clicks on your armor slot to quickly skip the fishing animation.\n\n"
+                               "HOW IT WORKS:\n"
+                               "• After catching a fish, the bot right-clicks on your armor slot\n"
+                               "• This unequips/re-equips your armor\n"
+                               "• The equip animation skips the fishing animation\n\n"
+                               "STEPS TO CONFIGURE:\n"
+                               "1. Make sure your character has armor equipped\n"
+                               "2. Click 'Set Armor Slot Coords' button\n"
+                               "3. Click on the armor slot in your game inventory\n"
+                               "4. Done! You can now start the bot with armor quick skip enabled.")
+                return
         
         # Reset sound alert flag for new session
         self._sound_alert_played = False
@@ -1723,13 +2347,13 @@ class BotGUI:
             
             if any_paused:
                 # Show Resume button
-                self.start_pause_btn.config(text="▶ Resume All (F5)", bg="#2ecc71", activebackground="#27ae60")
+                self.start_pause_btn.config(text="▶ Resume All (F5)", bg="#888888", activebackground="#999999")
             else:
                 # Show Pause button
-                self.start_pause_btn.config(text="⏸ Pause All (F5)", bg="#f39c12", activebackground="#e67e22")
+                self.start_pause_btn.config(text="⏸ Pause All (F5)", bg="#888888", activebackground="#999999")
         else:
             # No bots running - show Start button
-            self.start_pause_btn.config(state=tk.NORMAL, text="▶ Start All", bg="#2ecc71", activebackground="#27ae60")
+            self.start_pause_btn.config(state=tk.NORMAL, text="▶ Start All", bg="#888888", activebackground="#999999")
             self.stop_all_btn.config(state=tk.DISABLED)
         
         # Update active windows count
@@ -1746,8 +2370,15 @@ class BotGUI:
         # Human-like clicking checkbox
         self.human_like_check.config(state=state)
         
-        # Quick skip checkbox
+        # Quick skip checkbox and mode checkboxes
         self.quick_skip_check.config(state=state)
+        # Mode checkboxes should only be enabled if quick skip is enabled and we're enabling widgets
+        if state == 'normal' and self.quick_skip_var.get():
+            self.quick_skip_mode_horse_check.config(state=state)
+            self.quick_skip_mode_armor_check.config(state=state)
+        else:
+            self.quick_skip_mode_horse_check.config(state='disabled')
+            self.quick_skip_mode_armor_check.config(state='disabled')
         
         # Sound alert checkbox
         self.sound_alert_check.config(state=state)
@@ -1766,6 +2397,23 @@ class BotGUI:
             self.select_fishes_btn.config(state=tk.NORMAL)
         else:
             self.select_fishes_btn.config(state=tk.DISABLED)
+        
+        # Drop/Confirm button coordinate capture buttons
+        # Only enable when widgets are being enabled (bots stopped) and auto fish handling is on
+        if state == 'normal' and self.auto_fish_var.get():
+            if hasattr(self, 'drop_btn_pos_btn'):
+                self.drop_btn_pos_btn.config(state=tk.NORMAL)
+            if hasattr(self, 'confirm_btn_pos_btn'):
+                self.confirm_btn_pos_btn.config(state=tk.NORMAL)
+        else:
+            if hasattr(self, 'drop_btn_pos_btn'):
+                self.drop_btn_pos_btn.config(state=tk.DISABLED)
+            if hasattr(self, 'confirm_btn_pos_btn'):
+                self.confirm_btn_pos_btn.config(state=tk.DISABLED)
+        
+        # Refresh Windows button
+        if hasattr(self, 'refresh_windows_btn'):
+            self.refresh_windows_btn.config(state=state)
     
     def on_bot_stopped(self, bot_id: int):
         """Updates UI when a bot stops running."""

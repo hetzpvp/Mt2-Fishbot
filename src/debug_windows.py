@@ -38,7 +38,9 @@ class StatusLogWindow:
             try:
                 self.window.iconbitmap(icon_path)
             except Exception as e:
-                print(f"Error loading icon: {e}")
+                from utils import DEBUG_PRINTS
+                if DEBUG_PRINTS:
+                    print(f"Error loading icon: {e}")
         
         # Header
         header = tk.Frame(self.window, bg="#000000", height=35)
@@ -158,7 +160,9 @@ class IgnoredPositionsWindow:
             try:
                 self.window.iconbitmap(icon_path)
             except Exception as e:
-                print(f"Error loading icon: {e}")
+                from utils import DEBUG_PRINTS
+                if DEBUG_PRINTS:
+                    print(f"Error loading icon: {e}")
         
         # Header
         header = tk.Frame(self.window, bg="#000000", height=35)
@@ -218,9 +222,11 @@ class IgnoredPositionsWindow:
             self.canvas.create_image(140, 140, image=self.placeholder_image, anchor="center")
             self.canvas.update()
         except Exception as e:
-            print(f"Error drawing placeholder: {e}")
-            import traceback
-            traceback.print_exc()
+            from utils import DEBUG_PRINTS
+            if DEBUG_PRINTS:
+                print(f"Error drawing placeholder: {e}")
+                import traceback
+                traceback.print_exc()
     
     def _schedule_update(self):
         """Schedule next update"""
@@ -367,9 +373,11 @@ class IgnoredPositionsWindow:
             self.counter_label.config(text=f"Count: {count}")
             
         except Exception as e:
-            print(f"Error updating display: {e}")
-            import traceback
-            traceback.print_exc()
+            from utils import DEBUG_PRINTS
+            if DEBUG_PRINTS:
+                print(f"Error updating display: {e}")
+                import traceback
+                traceback.print_exc()
         
         self._schedule_update()
     
