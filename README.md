@@ -14,8 +14,6 @@ Free fishing minigame bot for Metin2. No subscriptions, no licenses.
 
 ## Tutorial/Demo
 
-[![Watch Tutorial](https://img.youtube.com/vi/M0THxnio894/maxresdefault.jpg)](https://youtu.be/M0THxnio894)
-
 **Watch the full tutorial:** [YouTube Video](https://youtu.be/M0THxnio894)
 
 ---
