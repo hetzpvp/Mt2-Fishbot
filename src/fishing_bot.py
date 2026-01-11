@@ -115,6 +115,9 @@ class FishingBot:
         # Dead fish tracking: ignored slot positions (10 pixel radius around center)
         self._ignored_positions = set()  # Positions confirmed as dead fish
         
+        # Aelys2 minigame: track if space has been pressed
+        self._space_pressed_once = False
+        
     def _load_template_cache(self) -> Dict[str, tuple]:
         """Loads all fish/item templates from assets folder into class-level cache.
         Returns dict of {filename: (grayscale_template, half_width, half_height)}
@@ -282,6 +285,10 @@ class FishingBot:
             frame = np.array(sct_img)
             frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
             return frame
+        except AttributeError:
+            # MSS thread-local issue - recreate instance
+            self.sct = mss()
+            return self.capture_inventory_area()
         except Exception as e:
             if self.on_status_update:
                 self.on_status_update(f"[W{self.bot_id+1}] Error capturing inventory: {e}")
@@ -629,6 +636,10 @@ class FishingBot:
             frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
             
             return frame
+        except AttributeError:
+            # MSS thread-local issue - recreate instance
+            self.sct = mss()
+            return self.capture_full_window()
         except Exception as e:
             if self.on_status_update:
                 self.on_status_update(f"Screenshot error: {e}")
@@ -659,6 +670,10 @@ class FishingBot:
             frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
             
             return frame
+        except AttributeError:
+            # MSS thread-local issue - recreate instance
+            self.sct = mss()
+            return self.capture_screen()
         except Exception as e:
             if self.on_status_update:
                 self.on_status_update(f"Screenshot error: {e}")
@@ -748,6 +763,64 @@ class FishingBot:
             if self.on_status_update:
                 self.on_status_update(f"[W{self.bot_id+1}] Click error: {e}")
             return (True, None)
+    
+    def check_horizontal_bar_and_press_space(self) -> bool:
+        """Checks Aelys2 minigame and presses space if target (2.png or 3.png) is detected.
+        Continuously checks until target is found or 20 second timeout.
+        Returns: True if minigame is still active, False if ended"""
+        try:
+            # If space was already pressed once, end the minigame
+            if self._space_pressed_once:
+                self._space_pressed_once = False  # Reset for next game
+                return False
+            
+            # Start timeout timer for target detection
+            start_time = time.time()
+            timeout = 20.0  # 20 seconds to find a target
+            
+            # Keep checking for target until found or timeout
+            while self.running and not self._space_pressed_once:
+                frame = self.capture_screen()
+                
+                # Check if window is still active using 1.png
+                window_active = self.detector.detect_aelys2_window(frame)
+                
+                if not window_active:
+                    # Window disappeared - reset flag and end minigame
+                    self._space_pressed_once = False
+                    return False
+                
+                # Check for timeout
+                if time.time() - start_time > timeout:
+                    if self.on_status_update:
+                        self.on_status_update(f"[W{self.bot_id+1}] Target detection timeout (20s) - no target found")
+                    self._space_pressed_once = False
+                    return False
+                
+                # Check if either target (2.png or 3.png) is detected
+                target_detected = self.detector.detect_aelys2_targets(frame)
+                
+                if target_detected:
+                    # Target detected - press space immediately and mark as pressed
+                    with input_lock:
+                        self.window_manager.activate_window(force_activate=True)
+                        time.sleep(0.01)
+                        self.press_key('space', "")
+                        time.sleep(0.03)
+                    
+                    # Mark that space has been pressed - will end minigame on next call
+                    self._space_pressed_once = True
+                    return True
+                
+                # Small delay between checks (10ms = 100 checks per second)
+                time.sleep(0.01)
+            
+            return True
+            
+        except Exception as e:
+            if self.on_status_update:
+                self.on_status_update(f"[W{self.bot_id+1}] Aelys2 minigame error: {e}")
+            return True
     
     def get_bait_key(self, bait_count: int) -> str:
         """Determines which keyboard key to press based on bait counter and selected keys."""
@@ -889,7 +962,7 @@ class FishingBot:
                     self.on_status_update(f"[W{self.bot_id+1}] Error pressing key '{key}': {e}")
     
     def wait_for_minigame_window(self, timeout: float = 4.0) -> bool:
-        """Waits for and finds the fishing minigame window. Auto-calibrates region on first detection.
+        """Waits for and finds the Aelys2 fishing minigame window using 1.png detection.
         Returns True if minigame detected, False otherwise."""
         start_time = time.time()
         
@@ -899,26 +972,18 @@ class FishingBot:
                 continue
             
             try:
-                # On first detection, find and calibrate the region
-                if not self.region_auto_calibrated:
-                    frame = self.capture_full_window()
-                    bounds = self.detector.find_fishing_window_bounds(frame)
-                    if bounds:
-                        x, y, w, h = bounds
-                        self.region = GameRegion(x, y, w, h)
-                        self.region_auto_calibrated = True
-                        self._update_region_cache()  # Update cached constants
-                        if self.on_status_update:
-                            self.on_status_update(f"[W{self.bot_id+1}] Auto-calibrated region: {w}x{h} at ({x},{y})")
-                        return True
-                else:
-                    # Use standard detection after calibration
-                    frame = self.capture_screen()
-                    window_active, _ = self.detector.detect_window_and_fish(frame)
-                    if window_active:
-                        return True
+                frame = self.capture_full_window()
                 
-                time.sleep(0.05)  # Faster polling for quicker minigame detection
+                # Detect Aelys2 minigame window using 1.png template
+                window_detected = self.detector.detect_aelys2_window(frame)
+                
+                if window_detected:
+                    if self.on_status_update and not self.region_auto_calibrated:
+                        self.on_status_update(f"[W{self.bot_id+1}] Aelys2 minigame detected!")
+                        self.region_auto_calibrated = True
+                    return True
+                
+                time.sleep(0.05)
             except Exception as e:
                 if self.on_status_update:
                     self.on_status_update(f"[W{self.bot_id+1}] Error: {e}")
@@ -1184,24 +1249,30 @@ class FishingBot:
                     self.consecutive_failures = 0
                     
                     minigame_active = True
-                    human_like = self.config.get('human_like_clicking', True)
+                    minigame_start_time = time.time()
+                    minigame_timeout = 20.0  # 20 seconds timeout
                     
                     while self.running and minigame_active:
                         if self.paused:
                             time.sleep(0.1)
                             continue
                         
-                        # Small delay between attempts (minimized for responsiveness)
-                        if human_like:
-                            time.sleep(np.random.uniform(0.15, 0.4))
+                        # Check for timeout
+                        if time.time() - minigame_start_time > minigame_timeout:
+                            if self.on_status_update:
+                                self.on_status_update(f"[W{self.bot_id+1}] Minigame timeout (20s) - no target detected")
+                            minigame_active = False
+                            break
+                        
+                        # Very small delay for fast detection (10ms = 100 checks per second)
+                        time.sleep(0.01)
                         
                         try:
-                            # Atomic operation: capture + detect + click all within lock
-                            window_active, fish_pos = self.atomic_capture_and_click()
+                            # Check Aelys2 targets (2.png or 3.png) and press space if detected
+                            minigame_active = self.check_horizontal_bar_and_press_space()
                             
-                            if not window_active:
+                            if not minigame_active:
                                 # Minigame ended
-                                minigame_active = False
                                 self.total_games += 1
                                 self.bait_counter -= 1
                                 
@@ -1215,11 +1286,6 @@ class FishingBot:
                                 # Handle caught item (if auto fish handling is enabled)
                                 self.handle_caught_item()
                                 break
-                            
-                            if fish_pos:
-                                self.hits += 1
-                                if self.on_stats_update:
-                                    self.on_stats_update(self.bot_id, self.hits, self.total_games, self.bait_counter)
                                 
                         except Exception as e:
                             if self.on_status_update:

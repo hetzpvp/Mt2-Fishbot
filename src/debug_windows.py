@@ -1,4 +1,4 @@
-"""
+﻿"""
 Debug Windows for the Fishing Bot
 IgnoredPositionsWindow, FishDetectorDebugWindow, and StatusLogWindow
 """
@@ -774,6 +774,235 @@ class FishDetectorDebugWindow:
             self.window.withdraw()
     
     def is_visible(self) -> bool:
+        """Check if window is visible"""
+        if self.window:
+            return self.window.winfo_viewable()
+        return False
+    
+    def destroy(self):
+        """Destroy the window"""
+        if self._update_loop_id:
+            self.window.after_cancel(self._update_loop_id)
+        if self.window:
+            self.window.destroy()
+
+
+
+class Aelys2DebugWindow:
+    """Debug window for Aelys2 minigame target detection"""
+    
+    def __init__(self, parent, bot_instance):
+        self.parent = parent
+        self.bot = bot_instance
+        self.window = None
+        self.canvas = None
+        self.photo_image = None
+        self.status_label = None
+        self.timeout_label = None
+        self.info_text = None
+        self._create_window()
+        self._update_loop_id = None
+        self.is_paused = False
+    
+    def _create_window(self):
+        """Creates the Aelys2 debug window"""
+        self.window = tk.Toplevel(self.parent)
+        self.window.title(f"Aelys2 Target Detection - [W{self.bot.bot_id+1}]")
+        self.window.geometry("600x520")
+        self.window.configure(bg="#1a1a1a")
+        self.window.resizable(False, False)
+        
+        icon_path = get_resource_path("monkey.ico")
+        if os.path.exists(icon_path):
+            try:
+                self.window.iconbitmap(icon_path)
+            except Exception:
+                pass
+        
+        header = tk.Frame(self.window, bg="#000000", height=35)
+        header.pack(fill=tk.X)
+        header.pack_propagate(False)
+        
+        title = tk.Label(header, text="🎯 Aelys2 Target Detection", 
+                        font=("Courier New", 11, "bold"),
+                        bg="#000000", fg="#FFD700")
+        title.pack(pady=6)
+        
+        status_frame = tk.Frame(self.window, bg="#1a1a1a")
+        status_frame.pack(fill=tk.X, padx=5, pady=3)
+        
+        self.status_label = tk.Label(status_frame, text="Status: Idle",
+                                     font=("Courier New", 9, "bold"),
+                                     bg="#1a1a1a", fg="#00ff00",
+                                     anchor="w")
+        self.status_label.pack(fill=tk.X, pady=2)
+        
+        self.timeout_label = tk.Label(status_frame, text="Timeout: --",
+                                      font=("Courier New", 9),
+                                      bg="#1a1a1a", fg="#FFD700",
+                                      anchor="w")
+        self.timeout_label.pack(fill=tk.X, pady=2)
+        
+        self.canvas = tk.Canvas(self.window, bg="#000000", width=580, height=350,
+                               highlightthickness=1, highlightbackground="#333333")
+        self.canvas.pack(padx=5, pady=5)
+        
+        self.info_text = tk.Label(self.window, text="Waiting for minigame...",
+                                 font=("Courier New", 8),
+                                 bg="#1a1a1a", fg="#888888",
+                                 anchor="w", justify=tk.LEFT)
+        self.info_text.pack(fill=tk.X, padx=10, pady=3)
+        
+        button_frame = tk.Frame(self.window, bg="#1a1a1a")
+        button_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        self.pause_btn = tk.Button(button_frame, text="⏸ Pause Updates", 
+                                   command=self.toggle_pause,
+                                   bg="#3498db", fg="white", 
+                                   font=("Courier New", 9, "bold"),
+                                   cursor="hand2", padx=10, pady=3)
+        self.pause_btn.pack(side=tk.LEFT, padx=5)
+        
+        tk.Button(button_frame, text="Close", 
+                 command=self._on_close,
+                 bg="#555555", fg="white", 
+                 font=("Courier New", 9, "bold"),
+                 cursor="hand2", padx=15, pady=3).pack(side=tk.RIGHT, padx=5)
+        
+        self.window.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._schedule_update()
+    
+    def toggle_pause(self):
+        """Toggle pause state"""
+        self.is_paused = not self.is_paused
+        if self.is_paused:
+            self.pause_btn.config(text="▶ Resume Updates", bg="#e74c3c")
+        else:
+            self.pause_btn.config(text="⏸ Pause Updates", bg="#3498db")
+    
+    def _schedule_update(self):
+        """Schedule next update"""
+        if self.window and self.window.winfo_exists():
+            self._update_loop_id = self.window.after(50, self._update_display)
+    
+    def _on_close(self):
+        """Handle window close"""
+        if self._update_loop_id:
+            self.window.after_cancel(self._update_loop_id)
+        if self.window:
+            self.window.destroy()
+            self.window = None
+    
+    def _update_display(self):
+        """Update the display with current detection results"""
+        try:
+            if not self.window or not self.window.winfo_exists():
+                return
+            
+            if self.is_paused:
+                self._schedule_update()
+                return
+            
+            if not self.bot.running:
+                self.status_label.config(text="Status: Bot not running", fg="#ff8800")
+                self._schedule_update()
+                return
+            
+            try:
+                frame = self.bot.capture_screen()
+            except Exception as e:
+                self.status_label.config(text=f"Status: Capture error", fg="#ff0000")
+                self._schedule_update()
+                return
+            
+            if frame is None or frame.size == 0:
+                self.status_label.config(text="Status: No frame", fg="#ff8800")
+                self._schedule_update()
+                return
+            
+            h, w = frame.shape[:2]
+            viz_frame = frame.copy()
+            
+            status_msg = []
+            
+            try:
+                window_active = self.bot.detector.detect_aelys2_window(frame)
+                
+                if window_active:
+                    cv2.putText(viz_frame, "WINDOW DETECTED (1.png)", (10, 30),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    status_msg.append("Window: YES")
+                    
+                    target_detected = self.bot.detector.detect_aelys2_targets(frame)
+                    
+                    if target_detected:
+                        cv2.putText(viz_frame, "TARGET DETECTED! (2.png or 3.png)", (10, 70),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 3)
+                        cv2.rectangle(viz_frame, (5, 5), (w-5, h-5), (0, 255, 255), 5)
+                        status_msg.append("Target: FOUND!")
+                        self.status_label.config(text="Status: TARGET FOUND - Press SPACE", fg="#00ffff")
+                    else:
+                        cv2.putText(viz_frame, "Searching for target...", (10, 70),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                        status_msg.append("Target: searching")
+                        self.status_label.config(text="Status: Searching for target", fg="#ffff00")
+                else:
+                    cv2.putText(viz_frame, "WINDOW NOT DETECTED", (10, 30),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    status_msg.append("Window: NO")
+                    self.status_label.config(text="Status: Minigame window not detected", fg="#ff0000")
+                
+                if self.bot._space_pressed_once:
+                    cv2.putText(viz_frame, "SPACE PRESSED - ENDING", (10, h-20),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+                    status_msg.append("SPACE PRESSED")
+                
+            except Exception as e:
+                status_msg.append(f"Error: {str(e)[:40]}")
+                self.status_label.config(text=f"Status: Detection error", fg="#ff0000")
+            
+            timeout_text = "Timeout: 20s (check minigame loop)"
+            self.timeout_label.config(text=timeout_text)
+            
+            scale = min(580.0 / w, 350.0 / h, 1.0)
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            
+            if new_w > 0 and new_h > 0:
+                viz_resized = cv2.resize(viz_frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            else:
+                self._schedule_update()
+                return
+            
+            rgb_frame = cv2.cvtColor(viz_resized, cv2.COLOR_BGR2RGB)
+            pil_image = Image.fromarray(rgb_frame)
+            self.photo_image = ImageTk.PhotoImage(pil_image)
+            
+            self.canvas.delete("all")
+            self.canvas.create_image(290, 175, image=self.photo_image, anchor="center")
+            
+            info_str = " | ".join(status_msg)
+            self.info_text.config(text=info_str)
+            
+        except Exception as e:
+            if DEBUG_PRINTS:
+                print(f"Aelys2 debug window error: {e}")
+        
+        self._schedule_update()
+    
+    def show(self):
+        """Show the window"""
+        if self.window:
+            self.window.deiconify()
+            self.window.lift()
+            self.window.focus_force()
+    
+    def hide(self):
+        """Hide the window"""
+        if self.window:
+            self.window.withdraw()
+    
+    def is_visible(self):
         """Check if window is visible"""
         if self.window:
             return self.window.winfo_viewable()

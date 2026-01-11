@@ -14,7 +14,7 @@ input_lock = threading.Lock()
 MAX_WINDOWS = 8
 
 # Debug mode - enable/disable IgnoredPositionsWindow
-DEBUG_MODE_EN = False
+DEBUG_MODE_EN = True
 
 # Debug prints - enable/disable verbose debug print statements
 DEBUG_PRINTS = False

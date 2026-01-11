@@ -3,11 +3,12 @@ Build script for MT2 Fishing Bot
 Handles versioning and PyInstaller build process
 
 Usage:
-    python build.py                 - Build with current version
-    python build.py --clean         - Clean build artifacts before building
-    python build.py --version X.X.X - Build with specific version (updates version.py)
-    python build.py --no-build      - Only update versions without building
-    python build.py --verify        - Verify build environment and dependencies
+    python build.py                      - Build with current version
+    python build.py --clean              - Clean build artifacts before building
+    python build.py --version X.X.X      - Build with specific version (updates version.py)
+    python build.py --no-build           - Only update versions without building
+    python build.py --verify             - Verify build environment matches required versions exactly
+    python build.py --update-versions    - Update required versions to currently installed packages
 """
 
 import os
@@ -89,36 +90,119 @@ def print_info(message):
 
 
 def verify_dependencies():
-    """Verify that all required dependencies are installed."""
+    """Verify that all required dependencies are installed with exact versions."""
     print_info("Verifying dependencies...")
     
-    dependencies = {
-        'PyInstaller': 'pyinstaller',
-        'PIL/Pillow': 'PIL',
+    # Required dependencies with exact versions from current environment
+    # Update these versions to match your production environment
+    required_versions = {
+        'Python': '3.14.2',
+        'PyInstaller': '6.12.0',
+        'Pillow': '11.1.0',
+        'pynput': '1.7.7',
+        'opencv-python': '4.11.0.86',
+        'numpy': '2.2.2',
+        'psutil': '6.1.1',
+        'PyAutoGUI': '0.9.54',
+        'mss': '10.0.0',
+        'pygetwindow': '0.0.9',
+    }
+    
+    # Check Python version
+    import platform
+    current_python = platform.python_version()
+    expected_python = required_versions['Python']
+    
+    if current_python == expected_python:
+        print_success(f"Python {current_python} (matches required {expected_python})")
+    else:
+        print_error(f"Python {current_python} (expected {expected_python})")
+        print_warning(f"Python version mismatch! Current: {current_python}, Required: {expected_python}")
+    
+    # Module name mapping for imports
+    import_names = {
+        'PyInstaller': 'PyInstaller',
+        'Pillow': 'PIL',
         'pynput': 'pynput',
-        'OpenCV': 'cv2',
-        'NumPy': 'numpy',
+        'opencv-python': 'cv2',
+        'numpy': 'numpy',
         'psutil': 'psutil',
         'PyAutoGUI': 'pyautogui',
-        'MSS': 'mss',
-        'PyGetWindow': 'pygetwindow',
+        'mss': 'mss',
+        'pygetwindow': 'pygetwindow',
     }
     
     missing = []
-    for name, module in dependencies.items():
+    version_mismatch = []
+    
+    for package_name, import_name in import_names.items():
         try:
-            __import__(module)
-            print_success(f"{name} is installed")
+            module = __import__(import_name)
+            
+            # Try to get version
+            version = None
+            if hasattr(module, '__version__'):
+                version = module.__version__
+            elif hasattr(module, 'VERSION'):
+                version = module.VERSION
+            elif hasattr(module, 'version'):
+                if callable(module.version):
+                    version = module.version()
+                else:
+                    version = module.version
+            
+            # For packages without __version__, try pkg_resources or importlib.metadata
+            if not version:
+                try:
+                    import importlib.metadata
+                    version = importlib.metadata.version(package_name)
+                except:
+                    try:
+                        import pkg_resources
+                        version = pkg_resources.get_distribution(package_name).version
+                    except:
+                        version = "unknown"
+            
+            expected_version = required_versions.get(package_name, "any")
+            
+            if version == "unknown":
+                print_warning(f"{package_name} is installed (version: unknown)")
+            elif version == expected_version:
+                print_success(f"{package_name} {version} (matches required)")
+            else:
+                print_error(f"{package_name} {version} (expected {expected_version})")
+                version_mismatch.append(f"{package_name} (current: {version}, expected: {expected_version})")
+                
         except ImportError:
-            print_error(f"{name} is NOT installed")
-            missing.append(name)
+            print_error(f"{package_name} is NOT installed")
+            missing.append(package_name)
+    
+    print()
+    
+    # Report issues
+    if current_python != expected_python:
+        print_error(f"Python version mismatch: {current_python} vs {expected_python}")
+        return False
     
     if missing:
-        print_warning(f"\nMissing dependencies: {', '.join(missing)}")
+        print_error(f"Missing dependencies: {', '.join(missing)}")
         print_info("Install missing packages with: pip install " + " ".join(missing))
         return False
     
-    print_success("\nAll dependencies are installed!")
+    if version_mismatch:
+        print_error(f"Version mismatches found:")
+        for mismatch in version_mismatch:
+            print_error(f"  - {mismatch}")
+        print_info("\nTo install exact versions, run:")
+        print_info("pip install -r requirements.txt")
+        print_info("\nOr install individually:")
+        for package_name in import_names.keys():
+            expected = required_versions.get(package_name)
+            if expected:
+                print_info(f"  pip install {package_name}=={expected}")
+        return False
+    
+    print_success("All dependencies match required versions!")
     return True
 
 
@@ -353,6 +437,102 @@ def run_pyinstaller():
         return False
 
 
+def update_required_versions():
+    """Update the required_versions dict in this file based on currently installed packages."""
+    print_info("Detecting currently installed package versions...")
+    
+    import platform
+    current_python = platform.python_version()
+    
+    # Package names for pip vs import names
+    packages = {
+        'PyInstaller': 'PyInstaller',
+        'Pillow': 'PIL',
+        'pynput': 'pynput',
+        'opencv-python': 'cv2',
+        'numpy': 'numpy',
+        'psutil': 'psutil',
+        'PyAutoGUI': 'pyautogui',
+        'mss': 'mss',
+        'pygetwindow': 'pygetwindow',
+    }
+    
+    detected_versions = {'Python': current_python}
+    
+    for package_name, import_name in packages.items():
+        try:
+            module = __import__(import_name)
+            version = None
+            
+            # Try various version attributes
+            if hasattr(module, '__version__'):
+                version = module.__version__
+            elif hasattr(module, 'VERSION'):
+                version = module.VERSION
+            elif hasattr(module, 'version'):
+                if callable(module.version):
+                    version = module.version()
+                else:
+                    version = module.version
+            
+            # Fallback to importlib.metadata
+            if not version:
+                try:
+                    import importlib.metadata
+                    version = importlib.metadata.version(package_name)
+                except:
+                    try:
+                        import pkg_resources
+                        version = pkg_resources.get_distribution(package_name).version
+                    except:
+                        version = None
+            
+            if version:
+                detected_versions[package_name] = version
+                print_success(f"{package_name}: {version}")
+            else:
+                print_warning(f"{package_name}: installed but version unknown")
+        except ImportError:
+            print_warning(f"{package_name}: not installed")
+    
+    print()
+    print_info("Updating build.py with detected versions...")
+    
+    # Create the new required_versions dict string
+    versions_str = "    required_versions = {\n"
+    for pkg, ver in detected_versions.items():
+        versions_str += f"        '{pkg}': '{ver}',\n"
+    versions_str += "    }"
+    
+    # Read current file
+    build_file = os.path.abspath(__file__)
+    try:
+        with open(build_file, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        # Replace the required_versions dict
+        import re
+        pattern = r'required_versions = \{[^}]+\}'
+        if re.search(pattern, content):
+            new_content = re.sub(pattern, f"required_versions = {{\n" + 
+                                '\n'.join([f"        '{k}': '{v}'," for k, v in detected_versions.items()]) +
+                                "\n    }", content)
+            
+            with open(build_file, 'w', encoding='utf-8') as f:
+                f.write(new_content)
+            
+            print_success("Updated required_versions in build.py")
+            print_info("Run 'python build.py --verify' to verify against new versions")
+            return True
+        else:
+            print_error("Could not find required_versions dict in build.py")
+            return False
+            
+    except Exception as e:
+        print_error(f"Failed to update build.py: {e}")
+        return False
+
+
 def parse_arguments():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -360,11 +540,12 @@ def parse_arguments():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 Examples:
-  python build.py                 # Build with current version
-  python build.py --clean         # Clean and build
-  python build.py --version 1.0.6 # Update to version 1.0.6 and build
-  python build.py --verify        # Verify environment only
-  python build.py --no-build      # Update versions without building
+  python build.py                      # Build with current version
+  python build.py --clean              # Clean and build
+  python build.py --version 1.0.6      # Update to version 1.0.6 and build
+  python build.py --verify             # Verify environment matches required versions
+  python build.py --update-versions    # Update required versions to currently installed
+  python build.py --no-build           # Update versions without building
         '''
     )
     
@@ -375,7 +556,9 @@ Examples:
     parser.add_argument('--no-build', action='store_true',
                         help='Only update version files without building')
     parser.add_argument('--verify', action='store_true',
-                        help='Verify build environment and dependencies')
+                        help='Verify build environment and dependencies match required versions')
+    parser.add_argument('--update-versions', action='store_true',
+                        help='Update required versions in build.py to match currently installed packages')
     
     return parser.parse_args()
 
@@ -388,6 +571,13 @@ def main():
     
     # Parse command line arguments
     args = parse_arguments()
+    
+    # Update required versions if requested
+    if args.update_versions:
+        print()
+        if not update_required_versions():
+            sys.exit(1)
+        sys.exit(0)
     
     # Verify environment if requested
     if args.verify:

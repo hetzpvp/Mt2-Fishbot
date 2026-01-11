@@ -23,7 +23,7 @@ except ImportError:
 from utils import get_resource_path, MAX_WINDOWS, DEBUG_MODE_EN, DEBUG_PRINTS
 from window_manager import WindowManager
 from fishing_bot import FishingBot
-from debug_windows import IgnoredPositionsWindow, FishDetectorDebugWindow, StatusLogWindow
+from debug_windows import IgnoredPositionsWindow, FishDetectorDebugWindow, StatusLogWindow, Aelys2DebugWindow
 
 
 class FishSelectionWindow:
@@ -413,7 +413,7 @@ class BotGUI:
     
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title(f"Fishing Puzzle Player v{self.BOT_VERSION}")
+        self.root.title(f"Fishing Puzzle Player v{self.BOT_VERSION} - Aelys2 Only")
         
         # Calculate window height based on DPI scaling
         base_height = 430
@@ -451,6 +451,7 @@ class BotGUI:
         self.window_stats: Dict[int, dict] = {}  # bot_id -> {hits, games, bait}
         self.ignored_positions_windows: Dict[int, IgnoredPositionsWindow] = {}  # bot_id -> IgnoredPositionsWindow
         self.fish_detector_debug_windows: Dict[int, FishDetectorDebugWindow] = {}  # bot_id -> FishDetectorDebugWindow
+        self.aelys2_debug_windows: Dict[int, Aelys2DebugWindow] = {}  # bot_id -> Aelys2DebugWindow
         
         # Global keyboard listener for F5 pause
         self.global_key_listener = None
@@ -561,6 +562,12 @@ class BotGUI:
                                 font=("Courier New", 10), 
                                 bg="#000000", fg=BotGUI.ACCENT_COLOR)
         discord_label.pack(anchor=tk.CENTER)
+        
+        # Aelys2 Only notice
+        aelys2_label = tk.Label(title_container, text="⚠ This version can only be used in Aelys2 ⚠", 
+                               font=("Courier New", 9, "bold"), 
+                               bg="#000000", fg="#ff0000")
+        aelys2_label.pack(anchor=tk.CENTER, pady=(2, 0))
         
         # Right GIF (only if loaded)
         if self.photo_images:
@@ -804,13 +811,15 @@ class BotGUI:
         # Classic Fishing checkbox (no minigame) - FIRST option
         self.classic_fishing_var = tk.BooleanVar(value=self.config.get('classic_fishing', False))
         self.classic_fishing_check = tk.Checkbutton(left_options_frame, 
-                                              text="Classic Fishing",
+                                              text="Classic Fishing (Disabled)",
                                               variable=self.classic_fishing_var,
                                               command=self.toggle_classic_fishing,
                                               bg="#2a2a2a", fg="#ffffff",
                                               selectcolor="#1a1a1a",
                                               activebackground="#2a2a2a",
-                                              font=("Courier New", 9))
+                                              disabledforeground="#666666",
+                                              font=("Courier New", 9),
+                                              state=tk.DISABLED)
         self.classic_fishing_check.pack(anchor=tk.W, pady=1)
         
         # Delay input for classic fishing (below checkbox)
@@ -2283,6 +2292,7 @@ class BotGUI:
             if DEBUG_MODE_EN:
                 self.ignored_positions_windows[bot_id] = IgnoredPositionsWindow(self.root, bot)
                 self.fish_detector_debug_windows[bot_id] = FishDetectorDebugWindow(self.root, bot)
+                self.aelys2_debug_windows[bot_id] = Aelys2DebugWindow(self.root, bot)
             
             # Start bot thread
             thread = threading.Thread(target=bot.start, daemon=True)
@@ -2428,6 +2438,11 @@ class BotGUI:
             self.fish_detector_debug_windows[bot_id].destroy()
             del self.fish_detector_debug_windows[bot_id]
         
+        # Destroy Aelys2 debug window
+        if bot_id in self.aelys2_debug_windows:
+            self.aelys2_debug_windows[bot_id].destroy()
+            del self.aelys2_debug_windows[bot_id]
+        
         # Remove from active bots
         if bot_id in self.bots:
             del self.bots[bot_id]
@@ -2482,6 +2497,13 @@ class BotGUI:
         
         # Destroy all fish detector debug windows
         for window in self.fish_detector_debug_windows.values():
+            try:
+                window.destroy()
+            except:
+                pass
+        
+        # Destroy all Aelys2 debug windows
+        for window in self.aelys2_debug_windows.values():
             try:
                 window.destroy()
             except:
