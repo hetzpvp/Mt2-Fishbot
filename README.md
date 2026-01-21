@@ -1,5 +1,6 @@
 # MT2 Fishing Bot
 THIS PROJECT WAS BUILT FOR EDUCATIONAL AND LEARNING PURPOSES ONLY!
+
 Free fishing minigame bot for Metin2. No subscriptions, no licenses.
 
 **Author:** boristei | **Discord:** boristei
