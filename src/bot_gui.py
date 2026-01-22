@@ -408,7 +408,7 @@ class FishSelectionWindow:
 class BotGUI:
     """GUI for the fishing bot - supports up to 8 simultaneous windows"""
     
-    BOT_VERSION = "1.0.5"  # Version for config validation and GUI display
+    BOT_VERSION = "1.0.5.1"  # Version for config validation and GUI display
     ACCENT_COLOR = "#FFBB00"  # Gold color used throughout the GUI
     
     def __init__(self):

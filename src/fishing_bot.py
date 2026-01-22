@@ -437,7 +437,7 @@ class FishingBot:
             with input_lock:
                 self.window_manager.activate_window(force_activate=True)
             # Small delay for item to appear in inventory
-            time.sleep(0.2)
+            time.sleep(0.4)
             
             # Capture inventory area
             inventory_frame = self.capture_inventory_area()
