@@ -90,7 +90,7 @@ Free fishing minigame bot for Metin2. No subscriptions, no licenses.
 
 ## TODO
 
-- [ ] Fish skipping based on chat message (skip minigame)
+- [ ] Fish skipping based on chat message (skip minigame).
 
 ---
 
