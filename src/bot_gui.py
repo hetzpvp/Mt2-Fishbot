@@ -347,23 +347,27 @@ class FishSelectionWindow:
                                  "Items: Keep or Drop")
             return
         
-        # Check if any item is set to 'drop' and drop positions are not configured
+        # Check if any item is set to 'drop' and confirm position is not configured
         items_to_drop = [name for name, action in self.current_actions.items() if action == 'drop']
         if items_to_drop:
             drop_pos = self.config.get('drop_button_pos')
             confirm_pos = self.config.get('confirm_button_pos')
             
-            # Only show warning if positions are not yet configured
-            if not drop_pos or not confirm_pos:
-                messagebox.showinfo("WARNING: Please configure button positions!", 
-                                   "The fishbot needs to know where to click in order to to drop/sell/destroy items.\n\n"
-                                   "Please configure the drop/sell/destroy and the confirm button positions in the\n"
+            # Only show warning if confirm position is not configured (drop position is optional)
+            if not confirm_pos:
+                messagebox.showinfo("WARNING: Please configure confirm button position!", 
+                                   "The fishbot needs to know where to click the confirm button to finalize dropping items.\n\n"
+                                   "Please configure the confirm button position in the\n"
                                    "'Automatic Fish Handling' section before starting the bot.\n\n"
                                    "STEPS TO CONFIGURE:\n"
+                                   "If your game has a drop/sell/destroy menu:\n"
                                    "1. Drop an item to the floor and don't press anything (only to open the drop/destroy/sell window)\n"
                                    "2. Click 'Set Drop/Sell/Destroy Button Coords' and click on the drop/sell/destroy button in the game\n"
-                                   "3. Click 'Set Confirm Button Coords' and click on the confirm button to finalize dropping the item in game\n"
-                                   "4. Done! You can now start the bot safely.")
+                                   "3. Click 'Set Confirm Button Coords' and click on the confirm button to finalize dropping the item in game\n\n"
+                                   "If your game drops items automatically (no menu):\n"
+                                   "1. Drop an item to the floor and don't press anything (only to open the drop confirmation window)\n"
+                                   "2. Click 'Set Confirm Button Coords' and click on the final confirm/accept button\n\n"
+                                   "Note: Drop button position is optional. Leave unset if your game auto-drops items.")
         
         # Call the callback with the actions
         if self.on_save_callback:
@@ -1104,10 +1108,10 @@ class BotGUI:
         
         # Drop button position label
         drop_pos = self.config.get('drop_button_pos')
-        drop_pos_text = f"({drop_pos[0]},{drop_pos[1]})" if drop_pos else "Not set"
+        drop_pos_text = f"({drop_pos[0]},{drop_pos[1]})" if drop_pos else "Optional"
         self.drop_btn_pos_label = tk.Label(drop_config_row, text=drop_pos_text,
                                           bg="#2a2a2a", 
-                                          fg="#ffffff" if drop_pos else "#e74c3c",
+                                          fg="#ffffff" if drop_pos else "#888888",
                                           font=("Courier New", 9),
                                           width=10, anchor=tk.W)
         self.drop_btn_pos_label.pack(side=tk.LEFT)
@@ -1593,14 +1597,18 @@ class BotGUI:
     def show_drop_config_guide(self):
         """Shows the drop configuration guide message."""
         messagebox.showinfo("Drop Configuration Guide", 
-                           "The fishbot needs to know where to click in order to drop/sell/destroy items.\n\n"
-                           "Please configure the drop/sell/destroy and the confirm button positions in the\n"
-                           "'Automatic Fish Handling' section before starting the bot.\n\n"
-                           "STEPS TO CONFIGURE:\n"
-                           "1. Drop an item to the floor and don't press anything (only to open the drop/destroy/sell window)\n"
-                           "2. Click 'Set Drop/Sell/Destroy Button Coords' and click on the drop/sell/destroy button in the game\n"
-                           "3. Click 'Set Confirm Button Coords' and click on the confirm button to finalize dropping the item in game\n"
-                           "4. Done! You can now start the bot safely.")
+                                       "The fishbot needs to know where to click the confirm button to finalize dropping items.\n\n"
+                                       "Please configure the confirm button position in the\n"
+                                       "'Automatic Fish Handling' section before starting the bot.\n\n"
+                                       "STEPS TO CONFIGURE:\n"
+                                       "If your game has a drop/sell/destroy menu:\n"
+                                       "1. Drop an item to the floor and don't press anything (only to open the drop/destroy/sell window)\n"
+                                       "2. Click 'Set Drop/Sell/Destroy Button Coords' and click on the drop/sell/destroy button in the game\n"
+                                       "3. Click 'Set Confirm Button Coords' and click on the confirm button to finalize dropping the item in game\n\n"
+                                       "If your game drops items automatically (no menu):\n"
+                                       "1. Drop an item to the floor and don't press anything (only to open the drop confirmation window)\n"
+                                       "2. Click 'Set Confirm Button Coords' and click on the final confirm/accept button\n\n"
+                                       "Note: Drop button position is optional. Leave unset if your game auto-drops items.")
     
     def show_quick_skip_guide(self):
         """Shows the quick skip guide message based on selected mode."""
@@ -2170,33 +2178,29 @@ class BotGUI:
                                "before starting the bot.")
             return
         
-        # Check if drop positions are configured when any item is set to 'drop'
+        # Check if confirm position is configured when any item is set to 'drop' (drop position is optional)
         if self.config.get('auto_fish_handling', False):
             fish_actions = self.config.get('fish_actions', {})
             items_to_drop = [name for name, action in fish_actions.items() if action == 'drop']
             
             if items_to_drop:
-                drop_pos = self.config.get('drop_button_pos')
                 confirm_pos = self.config.get('confirm_button_pos')
                 
-                missing_positions = []
-                if not drop_pos:
-                    missing_positions.append("Drop Button")
+                # Only confirm position is required, drop position is optional
                 if not confirm_pos:
-                    missing_positions.append("Confirm Button")
-                
-                if missing_positions:
-                    messagebox.showerror("Configure button positions!", 
-                                       "The fishbot needs to know where to click in order to to drop/sell/destroy items.\n\n"
-                                       f"The following buttons is still not configured:\n\n"
-                                       f"• {chr(10).join(missing_positions)}\n\n"
-                                       "Please configure the drop/sell/destroy and the confirm button positions in the\n"
+                    messagebox.showerror("Configure confirm button position!", 
+                                       "The fishbot needs to know where to click the confirm button to finalize dropping items.\n\n"
+                                       "Please configure the confirm button position in the\n"
                                        "'Automatic Fish Handling' section before starting the bot.\n\n"
                                        "STEPS TO CONFIGURE:\n"
+                                       "If your game has a drop/sell/destroy menu:\n"
                                        "1. Drop an item to the floor and don't press anything (only to open the drop/destroy/sell window)\n"
                                        "2. Click 'Set Drop/Sell/Destroy Button Coords' and click on the drop/sell/destroy button in the game\n"
-                                       "3. Click 'Set Confirm Button Coords' and click on the confirm button to finalize dropping the item in game\n"
-                                       "4. Done! You can now start the bot safely.")
+                                       "3. Click 'Set Confirm Button Coords' and click on the confirm button to finalize dropping the item in game\n\n"
+                                       "If your game drops items automatically (no menu):\n"
+                                       "1. Drop an item to the floor and don't press anything (only to open the drop confirmation window)\n"
+                                       "2. Click 'Set Confirm Button Coords' and click on the final confirm/accept button\n\n"
+                                       "Note: Drop button position is optional. Leave unset if your game auto-drops items.")
                     return
         
         # Check if armor slot position is configured when quick skip is enabled with armor mode

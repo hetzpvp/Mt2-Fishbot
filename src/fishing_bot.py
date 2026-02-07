@@ -488,9 +488,10 @@ class FishingBot:
                     drop_pos = self.config.get('drop_button_pos')
                     confirm_pos = self.config.get('confirm_button_pos')
                     
-                    if not drop_pos or not confirm_pos:
+                    # confirm_pos is required, drop_pos is optional
+                    if not confirm_pos:
                         if self.on_status_update:
-                            self.on_status_update(f"[W{self.bot_id+1}] Drop positions not configured! Keeping: {filename}")
+                            self.on_status_update(f"[W{self.bot_id+1}] Confirm button position not configured! Keeping: {filename}")
                         self._ignored_positions.add((inv_x, inv_y))
                         return
                     
@@ -560,13 +561,14 @@ class FishingBot:
                         pyautogui.click(_pause=False)
                         time.sleep(np.random.uniform(0.1, 0.15))
                         
-                        # Step 4: Click the drop button (relative to window)
-                        drop_screen_x = win_left + drop_pos[0]
-                        drop_screen_y = win_top + drop_pos[1]
-                        pyautogui.moveTo(drop_screen_x, drop_screen_y, _pause=False)
-                        time.sleep(np.random.uniform(0.05, 0.07))
-                        pyautogui.click(_pause=False)
-                        time.sleep(np.random.uniform(0.1, 0.15))
+                        # Step 4: Click the drop button (relative to window) - only if drop_pos is configured
+                        if drop_pos:
+                            drop_screen_x = win_left + drop_pos[0]
+                            drop_screen_y = win_top + drop_pos[1]
+                            pyautogui.moveTo(drop_screen_x, drop_screen_y, _pause=False)
+                            time.sleep(np.random.uniform(0.05, 0.07))
+                            pyautogui.click(_pause=False)
+                            time.sleep(np.random.uniform(0.1, 0.15))
                         
                         # Step 5: Click the confirm button (relative to window)
                         confirm_screen_x = win_left + confirm_pos[0]
@@ -816,6 +818,15 @@ class FishingBot:
                 if self.on_status_update:
                     self.on_status_update(f"[W{self.bot_id+1}] Error pressing CTRL+{key}: {e}")
     
+    def bait_and_cast(self):
+        """Selects bait and casts fishing line."""
+        bait_key = self.get_bait_key(self.bait_counter)
+        self.press_key(bait_key, f"Pressed key {bait_key}")
+        time.sleep(0.05)
+        
+        self.press_key('space', "Cast fishing line")
+        time.sleep(0.05)
+    
     def quickskip(self):
         """Performs quick skip - uses different method based on mode (horse or armour)."""
         # Get quick skip mode from config (default to 'horse' if not set)
@@ -888,7 +899,7 @@ class FishingBot:
                 if self.on_status_update:
                     self.on_status_update(f"[W{self.bot_id+1}] Error pressing key '{key}': {e}")
     
-    def wait_for_minigame_window(self, timeout: float = 4.0) -> bool:
+    def wait_for_minigame_window(self, timeout: float = 6.0) -> bool:
         """Waits for and finds the fishing minigame window. Auto-calibrates region on first detection.
         Returns True if minigame detected, False otherwise."""
         start_time = time.time()
@@ -1146,16 +1157,11 @@ class FishingBot:
                 continue
             
             try:
-                bait_key = self.get_bait_key(self.bait_counter)
-                self.press_key(bait_key, f"Pressed key {bait_key}")
-                time.sleep(0.05)
-                
-                self.press_key('space', "Cast fishing line")
-                time.sleep(0.05)
+                self.bait_and_cast()
                 
                 # Only play minigame if Classic Fishing system is NOT enabled
                 if not self.config.get('classic_fishing', False):
-                    minigame_detected = self.wait_for_minigame_window(timeout=4)
+                    minigame_detected = self.wait_for_minigame_window(timeout=6)
                     if not minigame_detected:
                         self.consecutive_failures += 1
                         if self.on_status_update:
@@ -1171,13 +1177,14 @@ class FishingBot:
                                     self.on_bot_stop(self.bot_id)
                                 break
                         
-                        # Press CTRL+G once per failure to dismount horse if that's the issue
-                        # First failure: try to dismount if on horse
-                        # Second failure: you actually mounted in first attemp and now you need to unmount
-                        if self.on_status_update:
-                            self.on_status_update(f"[W{self.bot_id+1}] Pressing CTRL+G to dismount horse...")
-                        self.press_ctrl_key('g')
-                        time.sleep(0.15)
+                        #   Fail safe mechanism for cases where bot might be mounted on horse and missing minigame window - try to dismount before next attempt
+                        # # Press CTRL+G once per failure to dismount horse if that's the issue
+                        # # First failure: try to dismount if on horse
+                        # # Second failure: you actually mounted in first attemp and now you need to unmount
+                        # if self.on_status_update:
+                        #     self.on_status_update(f"[W{self.bot_id+1}] Pressing CTRL+G to dismount horse...")
+                        # self.press_ctrl_key('g')
+                        # time.sleep(0.15)
                         continue
                     
                     # Reset failure counter on successful minigame detection
