@@ -36,7 +36,7 @@ Free fishing minigame bot for Metin2. No subscriptions, no licenses.
 - Auto fish handling (keep/drop/open)
 - Quick skip with horse (CTRL+G) or armor slot
 - Configurable classic fishing delay
-- F5 pause/resume
+- F5 pause/resume.
 
 ---
 
