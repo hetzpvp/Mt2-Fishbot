@@ -29,7 +29,7 @@ Free fishing minigame bot for Metin2. No subscriptions, no licenses.
 
 ## Features
 
-- Multi-window support (up to 8 clients, depends on hardware)
+- Multi-window support (up to 8 clients, depends on hardware).
 - Visual processing only (undetectable)
 - Works on any server with the new or classic fishing system
 - Configurable bait keys (1-4, F1-F4)
