@@ -65,6 +65,12 @@ class FishingBot:
         'Black_Dye_item.jpg',
         'Bleach_item.jpg',
     }
+
+    _bait_fish= {
+        'Vai_living.jpg',
+        'Shrimp_living.jpg'
+    }
+
     _color_template_cache = None  # Cache for colored versions of confusable fish
     
     def __init__(self, region: GameRegion, config: dict, window_manager: WindowManager, 
@@ -86,7 +92,8 @@ class FishingBot:
         self.region_auto_calibrated = False
         self.consecutive_failures = 0
         self.bot_id = bot_id
-        
+        self.opened_bait_fish = False
+
         # Cached circle values for performance
         self._circle_center = None
         self._circle_radius_sq = 67 * 67
@@ -431,8 +438,11 @@ class FishingBot:
         fish_actions = self.config.get('fish_actions', {})
         if not fish_actions:
             return
-        
-        try: 
+
+        # Reset this flag on every handler run
+        self.opened_bait_fish = False
+
+        try:
             # Activate our window first
             with input_lock:
                 self.window_manager.activate_window(force_activate=True)
@@ -477,7 +487,10 @@ class FishingBot:
                     time.sleep(0.05)
                     pyautogui.click(button='right', _pause=False)
                     time.sleep(0.1)  # Wait for game to process
-                    
+
+                    if filename in self._bait_fish :
+                        self.opened_bait_fish = True
+
                     # Move cursor to center of the window (safe position)
                     win_center_x = win_left + win_width // 2
                     win_center_y = win_top + 400  # Upper-middle area of window
@@ -817,16 +830,19 @@ class FishingBot:
             except Exception as e:
                 if self.on_status_update:
                     self.on_status_update(f"[W{self.bot_id+1}] Error pressing CTRL+{key}: {e}")
-    
-    def bait_and_cast(self):
-        """Selects bait and casts fishing line."""
+
+    def select_bait(self):
+        """Selects the bait."""
         bait_key = self.get_bait_key(self.bait_counter)
         self.press_key(bait_key, f"Pressed key {bait_key}")
         time.sleep(0.05)
-        
+
+
+    def cast_line(self):
+        """Casts the fishing line."""
         self.press_key('space', "Cast fishing line")
         time.sleep(0.05)
-    
+        
     def quickskip(self):
         """Performs quick skip - uses different method based on mode (horse or armour)."""
         # Get quick skip mode from config (default to 'horse' if not set)
@@ -1157,8 +1173,13 @@ class FishingBot:
                 continue
             
             try:
-                self.bait_and_cast()
-                
+                if not self.opened_bait_fish:
+                    self.select_bait()
+                else :
+                    self.opened_bait_fish = False
+
+                self.cast_line()
+
                 # Only play minigame if Classic Fishing system is NOT enabled
                 if not self.config.get('classic_fishing', False):
                     minigame_detected = self.wait_for_minigame_window(timeout=6)
