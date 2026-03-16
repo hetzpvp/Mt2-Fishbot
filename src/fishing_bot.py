@@ -1177,6 +1177,7 @@ class FishingBot:
                     self.select_bait()
                 else :
                     self.opened_bait_fish = False
+                    time.sleep(np.random.uniform(0.05, 0.2))
 
                 self.cast_line()
 
