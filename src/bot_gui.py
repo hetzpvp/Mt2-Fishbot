@@ -20,10 +20,10 @@ try:
 except ImportError:
     keyboard = None
 
-from utils import get_resource_path, MAX_WINDOWS, DEBUG_MODE_EN, DEBUG_PRINTS
+from utils import get_resource_path, MAX_WINDOWS, DEBUG_MODE_EN, DEBUG_PRINTS, load_window_icon
 from window_manager import WindowManager
 from fishing_bot import FishingBot
-from debug_windows import IgnoredPositionsWindow, FishDetectorDebugWindow, StatusLogWindow
+from debug_ui import IgnoredPositionsWindow, FishDetectorDebugWindow, StatusLogWindow
 
 
 class FishSelectionWindow:
@@ -69,15 +69,8 @@ class FishSelectionWindow:
         self.window.configure(bg="#1a1a1a")
         self.window.resizable(False, False)  # Allow vertical resize for DPI scaling
         
-        # Try to load and set window icon
-        icon_path = get_resource_path("monkey.ico")
-        if os.path.exists(icon_path):
-            try:
-                self.window.iconbitmap(icon_path)
-            except Exception as e:
-                if DEBUG_PRINTS:
-                    print(f"Error loading icon: {e}")
-        
+        load_window_icon(self.window)
+
         # Make window modal
         self.window.transient(parent)
         self.window.grab_set()
@@ -409,10 +402,201 @@ class FishSelectionWindow:
             pass
 
 
+class TimingSettingsWindow:
+    """Window for configuring bot input timing parameters (sliders in ms)."""
+
+    # Default values in seconds — single source of truth
+    DEFAULTS = {
+        # OS-input settle values — leave these alone unless debugging click issues
+        'timing_cursor_settle': 0.012,
+        'timing_button_hold':   0.008,
+        'timing_post_click':    0.035,
+        'timing_human_min':     0.150,
+        'timing_human_max':     0.400,
+        'timing_key_hold':      0.025,
+        'timing_key_settle':    0.030,
+        'timing_cast_interkey': 0.050,
+        # Game-response waits — safe to tune for your server/PC speed
+        'timing_catch_wait':        0.400,
+        'timing_open_wait':         0.100,
+        'timing_dead_fish_check':   0.100,
+        'timing_drop_settle':       0.120,
+        'timing_quickskip_between': 0.100,
+        'timing_quickskip_after':   0.100,
+    }
+
+    def __init__(self, parent, config: dict, on_save_callback, accent_color: str = "#FFBB00"):
+        self.parent = parent
+        self.config = config
+        self.on_save_callback = on_save_callback
+        self.accent_color = accent_color
+        self._vars: dict = {}        # key -> tk.IntVar (milliseconds)
+        self._val_labels: dict = {}  # key -> tk.Label (value display)
+
+        self.window = tk.Toplevel(parent)
+        self.window.title("Timing Settings")
+
+        try:
+            dpi = ctypes.windll.shcore.GetScaleFactorForDevice(0) / 100.0
+            w = int(430 * max(1.0, dpi * 0.9))
+            h = int(720 * max(1.0, dpi * 0.88))
+        except Exception:
+            w, h = 430, 720
+
+        self.window.geometry(f"{w}x{h}")
+        self.window.configure(bg="#1a1a1a")
+        self.window.resizable(False, False)
+
+        load_window_icon(self.window)
+        self.window.transient(parent)
+        self.window.grab_set()
+
+        self._setup_ui()
+
+    def _add_row(self, parent, label_text: str, key: str, min_ms: int, max_ms: int):
+        """Creates one labelled slider row inside a LabelFrame section."""
+        default_ms = int(round(self.DEFAULTS[key] * 1000))
+        current_ms = int(round(self.config.get(key, self.DEFAULTS[key]) * 1000))
+        current_ms = max(min_ms, min(max_ms, current_ms))
+
+        var = tk.IntVar(value=current_ms)
+        self._vars[key] = var
+
+        row = tk.Frame(parent, bg="#2a2a2a")
+        row.pack(fill=tk.X, padx=4, pady=2)
+
+        tk.Label(row, text=label_text,
+                 font=("Courier New", 8), bg="#2a2a2a", fg="#cccccc",
+                 width=27, anchor=tk.W).pack(side=tk.LEFT)
+
+        val_lbl = tk.Label(row, text=f"{current_ms}ms",
+                           font=("Courier New", 8, "bold"),
+                           bg="#2a2a2a", fg=self.accent_color,
+                           width=6, anchor=tk.E)
+        val_lbl.pack(side=tk.RIGHT)
+        self._val_labels[key] = val_lbl
+
+        def _on_scale(v, vl=val_lbl):
+            vl.config(text=f"{int(float(v))}ms")
+
+        tk.Scale(row, variable=var, from_=min_ms, to=max_ms,
+                 orient=tk.HORIZONTAL, resolution=1, showvalue=False,
+                 bg="#2a2a2a", fg=self.accent_color,
+                 highlightthickness=0, troughcolor="#444444",
+                 activebackground=self.accent_color,
+                 command=_on_scale).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=3)
+
+    def _setup_ui(self):
+        tk.Label(self.window,
+                 text="Only timings that directly produce OS inputs are exposed here.",
+                 font=("Courier New", 8), bg="#1a1a1a", fg="#777777").pack(pady=(6, 3))
+
+        body = tk.Frame(self.window, bg="#1a1a1a")
+        body.pack(fill=tk.BOTH, expand=True, padx=5)
+
+        # --- Fish Clicking ---
+        f1 = tk.LabelFrame(body, text="Fish Clicking",
+                           font=("Courier New", 9, "bold"),
+                           bg="#2a2a2a", fg=self.accent_color, padx=4, pady=3)
+        f1.pack(fill=tk.X, pady=(0, 4))
+        self._add_row(f1, "Cursor settle before click",  'timing_cursor_settle', 3, 50)
+        self._add_row(f1, "Mouse button hold",           'timing_button_hold',   3, 50)
+        self._add_row(f1, "Post-click settle",           'timing_post_click',    10, 100)
+
+        # --- Click Rhythm ---
+        f2 = tk.LabelFrame(body, text="Click Rhythm  (Human-like mode)",
+                           font=("Courier New", 9, "bold"),
+                           bg="#2a2a2a", fg=self.accent_color, padx=4, pady=3)
+        f2.pack(fill=tk.X, pady=(0, 4))
+        self._add_row(f2, "Min delay between attempts",  'timing_human_min',  50, 800)
+        self._add_row(f2, "Max delay between attempts",  'timing_human_max', 100, 1200)
+
+        # --- Key Presses ---
+        f3 = tk.LabelFrame(body, text="Key Presses",
+                           font=("Courier New", 9, "bold"),
+                           bg="#2a2a2a", fg=self.accent_color, padx=4, pady=3)
+        f3.pack(fill=tk.X, pady=(0, 4))
+        self._add_row(f3, "Key hold duration",           'timing_key_hold',    10, 100)
+        self._add_row(f3, "Pre-key window settle",       'timing_key_settle',  10,  60)
+
+        # --- Bait & Cast ---
+        f4 = tk.LabelFrame(body, text="Bait & Cast",
+                           font=("Courier New", 9, "bold"),
+                           bg="#2a2a2a", fg=self.accent_color, padx=4, pady=3)
+        f4.pack(fill=tk.X, pady=(0, 4))
+        self._add_row(f4, "Bait key → Cast key delay", 'timing_cast_interkey', 20, 200)
+
+        # --- Item Handling ---
+        f5 = tk.LabelFrame(body, text="Item Handling  (game-response waits)",
+                           font=("Courier New", 9, "bold"),
+                           bg="#2a2a2a", fg=self.accent_color, padx=4, pady=3)
+        f5.pack(fill=tk.X, pady=(0, 4))
+        self._add_row(f5, "Wait for item after catch",    'timing_catch_wait',      100, 1500)
+        self._add_row(f5, "Wait after right-click (open)","timing_open_wait",        50,  500)
+        self._add_row(f5, "Dead-fish re-check delay",     'timing_dead_fish_check',  50,  500)
+
+        # --- Drop Action ---
+        f6 = tk.LabelFrame(body, text="Drop Action",
+                           font=("Courier New", 9, "bold"),
+                           bg="#2a2a2a", fg=self.accent_color, padx=4, pady=3)
+        f6.pack(fill=tk.X, pady=(0, 4))
+        self._add_row(f6, "Pause between drop steps",    'timing_drop_settle',       50,  600)
+
+        # --- Quick Skip ---
+        f7 = tk.LabelFrame(body, text="Quick Skip",
+                           font=("Courier New", 9, "bold"),
+                           bg="#2a2a2a", fg=self.accent_color, padx=4, pady=3)
+        f7.pack(fill=tk.X, pady=(0, 4))
+        self._add_row(f7, "Gap between CTRL+G presses",  'timing_quickskip_between', 50,  600)
+        self._add_row(f7, "Settle after quick skip",     'timing_quickskip_after',   50,  400)
+
+        # --- Buttons ---
+        btn_frame = tk.Frame(self.window, bg="#1a1a1a")
+        btn_frame.pack(fill=tk.X, padx=5, pady=8)
+
+        tk.Button(btn_frame, text="Reset Defaults",
+                  command=self._reset_defaults,
+                  bg="#555555", fg=self.accent_color,
+                  font=("Courier New", 8), cursor="hand2",
+                  padx=8, pady=6).pack(side=tk.LEFT, padx=3)
+
+        tk.Button(btn_frame, text="Cancel",
+                  command=self.window.destroy,
+                  bg="#555555", fg=self.accent_color,
+                  font=("Courier New", 9, "bold"), cursor="hand2",
+                  padx=10, pady=6).pack(side=tk.RIGHT, padx=3)
+
+        tk.Button(btn_frame, text="Save",
+                  command=self._save_and_close,
+                  bg="#555555", fg=self.accent_color,
+                  font=("Courier New", 9, "bold"), cursor="hand2",
+                  padx=10, pady=6).pack(side=tk.RIGHT, padx=3)
+
+    def _reset_defaults(self):
+        for key, var in self._vars.items():
+            ms = int(round(self.DEFAULTS[key] * 1000))
+            var.set(ms)
+            if key in self._val_labels:
+                self._val_labels[key].config(text=f"{ms}ms")
+
+    def _save_and_close(self):
+        h_min = self._vars['timing_human_min'].get()
+        h_max = self._vars['timing_human_max'].get()
+        if h_min >= h_max:
+            messagebox.showwarning("Invalid Timing",
+                                   "Human-like max delay must be greater than min delay.")
+            return
+        for key, var in self._vars.items():
+            self.config[key] = var.get() / 1000.0  # ms → seconds
+        if self.on_save_callback:
+            self.on_save_callback()
+        self.window.destroy()
+
+
 class BotGUI:
     """GUI for the fishing bot - supports up to 8 simultaneous windows"""
     
-    BOT_VERSION = "1.0.5.1"  # Version for config validation and GUI display
+    BOT_VERSION = "1.1"  # Version for config validation and GUI display
     ACCENT_COLOR = "#FFBB00"  # Gold color used throughout the GUI
     
     def __init__(self):
@@ -420,8 +604,8 @@ class BotGUI:
         self.root.title(f"Fishing Puzzle Player v{self.BOT_VERSION}")
         
         # Calculate window height based on DPI scaling
-        base_height = 430
-        base_width = 660
+        base_height = 485
+        base_width = 720
         try:
             dpi_scale = ctypes.windll.shcore.GetScaleFactorForDevice(0) / 100.0
             # Increase height proportionally for high DPI (add extra space)
@@ -432,7 +616,7 @@ class BotGUI:
             window_width = base_width
         
         self.root.geometry(f"{window_width}x{window_height}")
-        self.root.resizable(False, False)  # Allow vertical resize for DPI scaling
+        self.root.resizable(True, True)  # Allow vertical resize for DPI scaling
         self.root.minsize(660, 430)
         self.root.configure(bg="#000000")
         
@@ -485,8 +669,18 @@ class BotGUI:
             'drop_button_pos': None,  # (x, y) relative to window - drop/sell button
             'confirm_button_pos': None,  # (x, y) relative to window - confirm button
             'armor_slot_pos': None,  # (x, y) relative to window - armor slot for quick skip
+            'inv_page_1_pos': None,  # (x, y) relative to window - inventory page 1 tab (mandatory)
+            'inv_page_2_pos': None,  # (x, y) relative to window - inventory page 2 tab (mandatory)
+            'inv_page_3_pos': None,  # (x, y) relative to window - inventory page 3 tab (mandatory)
+            'inv_page_4_pos': None,  # (x, y) relative to window - inventory page 4 tab (mandatory)
+            'inv_page_5_pos': None,  # (x, y) relative to window - inventory page 5 tab (optional)
+            'inv_page_6_pos': None,  # (x, y) relative to window - inventory page 6 tab (optional)
+            'inv_page_7_pos': None,  # (x, y) relative to window - inventory page 7 tab (optional)
+            'inv_page_8_pos': None,  # (x, y) relative to window - inventory page 8 tab (optional)
             'accent_color': "#FFBB00",  # Selected accent color
             'rgb_wave_active': False,  # RGB wave effect state
+            # Input timing settings (seconds) — configured via TimingSettingsWindow
+            **TimingSettingsWindow.DEFAULTS,
         }
         
         # Bait counter
@@ -858,13 +1052,16 @@ class BotGUI:
                                           disabledforeground="#666666",
                                           font=("Courier New", 9))
         self.sound_alert_check.pack(anchor=tk.W, pady=1)
-        
-        # MIDDLE SECTION: Bait Keys Selection
-        bait_keys_frame = tk.LabelFrame(config_content, text="Bait Keys (200 bait each)", 
+
+        # MIDDLE SECTION: Bait Keys + Timing Settings (vertical stack, same column)
+        bait_timing_col = tk.Frame(config_content, bg="#2a2a2a")
+        bait_timing_col.pack(side=tk.LEFT, anchor=tk.N, padx=(10, 0))
+
+        bait_keys_frame = tk.LabelFrame(bait_timing_col, text="Bait Keys (200 bait each)",
                                         font=("Courier New", 9),
                                         bg="#2a2a2a", fg=BotGUI.ACCENT_COLOR,
                                         padx=3, pady=3)
-        bait_keys_frame.pack(side=tk.LEFT, anchor=tk.N, padx=(10, 0))
+        bait_keys_frame.pack(fill=tk.X)
         
         # Get saved bait keys or default to ['1', '2', '3', '4']
         saved_bait_keys = self.config.get('bait_keys', ['1', '2', '3', '4'])
@@ -915,6 +1112,17 @@ class BotGUI:
             cb.pack(side=tk.LEFT, padx=(2, 11),pady=0)
             self.bait_key_checkboxes[key] = cb
         
+        # Timing settings button — outside and below bait_keys_frame, same column
+        self.timing_btn = tk.Button(bait_timing_col,
+                                    text="⏱ Timing Settings...",
+                                    command=self.open_timing_settings,
+                                    font=("Courier New", 8),
+                                    bg="#666666", fg=BotGUI.ACCENT_COLOR,
+                                    activebackground="#777777",
+                                    cursor="hand2",
+                                    padx=5, pady=1)
+        self.timing_btn.pack(anchor=tk.W, pady=(3, 0))
+
         # Now that bait_key_vars exists, update capacity for the first time
         self.update_bait_capacity()
         
@@ -1019,7 +1227,63 @@ class BotGUI:
         
         # Initialize mode checkboxes state based on quick_skip enabled/disabled
         self.toggle_quick_skip_modes()
-        
+
+        # Inventory Page Tab Coords Section
+        # Always enabled — needed for page switching in both auto and manual modes
+        # Pages 1-4 are mandatory (bot won't start without them), 5-8 are optional
+        inv_page_frame = tk.LabelFrame(config_frame, text="Inventory Page Tab Coords",
+                                       font=("Courier New", 9),
+                                       bg="#2a2a2a", fg=BotGUI.ACCENT_COLOR,
+                                       padx=4, pady=2)
+        inv_page_frame.pack(fill=tk.X, pady=(0, 2))
+
+        # Top row: button grid on the left, help button on the right
+        inv_page_top = tk.Frame(inv_page_frame, bg="#2a2a2a")
+        inv_page_top.pack(fill=tk.X)
+
+        inv_page_grid = tk.Frame(inv_page_top, bg="#2a2a2a")
+        inv_page_grid.pack(side=tk.LEFT)
+
+        self.inv_page_help_btn = tk.Button(inv_page_top,
+                                           text="❓",
+                                           command=self.show_inv_page_guide,
+                                           font=("Courier New", 9),
+                                           bg=BotGUI.ACCENT_COLOR, fg="white",
+                                           activebackground=BotGUI.ACCENT_COLOR,
+                                           cursor="hand2",
+                                           padx=8, pady=1)
+        self.inv_page_help_btn.pack(side=tk.RIGHT, anchor=tk.NE)
+
+        self.inv_page_btns = {}
+        self.inv_page_labels = {}
+        for _p in range(1, 9):
+            _mandatory = _p <= 4
+            _row_idx = (_p - 1) // 4
+            _col_idx = (_p - 1) % 4
+            _cell = tk.Frame(inv_page_grid, bg="#2a2a2a")
+            _cell.grid(row=_row_idx, column=_col_idx, padx=4, pady=1, sticky=tk.W)
+            _btn = tk.Button(_cell,
+                             text=f"Page {_p}",
+                             command=lambda p=_p: self.start_position_capture(f'inv_page_{p}'),
+                             font=("Courier New", 8),
+                             bg="#666666", fg=BotGUI.ACCENT_COLOR,
+                             activebackground="#777777",
+                             cursor="hand2",
+                             padx=4, pady=1,
+                             width=8)
+            _btn.pack(side=tk.LEFT, padx=(0, 3))
+            self.inv_page_btns[_p] = _btn
+            _pos = self.config.get(f'inv_page_{_p}_pos')
+            _pos_text = f"({_pos[0]},{_pos[1]})" if _pos else ("Not set" if _mandatory else "Optional")
+            _pos_fg = "#ffffff" if _pos else ("#e74c3c" if _mandatory else "#888888")
+            _lbl = tk.Label(_cell, text=_pos_text,
+                            bg="#2a2a2a",
+                            fg=_pos_fg,
+                            font=("Courier New", 9),
+                            width=10, anchor=tk.W)
+            _lbl.pack(side=tk.LEFT)
+            self.inv_page_labels[_p] = _lbl
+
         # Automatic Fish Handling Section
         fish_handling_frame = tk.LabelFrame(config_frame, text="Automatic Fish Handling", 
                                            font=("Courier New", 9),
@@ -1145,7 +1409,7 @@ class BotGUI:
         self.confirm_btn_pos_label.pack(side=tk.LEFT)
         
         # Position capture state
-        self._position_capture_mode = None  # None, 'drop', or 'confirm'
+        self._position_capture_mode = None  # None, 'drop', 'confirm', 'armor', or 'inv_page_N'
         self._position_capture_window = None  # Store the target window name
         self._position_capture_listener = None
         
@@ -1318,6 +1582,10 @@ class BotGUI:
                         self.config['confirm_button_pos'] = saved_config['confirm_button_pos']
                     if 'armor_slot_pos' in saved_config:
                         self.config['armor_slot_pos'] = saved_config['armor_slot_pos']
+                    for _p in range(1, 9):
+                        _k = f'inv_page_{_p}_pos'
+                        if _k in saved_config:
+                            self.config[_k] = saved_config[_k]
                     # Restore accent color
                     if 'accent_color' in saved_config:
                         self.config['accent_color'] = saved_config['accent_color']
@@ -1325,6 +1593,10 @@ class BotGUI:
                     # Restore RGB wave state
                     if 'rgb_wave_active' in saved_config:
                         self.config['rgb_wave_active'] = saved_config['rgb_wave_active']
+                    # Restore timing settings
+                    for _tkey in TimingSettingsWindow.DEFAULTS:
+                        if _tkey in saved_config:
+                            self.config[_tkey] = saved_config[_tkey]
                     # Store previously selected windows for later restoration (multi-window)
                     self.previous_windows = saved_config.get('selected_windows', [])
                     # Also support legacy single window
@@ -1366,8 +1638,11 @@ class BotGUI:
                 'drop_button_pos': self.config.get('drop_button_pos'),
                 'confirm_button_pos': self.config.get('confirm_button_pos'),
                 'armor_slot_pos': self.config.get('armor_slot_pos'),
+                **{f'inv_page_{_p}_pos': self.config.get(f'inv_page_{_p}_pos') for _p in range(1, 9)},
                 'accent_color': BotGUI.ACCENT_COLOR,
                 'rgb_wave_active': self.rgb_wave_active,
+                # Timing settings
+                **{k: self.config.get(k, v) for k, v in TimingSettingsWindow.DEFAULTS.items()},
                 'bait_keys': selected_bait_keys,
                 'bait': self.bait,
                 'selected_windows': selected_windows,
@@ -1465,15 +1740,6 @@ class BotGUI:
         if not DEBUG_MODE_EN or not hasattr(self, 'status_log_window') or not self.status_log_window:
             return
         self.status_log_window.add_message(message)
-    
-    def toggle_log_visibility(self):
-        """Toggles the visibility of the status log window."""
-        if self.status_log_window is None:
-            return
-        if self.show_log_var.get():
-            self.status_log_window.show()
-        else:
-            self.status_log_window.hide()
     
     def toggle_quick_skip_modes(self):
         """Enables or disables the quick skip mode checkboxes based on the main quick skip checkbox."""
@@ -1588,7 +1854,7 @@ class BotGUI:
             self.select_fishes_btn.config(state=tk.NORMAL)
         else:
             self.select_fishes_btn.config(state=tk.DISABLED)
-        
+
         # Update drop button states based on whether any fish is set to 'drop'
         self._update_drop_buttons_state()
         
@@ -1610,6 +1876,21 @@ class BotGUI:
                                        "2. Click 'Set Confirm Button Coords' and click on the final confirm/accept button\n\n"
                                        "Note: Drop button position is optional. Leave unset if your game auto-drops items.")
     
+    def show_inv_page_guide(self):
+        """Shows setup instructions for inventory page tab coordinates."""
+        messagebox.showinfo("Inventory Page Tab Coords",
+                           "The bot needs to know where each inventory page tab is so it can\n"
+                           "switch pages automatically when the current page fills up.\n\n"
+                           "PAGES 1-4 are MANDATORY — the bot will not start without them.\n"
+                           "PAGES 5-8 are OPTIONAL — set only if your game has extra pages.\n\n"
+                           "HOW TO CONFIGURE:\n"
+                           "1. Open your game's inventory\n"
+                           "2. Click a 'Page N' button here\n"
+                           "3. Click the corresponding tab in the game window\n"
+                           "4. Repeat for each page tab\n\n"
+                           "TIP: Click the tab that is currently inactive (not selected) so\n"
+                           "the bot can click it to switch pages during fishing.")
+
     def show_quick_skip_guide(self):
         """Shows the quick skip guide message based on selected mode."""
         # Determine which mode is selected
@@ -1710,10 +1991,14 @@ class BotGUI:
             self.confirm_btn_pos_btn.config(fg=new_color)
         if hasattr(self, 'armor_slot_btn'):
             self.armor_slot_btn.config(fg=new_color)
+        for _btn in getattr(self, 'inv_page_btns', {}).values():
+            _btn.config(fg=new_color)
         if hasattr(self, 'quick_skip_help_btn'):
             self.quick_skip_help_btn.config(bg=new_color, activebackground=new_color)
         if hasattr(self, 'drop_help_btn'):
             self.drop_help_btn.config(bg=new_color, activebackground=new_color)
+        if hasattr(self, 'inv_page_help_btn'):
+            self.inv_page_help_btn.config(bg=new_color, activebackground=new_color)
         if hasattr(self, 'total_games_label'):
             self.total_games_label.config(fg=new_color)
         if hasattr(self, 'active_windows_label'):
@@ -1841,6 +2126,9 @@ class BotGUI:
             self.drop_btn_pos_btn.config(text="⏳ Click in game...", bg="#f39c12")
         elif mode == 'confirm':
             self.confirm_btn_pos_btn.config(text="⏳ Click in game...", bg="#f39c12")
+        elif mode.startswith('inv_page_'):
+            page_num = int(mode.split('_')[-1])
+            self.inv_page_btns[page_num].config(text="⏳ Click in game...", bg="#f39c12")
         else:  # armor
             self.armor_slot_btn.config(text="⏳ Click in game...", bg="#f39c12")
         
@@ -1929,6 +2217,11 @@ class BotGUI:
                 self.config['confirm_button_pos'] = (rel_x, rel_y)
                 self.confirm_btn_pos_label.config(text=f"({rel_x},{rel_y})", fg="#ffffff")
                 self.add_status(f"Confirm button position set: ({rel_x}, {rel_y})")
+            elif mode.startswith('inv_page_'):
+                page_num = int(mode.split('_')[-1])
+                self.config[f'inv_page_{page_num}_pos'] = (rel_x, rel_y)
+                self.inv_page_labels[page_num].config(text=f"({rel_x},{rel_y})", fg="#ffffff")
+                self.add_status(f"Inventory page {page_num} position set: ({rel_x}, {rel_y})")
             else:  # armor
                 self.config['armor_slot_pos'] = (rel_x, rel_y)
                 self.armor_slot_label.config(text=f"({rel_x},{rel_y})", fg="#ffffff")
@@ -1958,6 +2251,8 @@ class BotGUI:
             self.confirm_btn_pos_btn.config(text="Set Confirm Button Coords", bg="#555555")
         if hasattr(self, 'armor_slot_btn'):
             self.armor_slot_btn.config(text="Set Armor Slot Coords", bg="#666666")
+        for _p, _btn in getattr(self, 'inv_page_btns', {}).items():
+            _btn.config(text=f"Page {_p}", bg="#666666")
     
     def open_fish_selection_window(self):
         """Opens the fish selection window for configuring fish/item actions."""
@@ -1982,6 +2277,23 @@ class BotGUI:
             self.rgb_wave_hue  # Pass current hue
         )
     
+    def open_timing_settings(self):
+        """Opens the timing settings window. Focuses existing window if already open."""
+        if hasattr(self, '_timing_window') and self._timing_window is not None:
+            try:
+                self._timing_window.window.lift()
+                self._timing_window.window.focus_force()
+                return
+            except tk.TclError:
+                self._timing_window = None
+
+        self._timing_window = TimingSettingsWindow(
+            self.root,
+            self.config,
+            on_save_callback=self.save_config,
+            accent_color=BotGUI.ACCENT_COLOR
+        )
+
     def on_fish_actions_saved(self, fish_actions: dict):
         """Callback when fish actions are saved from the selection window."""
         self.config['fish_actions'] = fish_actions
@@ -2159,6 +2471,17 @@ class BotGUI:
         self.last_action_time = current_time
         self.disable_buttons_for_cooldown()
         
+        # Check that all mandatory inventory page positions (1-4) are set
+        missing_pages = [p for p in range(1, 5) if not self.config.get(f'inv_page_{p}_pos')]
+        if missing_pages:
+            missing_str = ", ".join(f"Page {p}" for p in missing_pages)
+            messagebox.showerror("Inventory Pages Not Configured",
+                               f"All 4 inventory page tab coordinates must be set before starting!\n\n"
+                               f"Missing: {missing_str}\n\n"
+                               f"Click the 'Page N' buttons in the 'Inventory Page Tab Coords'\n"
+                               f"section and click the matching tab in your game window.")
+            return
+
         # Check if bait keys are selected FIRST (before checking bait amounts)
         selected_bait_keys = self.get_selected_bait_keys()
         if not selected_bait_keys:
@@ -2411,6 +2734,17 @@ class BotGUI:
             if hasattr(self, 'confirm_btn_pos_btn'):
                 self.confirm_btn_pos_btn.config(state=tk.DISABLED)
         
+        # Armor slot button: only enable when stopping AND quick_skip + armor mode are both on
+        if hasattr(self, 'armor_slot_btn'):
+            if state == 'normal' and self.quick_skip_var.get() and self.quick_skip_mode_armor_var.get():
+                self.armor_slot_btn.config(state=tk.NORMAL)
+            else:
+                self.armor_slot_btn.config(state=tk.DISABLED)
+
+        # Timing settings button
+        if hasattr(self, 'timing_btn'):
+            self.timing_btn.config(state=state)
+
         # Refresh Windows button
         if hasattr(self, 'refresh_windows_btn'):
             self.refresh_windows_btn.config(state=state)

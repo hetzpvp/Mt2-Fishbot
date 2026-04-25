@@ -88,6 +88,11 @@ def set_window_icon(window, icon_path: str):
         pass
 
 
+def load_window_icon(window) -> None:
+    """Applies monkey.ico to a Tk Toplevel window. Silently skips if the file is missing."""
+    set_window_icon(window, get_resource_path("monkey.ico"))
+
+
 def play_rickroll_beep():
     """Plays a Rick Roll-themed beep sequence with smooth ADSR envelopes.
     Uses numpy to generate WAV audio with professional envelope curves."""

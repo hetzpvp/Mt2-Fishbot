@@ -72,7 +72,9 @@ class FishDetector:
         
         hsv = cvtColor(frame, FishDetector._COLOR_BGR2HSV)
         
-        # Check window first - early exit if not active
+        # Check window first - early exit if not active.
+        # A fully visible minigame window produces ~10000+ cyan pixels; below this
+        # threshold we treat it as absent to avoid false positives on small reflections.
         window_mask = inRange(hsv, self.window_color_lower, self.window_color_upper)
         if countNonZero(window_mask) <= 10000:
             return (False, None)
