@@ -248,7 +248,11 @@ class FishingBot:
 
     def _scan_empty_slots(self, inventory_frame: np.ndarray) -> list:
         """Finds all empty inventory slot positions in the frame using template matching.
-        Returns an ordered list of (inv_x, inv_y) sorted top-to-bottom, left-to-right."""
+        Returns an ordered list of (inv_x, inv_y) sorted top-to-bottom, left-to-right.
+
+        Optimized: single matchTemplate + vectorized np.where + sort-based NMS,
+        replacing the previous iterative minMaxLoc+mask loop that re-scanned the
+        result array once per detected slot (~25 full passes)."""
         slot_template = self._load_empty_slot_template()
         if slot_template is None:
             return []
@@ -263,38 +267,34 @@ class FishingBot:
             return []
 
         THRESHOLD = 0.70
-        positions = []
-
         try:
             result = cv2.matchTemplate(inventory_gray, template, cv2.TM_CCOEFF_NORMED)
+            ys, xs = np.where(result >= THRESHOLD)
+            if ys.size == 0:
+                return []
 
-            while True:
-                _, max_val, _, max_loc = cv2.minMaxLoc(result)
+            # Sort all candidates by score descending, then keep only those
+            # outside a 10px radius of any already-kept point (cheap NMS).
+            scores = result[ys, xs]
+            order = np.argsort(scores)[::-1]
 
-                if max_val < THRESHOLD:
-                    break
+            kept = []
+            for idx in order:
+                cx = int(xs[idx]) + half_w
+                cy = int(ys[idx]) + half_h
+                dup = False
+                for ex, ey in kept:
+                    if abs(cx - ex) < 10 and abs(cy - ey) < 10:
+                        dup = True
+                        break
+                if not dup:
+                    kept.append((cx, cy))
 
-                pt_x, pt_y = max_loc
-                center_x = pt_x + half_w
-                center_y = pt_y + half_h
-
-                is_dup = any(abs(center_x - ex) < 10 and abs(center_y - ey) < 10 for ex, ey in positions)
-                if not is_dup:
-                    positions.append((center_x, center_y))
-
-                # Mask out matched region so the next iteration finds a different slot
-                mask_x1 = max(0, pt_x - t_w // 2)
-                mask_y1 = max(0, pt_y - t_h // 2)
-                mask_x2 = min(result.shape[1], pt_x + t_w + 1)
-                mask_y2 = min(result.shape[0], pt_y + t_h + 1)
-                result[mask_y1:mask_y2, mask_x1:mask_x2] = -1.0
+            kept.sort(key=lambda p: (p[1] // 30, p[0]))
+            return kept
 
         except Exception:
-            pass
-
-        # Sort top-to-bottom, left-to-right (30 px row bands match slot grid spacing)
-        positions.sort(key=lambda p: (p[1] // 30, p[0]))
-        return positions
+            return []
 
     def _disambiguate_confusable_fish(self, inventory_frame_color: np.ndarray, inv_x: int, inv_y: int, matched_filename: str) -> str:
         """Disambiguates between fish that look identical in grayscale using color comparison.
@@ -379,9 +379,7 @@ class FishingBot:
             }
             
             sct_img = self.sct.grab(monitor)
-            frame = np.array(sct_img)
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-            return frame
+            return np.ascontiguousarray(np.asarray(sct_img, dtype=np.uint8)[:, :, :3])
         except Exception as e:
             if self.on_status_update:
                 self.on_status_update(f"[W{self.bot_id+1}] Error capturing inventory: {e}")
@@ -416,27 +414,27 @@ class FishingBot:
         
         for filename, (template, half_w, half_h) in templates.items():
             t_h, t_w = template.shape
-            
+
             # Skip if template larger than inventory
             if t_h > inv_h or t_w > inv_w:
                 continue
-            
+
             try:
                 result = match_template(inventory_gray, template, TM_CCOEFF_NORMED)
                 result_copy = result.copy()
-                
+
                 # Try to find first non-ignored match for this template
                 while True:
                     _, max_val, _, max_loc = minMaxLoc(result_copy)
-                    
+
                     # Stop if no more good matches
                     if max_val <= 0.5:
                         break
-                    
+
                     pt_x, pt_y = max_loc
                     center_x = pt_x + half_w
                     center_y = pt_y + half_h
-                    
+
                     # Check if this match is in ignore list
                     is_ignored = False
                     if ignore_positions:
@@ -444,78 +442,100 @@ class FishingBot:
                             if abs(center_x - ix) < 10 and abs(center_y - iy) < 10:
                                 is_ignored = True
                                 break
-                    
+
                     # If not ignored and better than current best, accept it
                     if not is_ignored and max_val > best_confidence:
                         best_confidence = max_val
                         matched_filename = filename
-                        
+
                         # Disambiguate confusable fish using color comparison
                         if filename in confusable_fish:
                             matched_filename = self._disambiguate_confusable_fish(
                                 inventory_frame, center_x, center_y, filename
                             )
-                        
+
                         best_match = (matched_filename, (center_x, center_y))
-                        
+
                         # Early exit on near-perfect match (but NOT for confusable fish)
                         if best_confidence >= EARLY_EXIT_THRESHOLD and filename not in confusable_fish:
                             return best_match
                         break  # Found good match for this template, move to next template
-                    
+
                     # Mask out this match to try next one within same template
                     mask_x1 = max(0, pt_x - t_w // 2)
                     mask_y1 = max(0, pt_y - t_h // 2)
                     mask_x2 = min(result_copy.shape[1], pt_x + t_w // 2 + 1)
                     mask_y2 = min(result_copy.shape[0], pt_y + t_h // 2 + 1)
                     result_copy[mask_y1:mask_y2, mask_x1:mask_x2] = -1.0
-                    
-            except Exception as e:
+
+            except Exception:
                 continue
-        
+
         return best_match
     
     def _is_item_at_position(self, inventory_frame: np.ndarray, x: int, y: int, radius: int = 10) -> bool:
-        """Checks if any fish/item template matches at the given position (within radius).
-        Used for dead fish detection - checks if an item is still there after clicking.
-        Optimized: pre-computed dimensions, local variable caching, early termination."""
+        """Checks if a slot at (x, y) is still occupied by an item.
+        Optimized: instead of running matchTemplate against every fish/item template
+        (O(N) heavy convolutions), we check whether the empty_slot template fits at
+        this position. If it matches strongly, the slot is empty -> item is gone.
+        Single matchTemplate call on a tiny crop instead of N full-frame searches."""
+        slot_template = self._load_empty_slot_template()
+        if slot_template is None:
+            # Fallback to old path if empty_slot template missing
+            return self._is_item_at_position_fallback(inventory_frame, x, y, radius)
+
+        template, half_w, half_h = slot_template
+        t_h, t_w = template.shape
+
+        # Crop a small search window around the target position. The match window
+        # only needs to be slightly bigger than the template + radius.
+        pad = radius + 4
+        x1 = max(0, x - half_w - pad)
+        y1 = max(0, y - half_h - pad)
+        x2 = min(inventory_frame.shape[1], x + half_w + pad)
+        y2 = min(inventory_frame.shape[0], y + half_h + pad)
+
+        crop = inventory_frame[y1:y2, x1:x2]
+        if crop.shape[0] < t_h or crop.shape[1] < t_w:
+            return self._is_item_at_position_fallback(inventory_frame, x, y, radius)
+
+        try:
+            crop_gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            result = cv2.matchTemplate(crop_gray, template, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, _ = cv2.minMaxLoc(result)
+            # High empty-slot confidence => slot is empty => no item present
+            return max_val < 0.70
+        except Exception:
+            return self._is_item_at_position_fallback(inventory_frame, x, y, radius)
+
+    def _is_item_at_position_fallback(self, inventory_frame: np.ndarray, x: int, y: int, radius: int = 10) -> bool:
+        """Fallback heavy check: matches every item template (used only if empty_slot
+        template is unavailable or the crop is too small)."""
         templates = self._load_template_cache()
         if not templates:
             return False
-        
-        # Convert once
+
         inventory_gray = cv2.cvtColor(inventory_frame, cv2.COLOR_BGR2GRAY)
         inv_h, inv_w = inventory_gray.shape
-        
-        # Local references for speed
+
         match_template = cv2.matchTemplate
         where = np.where
         TM_CCOEFF_NORMED = cv2.TM_CCOEFF_NORMED
-        
-        for filename, (template, half_w, half_h) in templates.items():
+
+        for template, half_w, half_h in templates.values():
             t_h, t_w = template.shape
-            
             if t_h > inv_h or t_w > inv_w:
                 continue
-            
             try:
                 result = match_template(inventory_gray, template, TM_CCOEFF_NORMED)
                 locations = where(result >= 0.8)
-                
-                # Fast path: no matches
                 if locations[0].size == 0:
                     continue
-                
-                # Check if any match is at our target position
                 for pt_y, pt_x in zip(locations[0], locations[1]):
-                    center_x = pt_x + half_w
-                    center_y = pt_y + half_h
-                    
-                    if abs(center_x - x) < radius and abs(center_y - y) < radius:
+                    if abs((pt_x + half_w) - x) < radius and abs((pt_y + half_h) - y) < radius:
                         return True
             except Exception:
                 continue
-        
         return False
     
     def handle_caught_item(self):
@@ -540,33 +560,37 @@ class FishingBot:
         fish_actions = self.config.get('fish_actions', {})
         if not fish_actions:
             return
-        
-        try: 
-            # Activate our window first
+
+        try:
+            # Activate window and wait for item to land in inventory (outside lock — no input needed)
             with input_lock:
                 self.window_manager.activate_window(force_activate=True)
-            # Small delay for item to appear in inventory
             time.sleep(self._t_catch_wait)
-            
-            # Capture inventory area
+
+            # Identify item (outside lock — read-only screen capture)
             inventory_frame = self.capture_inventory_area()
-            
-            # Identify the item (ignoring known dead fish positions)
             match = self.identify_item_in_inventory(inventory_frame, ignore_positions=self._ignored_positions)
-                        
             if not match:
-                return  # No item found, that's OK (not every catch gives an item)
-            
+                return
+
             filename, (inv_x, inv_y) = match
-            
             action = fish_actions.get(filename, 'keep')
 
-            # ========== ACQUIRE LOCK FOR ENTIRE DETECTION + ACTION SEQUENCE ==========
-            # This prevents another bot from moving the mouse/clicking between our
-            # detection and action, which could cause clicking on the wrong fish
+            fish_name = filename.replace('_living.jpg', '').replace('_item.jpg', '')
+
+            # ========== SINGLE LOCK COVERS THE ENTIRE INTERACTION ==========
+            # Holding the lock from first click to last click prevents another
+            # bot from moving the mouse between our steps.  Screen captures
+            # (mss.grab) are safe inside the lock — they don't send input.
             with input_lock:
+                self.window_manager.activate_window(force_activate=True)
+                win_left, win_top, win_width, win_height = self.window_manager.get_window_rect()
+                screen_x = win_left + win_width - self._inventory_width + inv_x
+                screen_y = win_top + self._inventory_y_offset + inv_y
+                win_center_x = win_left + win_width // 2
+                win_center_y = win_top + win_height // 2
+
                 if action == 'keep':
-                    # Item stays in inventory — mark slot occupied and track it
                     self._ignored_positions.add((inv_x, inv_y))
                     self._empty_slot_positions = [
                         (ex, ey) for ex, ey in self._empty_slot_positions
@@ -574,178 +598,109 @@ class FishingBot:
                     ]
                     if self.on_status_update:
                         self.on_status_update(
-                            f"[W{self.bot_id+1}] Keeping: {filename.replace('_living.jpg', '').replace('_item.jpg', '')} "
+                            f"[W{self.bot_id+1}] Keeping: {fish_name} "
                             f"(ignored, {len(self._empty_slot_positions)} empty slots left)")
-                        
+
                 elif action == 'open':
-                    # Right-click to open fish - coordinates already computed, window already active
                     if self.on_status_update:
-                        self.on_status_update(f"[W{self.bot_id+1}] Opening: {filename.replace('_living.jpg', '').replace('_item.jpg', '')}")
-                    
-                    # Convert inventory-relative coords to screen coords
-                    win_left, win_top, win_width, _ = self.window_manager.get_window_rect()
-                    screen_x = win_left + win_width - self._inventory_width + inv_x
-                    screen_y = win_top + self._inventory_y_offset + inv_y
-                    
-                    # Right-click sequence (already inside lock)
+                        self.on_status_update(f"[W{self.bot_id+1}] Opening: {fish_name}")
+
                     pyautogui.moveTo(screen_x, screen_y, _pause=False)
                     time.sleep(0.05)
                     pyautogui.click(button='right', _pause=False)
                     time.sleep(self._t_open_wait)
-
-                    # Move cursor to center of the window (safe position)
-                    win_center_x = win_left + win_width // 2
-                    win_center_y = win_top + 400  # Upper-middle area of window
                     pyautogui.moveTo(win_center_x, win_center_y, _pause=False)
-                    
-                elif action == 'drop':
-                    # Drop functionality - validate config, do initial right-click test
-                    drop_pos = self.config.get('drop_button_pos')
-                    confirm_pos = self.config.get('confirm_button_pos')
-                    
-                    # confirm_pos is required, drop_pos is optional
-                    if not confirm_pos:
-                        if self.on_status_update:
-                            self.on_status_update(f"[W{self.bot_id+1}] Confirm button position not configured! Keeping: {filename}")
-                        self._ignored_positions.add((inv_x, inv_y))
-                        self._empty_slot_positions = [
-                            (ex, ey) for ex, ey in self._empty_slot_positions
-                            if not (abs(inv_x - ex) < 15 and abs(inv_y - ey) < 15)
-                        ]
-                        return
-                    
-                    if self.on_status_update:
-                        self.on_status_update(f"[W{self.bot_id+1}] Dropping: {filename.replace('_living.jpg', '').replace('_item.jpg', '')}")
-                    
-                    # Convert inventory-relative coords to screen coords
-                    win_left, win_top, win_width, win_height = self.window_manager.get_window_rect()
-                    screen_x = win_left + win_width - self._inventory_width + inv_x
-                    screen_y = win_top + self._inventory_y_offset + inv_y
-                    
-                    # Only right-click test for fish (to check if it can be opened)
-                    # Items (_item) go directly to drop sequence
-                    is_fish = '_living' in filename
-                    if is_fish:
-                        # Right-click sequence to test if fish can be opened (already inside lock)
-                        pyautogui.moveTo(screen_x, screen_y, _pause=False)
-                        time.sleep(0.05)
-                        pyautogui.click(button='right', _pause=False)
-                        time.sleep(self._t_open_wait)
-                    # Lock released after right-click - check happens outside
-                    
-            # ========== LOCK RELEASED ==========
 
-            # Switch to next inventory page when all slots on the current page are occupied
-            # (_switch_inventory_page acquires the lock internally so must run outside here)
-            if action == 'keep' and not self._empty_slot_positions:
-                self._switch_inventory_page()
-
-            # Dead fish detection and drop sequence happen outside main lock (read-only captures)
-            if action == 'drop':
-                # Determine if this is a fish (needs dead fish check) or item (drop directly)
-                is_fish = '_living' in filename
-                
-                if is_fish:
+                    # Verify while still holding the lock (no other bot can interfere)
                     time.sleep(self._t_open_wait)
+                    inv_check = self.capture_inventory_area()
+                    still_there = self._is_item_at_position(inv_check, inv_x, inv_y)
 
-                    inventory_frame_after = self.capture_inventory_area()
+                    if still_there:
+                        time.sleep(self._t_dead_check)
+                        inv_check2 = self.capture_inventory_area()
+                        still_there = self._is_item_at_position(inv_check2, inv_x, inv_y)
 
-                    # Check if the SAME fish is still at the SAME position
-                    still_there = self._is_item_at_position(inventory_frame_after, inv_x, inv_y)
-                else:
-                    # Items always need to be dropped (no right-click test)
-                    still_there = True
-
-                # If fish is still there (can't be opened) or it's an item, perform drop sequence
-                if still_there:
-                    # Re-acquire lock only for the mouse operations
-                    with input_lock:
-                        # Re-activate window
-                        self.window_manager.activate_window(force_activate=True)
-
-                        # Re-fetch window rect in case it moved
-                        win_left, win_top, win_width, win_height = self.window_manager.get_window_rect()
-                        screen_x = win_left + win_width - self._inventory_width + inv_x
-                        screen_y = win_top + self._inventory_y_offset + inv_y
-
-                        # ========== DROP SEQUENCE ==========
-                        # Step 1: Left-click on the item to pick it up
-                        pyautogui.moveTo(screen_x, screen_y, _pause=False)
-                        time.sleep(0.05)
-                        pyautogui.click(_pause=False)
-                        time.sleep(self._t_drop_settle)
-
-                        # Step 2: Move cursor to middle of window
-                        win_center_x = win_left + win_width // 2
-                        win_center_y = win_top + win_height // 2
-                        pyautogui.moveTo(win_center_x, win_center_y, _pause=False)
-                        time.sleep(0.05)
-
-                        # Step 3: Left-click to drop the item
-                        pyautogui.click(_pause=False)
-                        time.sleep(self._t_drop_settle)
-
-                        # Step 4: Click the drop button (relative to window) - only if drop_pos is configured
-                        if drop_pos:
-                            drop_screen_x = win_left + drop_pos[0]
-                            drop_screen_y = win_top + drop_pos[1]
-                            pyautogui.moveTo(drop_screen_x, drop_screen_y, _pause=False)
-                            time.sleep(0.05)
-                            pyautogui.click(_pause=False)
-                            time.sleep(self._t_drop_settle)
-
-                        # Step 5: Click the confirm button (relative to window)
-                        confirm_screen_x = win_left + confirm_pos[0]
-                        confirm_screen_y = win_top + confirm_pos[1]
-                        pyautogui.moveTo(confirm_screen_x, confirm_screen_y, _pause=False)
-                        time.sleep(0.05)
-                        pyautogui.click(_pause=False)
-                        time.sleep(self._t_drop_settle)
-
-                        # Move cursor to safe position (last mouse op before releasing lock)
-                        pyautogui.moveTo(win_center_x, win_center_y, _pause=False)
-                    # ========== DROP LOCK RELEASED ==========
-                    time.sleep(self._t_drop_settle)  # Final settle outside lock
-
-            elif action == 'open':
-                time.sleep(self._t_open_wait)
-
-                inventory_frame_after = self.capture_inventory_area()
-
-                # Check if the SAME fish is still at the SAME position
-                still_there = self._is_item_at_position(inventory_frame_after, inv_x, inv_y)
-
-                fish_opened = not still_there  # Opened on first check
-
-                # Safety check: wait and verify again to be absolutely sure
-                if still_there:
-                    time.sleep(self._t_dead_check)
-                    inventory_frame_safety = self.capture_inventory_area()
-                    still_there_safety = self._is_item_at_position(inventory_frame_safety, inv_x, inv_y)
-
-                    if still_there_safety:
+                    if still_there:
                         # Dead fish — permanently occupies this slot
                         self._ignored_positions.add((inv_x, inv_y))
                         self._empty_slot_positions = [
                             (ex, ey) for ex, ey in self._empty_slot_positions
                             if not (abs(inv_x - ex) < 15 and abs(inv_y - ey) < 15)
                         ]
-                        if not self._empty_slot_positions:
-                            self._switch_inventory_page()
                     else:
-                        fish_opened = True  # Opened on second check
+                        # Fish was opened — slot is now free
+                        if not any(abs(inv_x - ex) < 15 and abs(inv_y - ey) < 15
+                                   for ex, ey in self._empty_slot_positions):
+                            self._empty_slot_positions.append((inv_x, inv_y))
+                            self._empty_slot_positions.sort(key=lambda p: (p[1] // 30, p[0]))
 
-                if fish_opened:
-                    # Slot is now empty — restore to the ordered empty slot list
-                    already_tracked = any(
-                        abs(inv_x - ex) < 15 and abs(inv_y - ey) < 15
-                        for ex, ey in self._empty_slot_positions
-                    )
-                    if not already_tracked:
-                        self._empty_slot_positions.append((inv_x, inv_y))
-                        self._empty_slot_positions.sort(key=lambda p: (p[1] // 30, p[0]))
-                
-        except Exception as e:
+                elif action == 'drop':
+                    confirm_pos = self.config.get('confirm_button_pos')
+                    drop_pos    = self.config.get('drop_button_pos')
+
+                    if not confirm_pos:
+                        if self.on_status_update:
+                            self.on_status_update(f"[W{self.bot_id+1}] Confirm button not configured! Keeping: {fish_name}")
+                        self._ignored_positions.add((inv_x, inv_y))
+                        self._empty_slot_positions = [
+                            (ex, ey) for ex, ey in self._empty_slot_positions
+                            if not (abs(inv_x - ex) < 15 and abs(inv_y - ey) < 15)
+                        ]
+                        return  # exit inside lock — lock released by context manager
+
+                    if self.on_status_update:
+                        self.on_status_update(f"[W{self.bot_id+1}] Dropping: {fish_name}")
+
+                    is_fish = '_living' in filename
+                    still_there = True
+
+                    if is_fish:
+                        # Right-click to test if fish can be opened
+                        pyautogui.moveTo(screen_x, screen_y, _pause=False)
+                        time.sleep(0.05)
+                        pyautogui.click(button='right', _pause=False)
+                        time.sleep(self._t_open_wait)
+                        pyautogui.moveTo(win_center_x, win_center_y, _pause=False)
+
+                        # Check result while still holding the lock
+                        time.sleep(self._t_open_wait)
+                        inv_check = self.capture_inventory_area()
+                        still_there = self._is_item_at_position(inv_check, inv_x, inv_y)
+
+                    if still_there:
+                        # ========== DROP SEQUENCE (all inside lock) ==========
+                        pyautogui.moveTo(screen_x, screen_y, _pause=False)
+                        time.sleep(0.05)
+                        pyautogui.click(_pause=False)
+                        time.sleep(self._t_drop_settle)
+
+                        pyautogui.moveTo(win_center_x, win_center_y, _pause=False)
+                        time.sleep(0.05)
+                        pyautogui.click(_pause=False)
+                        time.sleep(self._t_drop_settle)
+
+                        if drop_pos:
+                            pyautogui.moveTo(win_left + drop_pos[0], win_top + drop_pos[1], _pause=False)
+                            time.sleep(0.05)
+                            pyautogui.click(_pause=False)
+                            time.sleep(self._t_drop_settle)
+
+                        pyautogui.moveTo(win_left + confirm_pos[0], win_top + confirm_pos[1], _pause=False)
+                        time.sleep(0.05)
+                        pyautogui.click(_pause=False)
+                        time.sleep(self._t_drop_settle)
+
+                        pyautogui.moveTo(win_center_x, win_center_y, _pause=False)
+            # ========== LOCK RELEASED ==========
+
+            # Page-switch if needed — acquires its own lock internally
+            if action == 'keep' and not self._empty_slot_positions:
+                self._switch_inventory_page()
+            elif action == 'open' and not self._empty_slot_positions:
+                self._switch_inventory_page()
+
+        except Exception:
             pass
         
     def _update_region_cache(self):
@@ -771,10 +726,7 @@ class FishingBot:
             }
             
             sct_img = self.sct.grab(monitor)
-            frame = np.array(sct_img)
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-            
-            return frame
+            return np.ascontiguousarray(np.asarray(sct_img, dtype=np.uint8)[:, :, :3])
         except Exception as e:
             if self.on_status_update:
                 self.on_status_update(f"Screenshot error: {e}")
@@ -785,26 +737,25 @@ class FishingBot:
         try:
             if self.sct is None:
                 self.sct = mss()
-            
+
             if not self.region:
                 return self.capture_full_window()
-            
+
             win_left, win_top, _, _ = self.window_manager.get_window_rect()
             screen_left = win_left + self.region.left
             screen_top = win_top + self.region.top
-            
+
             monitor = {
                 "left": screen_left,
                 "top": screen_top,
                 "width": self.region.width,
                 "height": self.region.height
             }
-            
+
             sct_img = self.sct.grab(monitor)
-            frame = np.array(sct_img)
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-            
-            return frame
+            # Direct slice from BGRA buffer to contiguous BGR view — avoids the full
+            # cvtColor pass over every pixel (significant on hot-loop captures).
+            return np.ascontiguousarray(np.asarray(sct_img, dtype=np.uint8)[:, :, :3])
         except Exception as e:
             if self.on_status_update:
                 self.on_status_update(f"Screenshot error: {e}")
@@ -1128,11 +1079,11 @@ class FishingBot:
             minMaxLoc = cv2.minMaxLoc
             TM_CCOEFF_NORMED = cv2.TM_CCOEFF_NORMED
             CONFIDENCE_THRESHOLD = 0.80
-            confusable_fish = FishingBot._confusable_fish
 
             found_count = 0
+            ignored = self._ignored_positions
 
-            for filename, (template, half_w, half_h) in templates.items():
+            for template, half_w, half_h in templates.values():
                 t_h, t_w = template.shape
 
                 if t_h > inv_h or t_w > inv_w:
@@ -1141,11 +1092,17 @@ class FishingBot:
                 try:
                     result = match_template(inventory_gray, template, TM_CCOEFF_NORMED)
 
-                    # Find ALL matches using iterative minMaxLoc with masking
+                    # Cheap upfront rejection: if the global max is already below
+                    # threshold, this template has no occurrence anywhere.
+                    _, peak, _, _ = minMaxLoc(result)
+                    if peak < CONFIDENCE_THRESHOLD:
+                        continue
+
+                    # Find ALL matches using iterative minMaxLoc with masking.
+                    # Disambiguation is skipped here — we only need positions for the
+                    # ignore-list, not species identity.
                     while True:
                         _, max_val, _, max_loc = minMaxLoc(result)
-
-                        # Stop if best remaining match is below threshold
                         if max_val < CONFIDENCE_THRESHOLD:
                             break
 
@@ -1153,26 +1110,17 @@ class FishingBot:
                         center_x = pt_x + half_w
                         center_y = pt_y + half_h
 
-                        # Check if position already in ignore list (within 10px radius)
                         is_duplicate = False
-                        for ix, iy in self._ignored_positions:
+                        for ix, iy in ignored:
                             if abs(center_x - ix) < 10 and abs(center_y - iy) < 10:
                                 is_duplicate = True
                                 break
 
-                        # Color disambiguation for confusable fish
-                        matched_filename = filename
-                        if not is_duplicate and filename in confusable_fish:
-                            matched_filename = self._disambiguate_confusable_fish(
-                                inventory_frame, center_x, center_y, filename
-                            )
-
                         if not is_duplicate:
-                            self._ignored_positions.add((center_x, center_y))
+                            ignored.add((center_x, center_y))
                             found_count += 1
 
-                        # Mask out this match area to find next one (set to -1 so it won't be found again)
-                        # Mask a region around the match point
+                        # Mask out this match area to find the next one
                         mask_x1 = max(0, pt_x - t_w // 2)
                         mask_y1 = max(0, pt_y - t_h // 2)
                         mask_x2 = min(result.shape[1], pt_x + t_w // 2 + 1)
@@ -1383,7 +1331,12 @@ class FishingBot:
             confusable_fish = FishingBot._confusable_fish
             keep_count = 0
 
-            # Pass 1: mark all 'keep' items as ignored so Pass 2 skips them
+            # Pass 1: collect every template hit, cluster by position, then for each
+            # cluster pick the highest-confidence template as the slot's true identity.
+            # Without this clustering step, a weakly-matching 'keep' template can win
+            # over the actually-correct 'drop' template at the same slot purely
+            # because of dict iteration order, causing the slot to be ignored.
+            raw_hits = []  # (filename, cx, cy, confidence)
             for filename, (template, half_w, half_h) in templates.items():
                 t_h, t_w = template.shape
                 if t_h > inv_h or t_w > inv_w:
@@ -1395,20 +1348,7 @@ class FishingBot:
                         if max_val < CONFIDENCE_THRESHOLD:
                             break
                         pt_x, pt_y = max_loc
-                        center_x = pt_x + half_w
-                        center_y = pt_y + half_h
-
-                        is_dup = any(abs(center_x - ix) < 10 and abs(center_y - iy) < 10
-                                     for ix, iy in self._ignored_positions)
-                        if not is_dup:
-                            matched_filename = filename
-                            if filename in confusable_fish:
-                                matched_filename = self._disambiguate_confusable_fish(
-                                    inventory_frame, center_x, center_y, filename)
-                            if fish_actions.get(matched_filename, 'keep') == 'keep':
-                                self._ignored_positions.add((center_x, center_y))
-                                keep_count += 1
-
+                        raw_hits.append((filename, pt_x + half_w, pt_y + half_h, max_val))
                         mask_x1 = max(0, pt_x - t_w // 2)
                         mask_y1 = max(0, pt_y - t_h // 2)
                         mask_x2 = min(result.shape[1], pt_x + t_w // 2 + 1)
@@ -1416,6 +1356,34 @@ class FishingBot:
                         result[mask_y1:mask_y2, mask_x1:mask_x2] = -1.0
                 except Exception:
                     continue
+
+            # Cluster hits within 10 px → one entry per physical slot, keeping
+            # the best (filename, conf) for that slot.
+            slot_best = []  # list of [cx, cy, best_filename, best_conf]
+            for filename, cx, cy, conf in raw_hits:
+                merged = False
+                for slot in slot_best:
+                    if abs(cx - slot[0]) < 10 and abs(cy - slot[1]) < 10:
+                        if conf > slot[3]:
+                            slot[2] = filename
+                            slot[3] = conf
+                        merged = True
+                        break
+                if not merged:
+                    slot_best.append([cx, cy, filename, conf])
+
+            # Now classify each slot by its best-matching template's action.
+            for cx, cy, best_filename, _ in slot_best:
+                if any(abs(cx - ix) < 10 and abs(cy - iy) < 10
+                       for ix, iy in self._ignored_positions):
+                    continue
+                matched_filename = best_filename
+                if best_filename in confusable_fish:
+                    matched_filename = self._disambiguate_confusable_fish(
+                        inventory_frame, cx, cy, best_filename)
+                if fish_actions.get(matched_filename, 'keep') == 'keep':
+                    self._ignored_positions.add((cx, cy))
+                    keep_count += 1
 
             if self.on_status_update and keep_count:
                 self.on_status_update(f"[W{self.bot_id+1}] Startup: {keep_count} 'keep' items (ignored)")
@@ -1452,106 +1420,87 @@ class FishingBot:
 
     def _startup_handle_item(self, filename: str, inv_x: int, inv_y: int, action: str) -> None:
         """Executes open/drop for a single item found during startup scan.
-        Mirrors handle_caught_item() but without the initial 0.4s wait and page-switch trigger.
-        On failure (dead fish / drop error) the slot is added to _ignored_positions."""
+        Mirrors handle_caught_item() — single lock covers the entire sequence so
+        no other bot can interleave mouse operations mid-action."""
+        fish_name = filename.replace('_living.jpg', '').replace('_item.jpg', '')
         try:
             with input_lock:
                 self.window_manager.activate_window(force_activate=True)
+                win_left, win_top, win_width, win_height = self.window_manager.get_window_rect()
+                screen_x = win_left + win_width - self._inventory_width + inv_x
+                screen_y = win_top + self._inventory_y_offset + inv_y
+                win_cx = win_left + win_width // 2
+                win_cy = win_top + win_height // 2
 
                 if action == 'open':
                     if self.on_status_update:
-                        self.on_status_update(
-                            f"[W{self.bot_id+1}] Startup opening: "
-                            f"{filename.replace('_living.jpg', '').replace('_item.jpg', '')}")
-                    win_left, win_top, win_width, _ = self.window_manager.get_window_rect()
-                    screen_x = win_left + win_width - self._inventory_width + inv_x
-                    screen_y = win_top + self._inventory_y_offset + inv_y
+                        self.on_status_update(f"[W{self.bot_id+1}] Startup opening: {fish_name}")
+
                     pyautogui.moveTo(screen_x, screen_y, _pause=False)
                     time.sleep(0.05)
                     pyautogui.click(button='right', _pause=False)
-                    time.sleep(0.1)
-                    pyautogui.moveTo(win_left + win_width // 2, win_top + 400, _pause=False)
+                    time.sleep(self._t_open_wait)
+                    pyautogui.moveTo(win_cx, win_cy, _pause=False)
+
+                    time.sleep(self._t_open_wait)
+                    still_there = self._is_item_at_position(self.capture_inventory_area(), inv_x, inv_y)
+                    if still_there:
+                        time.sleep(self._t_dead_check)
+                        if self._is_item_at_position(self.capture_inventory_area(), inv_x, inv_y):
+                            self._ignored_positions.add((inv_x, inv_y))
 
                 elif action == 'drop':
                     confirm_pos = self.config.get('confirm_button_pos')
                     if not confirm_pos:
                         self._ignored_positions.add((inv_x, inv_y))
                         return
+
                     if self.on_status_update:
-                        self.on_status_update(
-                            f"[W{self.bot_id+1}] Startup dropping: "
-                            f"{filename.replace('_living.jpg', '').replace('_item.jpg', '')}")
+                        self.on_status_update(f"[W{self.bot_id+1}] Startup dropping: {fish_name}")
+
                     is_fish = '_living' in filename
-                    win_left, win_top, win_width, _ = self.window_manager.get_window_rect()
-                    screen_x = win_left + win_width - self._inventory_width + inv_x
-                    screen_y = win_top + self._inventory_y_offset + inv_y
+                    still_there = True
+
                     if is_fish:
                         pyautogui.moveTo(screen_x, screen_y, _pause=False)
                         time.sleep(0.05)
                         pyautogui.click(button='right', _pause=False)
-                        time.sleep(0.1)
+                        time.sleep(self._t_open_wait)
+                        pyautogui.moveTo(win_cx, win_cy, _pause=False)
 
-            # === Outside lock: check result and finish action ===
+                        time.sleep(self._t_open_wait)
+                        still_there = self._is_item_at_position(self.capture_inventory_area(), inv_x, inv_y)
 
-            if action == 'open':
-                time.sleep(0.1)
-                still_there = self._is_item_at_position(self.capture_inventory_area(), inv_x, inv_y)
-                if still_there:
-                    time.sleep(0.1)
-                    if self._is_item_at_position(self.capture_inventory_area(), inv_x, inv_y):
-                        self._ignored_positions.add((inv_x, inv_y))  # Dead fish
-
-            elif action == 'drop':
-                is_fish = '_living' in filename
-                if is_fish:
-                    time.sleep(0.1)
-                    still_there = self._is_item_at_position(self.capture_inventory_area(), inv_x, inv_y)
-                else:
-                    still_there = True
-
-                if still_there:
-                    drop_pos = self.config.get('drop_button_pos')
-                    confirm_pos = self.config.get('confirm_button_pos')
-                    if not confirm_pos:
-                        self._ignored_positions.add((inv_x, inv_y))
-                        return
-
-                    with input_lock:
-                        self.window_manager.activate_window(force_activate=True)
-                        win_left, win_top, win_width, win_height = self.window_manager.get_window_rect()
-                        screen_x = win_left + win_width - self._inventory_width + inv_x
-                        screen_y = win_top + self._inventory_y_offset + inv_y
-                        win_cx = win_left + win_width // 2
-                        win_cy = win_top + win_height // 2
+                    if still_there:
+                        drop_pos = self.config.get('drop_button_pos')
 
                         pyautogui.moveTo(screen_x, screen_y, _pause=False)
                         time.sleep(np.random.uniform(0.05, 0.07))
                         pyautogui.click(_pause=False)
-                        time.sleep(np.random.uniform(0.1, 0.15))
+                        time.sleep(self._t_drop_settle)
 
                         pyautogui.moveTo(win_cx, win_cy, _pause=False)
                         time.sleep(np.random.uniform(0.05, 0.07))
                         pyautogui.click(_pause=False)
-                        time.sleep(np.random.uniform(0.1, 0.15))
+                        time.sleep(self._t_drop_settle)
 
                         if drop_pos:
                             pyautogui.moveTo(win_left + drop_pos[0], win_top + drop_pos[1], _pause=False)
                             time.sleep(np.random.uniform(0.05, 0.07))
                             pyautogui.click(_pause=False)
-                            time.sleep(np.random.uniform(0.1, 0.15))
+                            time.sleep(self._t_drop_settle)
 
                         pyautogui.moveTo(win_left + confirm_pos[0], win_top + confirm_pos[1], _pause=False)
                         time.sleep(np.random.uniform(0.05, 0.07))
                         pyautogui.click(_pause=False)
-                        time.sleep(np.random.uniform(0.1, 0.15))
+                        time.sleep(self._t_drop_settle)
 
                         pyautogui.moveTo(win_cx, win_cy, _pause=False)
 
-                    time.sleep(np.random.uniform(0.1, 0.15))
-
-                    # If drop failed (item still present), add to ignored to avoid infinite loop
-                    if self._is_item_at_position(self.capture_inventory_area(), inv_x, inv_y):
-                        self._ignored_positions.add((inv_x, inv_y))
+                        # Verify drop succeeded while still holding lock
+                        time.sleep(self._t_drop_settle)
+                        if self._is_item_at_position(self.capture_inventory_area(), inv_x, inv_y):
+                            self._ignored_positions.add((inv_x, inv_y))
 
         except Exception as e:
             if self.on_status_update:
@@ -1706,11 +1655,22 @@ class FishingBot:
         # the first page that still has empty slots.
         self._startup_scan_and_process_all_pages()
 
+        _was_paused = False
+
         while self.running and self.bait_counter > 0:
             if self.paused:
+                _was_paused = True
                 time.sleep(0.1)
                 continue
-            
+
+            if _was_paused:
+                _was_paused = False
+                if self.on_status_update:
+                    self.on_status_update(f"[W{self.bot_id+1}] Resumed — re-scanning inventory...")
+                self._startup_scan_and_process_all_pages()
+                if not self.running:
+                    break
+
             try:
                 self.bait_and_cast()
                 
@@ -1742,9 +1702,10 @@ class FishingBot:
                     
                     while self.running and minigame_active:
                         if self.paused:
+                            _was_paused = True
                             time.sleep(0.1)
                             continue
-                        
+
                         # Small delay between attempts (minimized for responsiveness)
                         if human_like:
                             time.sleep(np.random.uniform(self._t_human_mn, self._t_human_mx))
@@ -1789,6 +1750,7 @@ class FishingBot:
                             wait_end = time.time() + wait_time
                             while time.time() < wait_end and self.running:
                                 if self.paused:
+                                    _was_paused = True
                                     time.sleep(0.1)
                                     continue
                                 time.sleep(0.05)
@@ -1831,6 +1793,7 @@ class FishingBot:
                     
                     # Handle pause before reeling in
                     while self.paused and self.running:
+                        _was_paused = True
                         time.sleep(0.1)
                     if not self.running:
                         break
@@ -1868,6 +1831,7 @@ class FishingBot:
                             wait_end = time.time() + 0.5
                             while time.time() < wait_end and self.running:
                                 if self.paused:
+                                    _was_paused = True
                                     time.sleep(0.1)
                                     continue
                                 time.sleep(0.05)
@@ -1880,6 +1844,7 @@ class FishingBot:
                             wait_end = time.time() + wait_time
                             while time.time() < wait_end and self.running:
                                 if self.paused:
+                                    _was_paused = True
                                     time.sleep(0.1)
                                     continue
                                 time.sleep(0.05)

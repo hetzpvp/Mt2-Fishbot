@@ -1,6 +1,6 @@
 """
 Debug UI windows for the Fishing Bot
-StatusLogWindow, IgnoredPositionsWindow, and FishDetectorDebugWindow
+StatusLogWindow, IgnoredPositionsWindow, FishDetectorDebugWindow, and InventoryDetectionDebugWindow
 """
 
 import time
@@ -637,6 +637,203 @@ class FishDetectorDebugWindow(DebugWindow):
             status_msg.append(f"Classic fish: searching ({best_match_val:.2f})")
 
         viz_frame[:] = overlay
+
+    def destroy(self):
+        if self._update_loop_id and self.window:
+            self.window.after_cancel(self._update_loop_id)
+        super().destroy()
+
+
+class InventoryDetectionDebugWindow(DebugWindow):
+    """Debug window that shows what items the bot detects in the inventory.
+
+    Displays the captured inventory area with overlaid detection results:
+      - Green box + label  : best match (highest confidence)
+      - Orange boxes       : other candidates >= 0.60
+      - Red circles        : ignored positions (dead fish / already processed)
+      - Cyan circles       : known empty slots
+    A text panel below shows each candidate's filename, confidence, and action.
+    """
+
+    _REFRESH_MS = 1500  # refresh interval
+
+    def __init__(self, parent: tk.Misc, bot):
+        super().__init__(parent)
+        self.bot = bot
+        self._update_loop_id = None
+        self._photo = None
+        self._sct = mss()
+        self._create_window()
+        self._schedule_update()
+
+    def _create_window(self):
+        bot_id = self.bot.bot_id
+        self.window = tk.Toplevel(self.parent)
+        self.window.title(f"Inventory Detection Debug [W{bot_id + 1}]")
+        self.window.geometry("370x650")
+        self.window.resizable(True, True)
+        self._apply_icon()
+
+        self.canvas = tk.Canvas(self.window, width=340, height=480, bg="black")
+        self.canvas.pack(padx=5, pady=5)
+
+        self.text_var = tk.StringVar(value="Waiting for inventory capture…")
+        tk.Label(
+            self.window,
+            textvariable=self.text_var,
+            justify=tk.LEFT,
+            anchor="nw",
+            font=("Courier", 9),
+            bg="#1e1e1e",
+            fg="#e0e0e0",
+            wraplength=360,
+        ).pack(fill=tk.X, padx=5, pady=(0, 5))
+
+        self.window.protocol("WM_DELETE_WINDOW", self.hide)
+
+    def _schedule_update(self):
+        if self.window:
+            self._update_loop_id = self.window.after(self._REFRESH_MS, self._tick)
+
+    def _tick(self):
+        if not self.window:
+            return
+        try:
+            self._update_display()
+        except Exception as e:
+            if DEBUG_PRINTS:
+                print(f"[InventoryDetectionDebugWindow] tick error: {e}")
+        self._schedule_update()
+
+    def _update_display(self):
+        bot = self.bot
+        inv_frame = bot.capture_inventory_area()
+        if inv_frame is None or inv_frame.size == 0:
+            self.text_var.set("No inventory frame captured.")
+            return
+
+        overlay = inv_frame.copy()
+        inv_h, inv_w = overlay.shape[:2]
+
+        fish_actions = bot.config.get('fish_actions', {})
+        ignored = set(bot._ignored_positions)
+        empty_slots = list(bot._empty_slot_positions)
+
+        # --- Run every template against the inventory, collect all raw hits >= 0.50 ---
+        templates = bot._load_template_cache()
+        inventory_gray = cv2.cvtColor(inv_frame, cv2.COLOR_BGR2GRAY)
+        RAW_THRESHOLD = 0.70   # only show confident matches
+        CLUSTER_DIST = 15      # px — hits this close belong to the same slot
+
+        # raw_hits: list of (filename, cx, cy, confidence)
+        raw_hits = []
+        for filename, (template, half_w, half_h) in templates.items():
+            t_h, t_w = template.shape
+            if t_h > inv_h or t_w > inv_w:
+                continue
+            try:
+                result = cv2.matchTemplate(inventory_gray, template, cv2.TM_CCOEFF_NORMED)
+                result_copy = result.copy()
+                while True:
+                    _, max_val, _, max_loc = cv2.minMaxLoc(result_copy)
+                    if max_val < RAW_THRESHOLD:
+                        break
+                    cx = max_loc[0] + half_w
+                    cy = max_loc[1] + half_h
+                    raw_hits.append((filename, cx, cy, max_val))
+                    mx1 = max(0, max_loc[0] - t_w // 2)
+                    my1 = max(0, max_loc[1] - t_h // 2)
+                    mx2 = min(result_copy.shape[1], max_loc[0] + t_w // 2 + 1)
+                    my2 = min(result_copy.shape[0], max_loc[1] + t_h // 2 + 1)
+                    result_copy[my1:my2, mx1:mx2] = -1.0
+            except Exception:
+                continue
+
+        # --- Cluster raw hits into per-slot groups ---
+        # Each slot is represented by its centroid (mean of member positions).
+        # For each slot we keep ALL template scores so we can show a ranked list.
+        slots = []  # list of { 'cx': int, 'cy': int, 'hits': [(fname, conf), ...] }
+        for fname, cx, cy, conf in raw_hits:
+            matched = None
+            for slot in slots:
+                if abs(cx - slot['cx']) < CLUSTER_DIST and abs(cy - slot['cy']) < CLUSTER_DIST:
+                    matched = slot
+                    break
+            if matched is None:
+                slots.append({'cx': cx, 'cy': cy, 'hits': [(fname, conf)]})
+            else:
+                matched['hits'].append((fname, conf))
+                # Update centroid toward new point (running average)
+                n = len(matched['hits'])
+                matched['cx'] = (matched['cx'] * (n - 1) + cx) // n
+                matched['cy'] = (matched['cy'] * (n - 1) + cy) // n
+
+        # Sort each slot's hits by confidence descending → best match is first
+        for slot in slots:
+            slot['hits'].sort(key=lambda h: h[1], reverse=True)
+
+        # Sort slots top-to-bottom, left-to-right for the text panel
+        slots.sort(key=lambda s: (s['cy'] // 30, s['cx']))
+
+        # --- Draw overlays ---
+        BOX = 14
+
+        # Empty slots — cyan circles
+        for ex, ey in empty_slots:
+            cv2.circle(overlay, (ex, ey), 8, (255, 255, 0), 2)
+
+        # Ignored positions — red circles
+        for ix, iy in ignored:
+            cv2.circle(overlay, (ix, iy), 10, (0, 0, 255), 2)
+            cv2.putText(overlay, "X", (ix - 5, iy + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
+
+        # Each detected slot — box + best-match label
+        for slot in slots:
+            cx, cy = slot['cx'], slot['cy']
+            best_fname, best_conf = slot['hits'][0]
+
+            is_ignored = any(abs(cx - ix) < CLUSTER_DIST and abs(cy - iy) < CLUSTER_DIST
+                             for ix, iy in ignored)
+
+            if is_ignored:
+                color = (60, 60, 200)   # dim red-ish — already processed
+            elif best_conf >= 0.85:
+                color = (0, 220, 0)     # green — high confidence
+            else:
+                color = (0, 165, 255)   # orange — medium confidence (0.70–0.84)
+
+            cv2.rectangle(overlay, (cx - BOX, cy - BOX), (cx + BOX, cy + BOX), color, 2)
+            label = f"{best_fname} {best_conf:.2f}"
+            cv2.putText(overlay, label, (max(0, cx - BOX), max(10, cy - BOX - 4)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.32, color, 1)
+
+        # --- Resize overlay to fit canvas (340 wide) ---
+        scale = min(340 / max(inv_w, 1), 480 / max(inv_h, 1))
+        disp_w = max(1, int(inv_w * scale))
+        disp_h = max(1, int(inv_h * scale))
+        display = cv2.resize(overlay, (disp_w, disp_h), interpolation=cv2.INTER_NEAREST)
+        display_rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(display_rgb)
+        self._photo = ImageTk.PhotoImage(image=img)
+        self.canvas.config(width=disp_w, height=disp_h)
+        self.canvas.create_image(0, 0, anchor=tk.NW, image=self._photo)
+
+        # --- Text panel: one row per slot, ranked by confidence ---
+        lines = [f"Slots detected: {len(slots)}  |  ignored: {len(ignored)}  |  empty: {len(empty_slots)}"]
+        for slot in slots:
+            cx, cy = slot['cx'], slot['cy']
+            is_ignored = any(abs(cx - ix) < CLUSTER_DIST and abs(cy - iy) < CLUSTER_DIST
+                             for ix, iy in ignored)
+            flag = " [IGN]" if is_ignored else ""
+            best_fname, best_conf = slot['hits'][0]
+            action = fish_actions.get(best_fname, 'keep')
+            lines.append(f"({cx:3d},{cy:3d}) {best_fname:<22} {best_conf:.2f}  {action}{flag}")
+            # Show runner-up candidates for this slot (up to 3)
+            for runner_fname, runner_conf in slot['hits'][1:4]:
+                lines.append(f"         ↳ {runner_fname:<22} {runner_conf:.2f}")
+
+        self.text_var.set("\n".join(lines) if lines else "No items detected.")
 
     def destroy(self):
         if self._update_loop_id and self.window:

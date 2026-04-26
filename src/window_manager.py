@@ -15,6 +15,8 @@ class WindowManager:
     
     def __init__(self):
         self.selected_window = None
+        self._rect_cache = None
+        self._rect_cache_time = 0.0
     
     @staticmethod
     def get_all_windows() -> List[Tuple[str, gw.Win32Window]]:
@@ -111,20 +113,35 @@ class WindowManager:
                 print(f"Error activating window: {e}")
     
     def get_window_rect(self) -> Tuple[int, int, int, int]:
-        """Gets the selected window's position and size (left, top, width, height)"""
+        """Gets the selected window's position and size (left, top, width, height).
+        Cached for 50ms — pygetwindow does a Win32 GetWindowRect on every attribute
+        access, so without caching this costs 4 syscalls per invocation and is
+        hit on every detection cycle."""
         if not self.selected_window:
             return (0, 0, 0, 0)
-        
+
+        now = time.perf_counter()
+        if now - self._rect_cache_time < 0.050 and self._rect_cache is not None:
+            return self._rect_cache
+
         try:
             left = self.selected_window.left
             top = self.selected_window.top
             width = self.selected_window.width
             height = self.selected_window.height
-            return (left, top, width, height)
+            rect = (left, top, width, height)
+            self._rect_cache = rect
+            self._rect_cache_time = now
+            return rect
         except Exception as e:
             if DEBUG_PRINTS:
                 print(f"Error getting window rect: {e}")
-            return (0, 0, 0, 0)
+            return self._rect_cache if self._rect_cache is not None else (0, 0, 0, 0)
+
+    def invalidate_rect_cache(self):
+        """Forces the next get_window_rect() to refetch (e.g. after move/resize)."""
+        self._rect_cache = None
+        self._rect_cache_time = 0.0
 
 
 @dataclass

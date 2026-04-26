@@ -22,9 +22,11 @@ class FishDetector:
     _boundingRect = cv2.boundingRect
     _contourArea = cv2.contourArea
     _moments = cv2.moments
+    _connectedComponentsWithStats = cv2.connectedComponentsWithStats
     _COLOR_BGR2HSV = cv2.COLOR_BGR2HSV
     _RETR_EXTERNAL = cv2.RETR_EXTERNAL
     _CHAIN_APPROX_SIMPLE = cv2.CHAIN_APPROX_SIMPLE
+    _CC_STAT_AREA = cv2.CC_STAT_AREA
     
     def __init__(self):
         # HSV color range for fish (blue-ish) - use dtype for faster comparison
@@ -66,30 +68,29 @@ class FishDetector:
         cvtColor = FishDetector._cvtColor
         inRange = FishDetector._inRange
         countNonZero = FishDetector._countNonZero
-        findContours = FishDetector._findContours
-        contourArea = FishDetector._contourArea
-        moments = FishDetector._moments
-        
+        ccStats = FishDetector._connectedComponentsWithStats
+        AREA = FishDetector._CC_STAT_AREA
+
         hsv = cvtColor(frame, FishDetector._COLOR_BGR2HSV)
-        
+
         # Check window first - early exit if not active.
         # A fully visible minigame window produces ~10000+ cyan pixels; below this
         # threshold we treat it as absent to avoid false positives on small reflections.
         window_mask = inRange(hsv, self.window_color_lower, self.window_color_upper)
         if countNonZero(window_mask) <= 10000:
             return (False, None)
-        
-        # Find fish using same HSV
+
+        # Find fish blob using connected components — single C call returns centroids
+        # and areas directly. Avoids the contour-list allocation + Python max(key=...)
+        # of the previous findContours/contourArea/moments path.
         fish_mask = inRange(hsv, self.fish_color_lower, self.fish_color_upper)
-        contours, _ = findContours(fish_mask, FishDetector._RETR_EXTERNAL, FishDetector._CHAIN_APPROX_SIMPLE)
-        
-        if not contours:
+        num_labels, _, stats, centroids = ccStats(fish_mask, connectivity=8)
+
+        if num_labels <= 1:
             return (True, None)
-        
-        largest_contour = max(contours, key=contourArea)
-        M = moments(largest_contour)
-        m00 = M["m00"]
-        if m00 != 0:
-            return (True, (int(M["m10"] / m00), int(M["m01"] / m00)))
-        
-        return (True, None)
+
+        # Label 0 is background; find largest foreground blob via numpy argmax on areas
+        areas = stats[1:, AREA]
+        largest_idx = int(areas.argmax()) + 1
+        cx, cy = centroids[largest_idx]
+        return (True, (int(cx), int(cy)))

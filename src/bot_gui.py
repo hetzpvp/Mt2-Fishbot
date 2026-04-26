@@ -23,7 +23,7 @@ except ImportError:
 from utils import get_resource_path, MAX_WINDOWS, DEBUG_MODE_EN, DEBUG_PRINTS, load_window_icon
 from window_manager import WindowManager
 from fishing_bot import FishingBot
-from debug_ui import IgnoredPositionsWindow, FishDetectorDebugWindow, StatusLogWindow
+from debug_ui import IgnoredPositionsWindow, FishDetectorDebugWindow, StatusLogWindow, InventoryDetectionDebugWindow
 
 
 class FishSelectionWindow:
@@ -596,7 +596,7 @@ class TimingSettingsWindow:
 class BotGUI:
     """GUI for the fishing bot - supports up to 8 simultaneous windows"""
     
-    BOT_VERSION = "1.1"  # Version for config validation and GUI display
+    BOT_VERSION = "1.1.1"  # Version for config validation and GUI display
     ACCENT_COLOR = "#FFBB00"  # Gold color used throughout the GUI
     
     def __init__(self):
@@ -639,6 +639,7 @@ class BotGUI:
         self.window_stats: Dict[int, dict] = {}  # bot_id -> {hits, games, bait}
         self.ignored_positions_windows: Dict[int, IgnoredPositionsWindow] = {}  # bot_id -> IgnoredPositionsWindow
         self.fish_detector_debug_windows: Dict[int, FishDetectorDebugWindow] = {}  # bot_id -> FishDetectorDebugWindow
+        self.inventory_detection_debug_windows: Dict[int, InventoryDetectionDebugWindow] = {}  # bot_id -> InventoryDetectionDebugWindow
         
         # Global keyboard listener for F5 pause
         self.global_key_listener = None
@@ -1119,6 +1120,7 @@ class BotGUI:
                                     font=("Courier New", 8),
                                     bg="#666666", fg=BotGUI.ACCENT_COLOR,
                                     activebackground="#777777",
+                                    disabledforeground="black",
                                     cursor="hand2",
                                     padx=5, pady=1)
         self.timing_btn.pack(anchor=tk.W, pady=(3, 0))
@@ -1268,6 +1270,7 @@ class BotGUI:
                              font=("Courier New", 8),
                              bg="#666666", fg=BotGUI.ACCENT_COLOR,
                              activebackground="#777777",
+                             disabledforeground="black",
                              cursor="hand2",
                              padx=4, pady=1,
                              width=8)
@@ -2610,6 +2613,7 @@ class BotGUI:
             if DEBUG_MODE_EN:
                 self.ignored_positions_windows[bot_id] = IgnoredPositionsWindow(self.root, bot)
                 self.fish_detector_debug_windows[bot_id] = FishDetectorDebugWindow(self.root, bot)
+                self.inventory_detection_debug_windows[bot_id] = InventoryDetectionDebugWindow(self.root, bot)
             
             # Start bot thread
             thread = threading.Thread(target=bot.start, daemon=True)
@@ -2745,6 +2749,10 @@ class BotGUI:
         if hasattr(self, 'timing_btn'):
             self.timing_btn.config(state=state)
 
+        # Inventory page tab coord buttons
+        for _btn in getattr(self, 'inv_page_btns', {}).values():
+            _btn.config(state=state)
+
         # Refresh Windows button
         if hasattr(self, 'refresh_windows_btn'):
             self.refresh_windows_btn.config(state=state)
@@ -2765,7 +2773,12 @@ class BotGUI:
         if bot_id in self.fish_detector_debug_windows:
             self.fish_detector_debug_windows[bot_id].destroy()
             del self.fish_detector_debug_windows[bot_id]
-        
+
+        # Destroy inventory detection debug window
+        if bot_id in self.inventory_detection_debug_windows:
+            self.inventory_detection_debug_windows[bot_id].destroy()
+            del self.inventory_detection_debug_windows[bot_id]
+
         # Remove from active bots
         if bot_id in self.bots:
             del self.bots[bot_id]
@@ -2824,7 +2837,14 @@ class BotGUI:
                 window.destroy()
             except:
                 pass
-        
+
+        # Destroy all inventory detection debug windows
+        for window in self.inventory_detection_debug_windows.values():
+            try:
+                window.destroy()
+            except:
+                pass
+
         self.save_config()
         self.root.destroy()
     
