@@ -137,7 +137,7 @@ Free fishing minigame bot for Metin2. No subscriptions, no licenses.
 
 ## Version History
 - **v1.1.1 (Latest)** — Performance improvements.
-- **v1.1  ** — Multi-page inventory management, configurable timing settings, improved auto-drop stability
+- **v1.1**   — Multi-page inventory management, configurable timing settings, improved auto-drop stability
 - **v1.0.5** — Redesigned GUI with better layout
 - **v1.0.4** — Bug fixes for goldfish/zander detection, improved drop reliability
 - **v1.0.3** — Fish drop mechanism implementation
