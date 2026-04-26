@@ -21,7 +21,7 @@ Free fishing minigame bot for Metin2. No subscriptions, no licenses.
 
 ## Download
 
-**Latest Version:** 1.1 (2024)
+**Latest Version:** 1.1 (2026)
 
 ---
 
