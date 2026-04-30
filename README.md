@@ -1,4 +1,4 @@
-# MT2 Fishing Bot — v1.2
+# MT2 Fishing Bot — v1.2.0
 **THIS PROJECT WAS BUILT FOR EDUCATIONAL AND LEARNING PURPOSES ONLY!**
 
 Free fishing minigame bot for Metin2. No subscriptions, no licenses.
@@ -21,7 +21,7 @@ Free fishing minigame bot for Metin2. No subscriptions, no licenses.
 
 ## Download
 
-**Latest Version:** 1.2 (2026)
+**Latest Version:** 1.2.0 (2026)
 
 ---
 
