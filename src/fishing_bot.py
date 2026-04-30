@@ -15,7 +15,6 @@ except Exception:
     pass  # Older Windows versions may not support this
 
 import os
-import threading
 import time
 from typing import Optional, Tuple, Dict
 
@@ -41,18 +40,27 @@ except ImportError:
     Controller = None
     Key = None
 
-from utils import get_resource_path, input_lock, play_rickroll_beep, DEBUG_PRINTS
+from utils import get_resource_path, input_lock, DEBUG_PRINTS
 from window_manager import WindowManager, GameRegion
 from fish_detector import FishDetector
+from humanize import Humanizer
+from input_backend import create_mouse_backend
 
 
 class FishingBot:
     """Main bot that plays the fishing minigame - one instance per game window"""
+    STOP_BAIT_DEPLETED = "bait_depleted"
+    STOP_MANUAL = "manual"
+    STOP_WINDOW_UNAVAILABLE = "window_unavailable"
+    STOP_INVENTORY_FULL = "inventory_full"
+    STOP_ERROR = "error"
     
     # Class-level template cache (shared by all bot instances - loaded only once)
     _template_cache = None
     _template_border_crop = 7  # Pixels to crop from each edge of templates
     _classic_fish_template = None  # Cache for classic fish detection template
+    _classic_fish_scaled_cache = None  # Pre-computed scaled variants (shared across calls)
+    _classic_fish_last_scale = None    # Last successful scale — tried first on next poll
     
     # Color templates for fish that look identical in grayscale
     _confusable_fish = {
@@ -87,6 +95,9 @@ class FishingBot:
         self.region_auto_calibrated = False
         self.consecutive_failures = 0
         self.bot_id = bot_id
+        self._manually_stopped = False  # Flag to track if user manually stopped the bot
+        self.stop_reason = None
+        self._stop_notified = False
         
         # Cached circle values for performance
         self._circle_center = None
@@ -106,6 +117,19 @@ class FishingBot:
         self.keyboard_controller = None
         if keyboard and Controller:
             self.keyboard_controller = Controller()
+
+        # Humanizer — wraps every mouse/keyboard call. When disabled, all wrappers
+        # forward directly to pyautogui/pynput (current behavior preserved).
+        self.mouse_backend = create_mouse_backend(
+            config,
+            status_callback=self.on_status_update,
+            bot_id=self.bot_id,
+        )
+        self.human = Humanizer(
+            enabled=bool(config.get('human_like_clicking', False)),
+            keyboard_controller=self.keyboard_controller,
+            mouse_backend=self.mouse_backend,
+        )
         
         # Inventory capture width (right side of window where items appear)
         self._inventory_width = 200
@@ -136,6 +160,37 @@ class FishingBot:
         self._t_drop_settle = config.get('timing_drop_settle',       0.120)
         self._t_qs_between  = config.get('timing_quickskip_between', 0.100)
         self._t_qs_after    = config.get('timing_quickskip_after',   0.100)
+
+    def _set_stop_reason(self, reason: str):
+        """Records the first reason this bot stopped."""
+        if self.stop_reason is None:
+            self.stop_reason = reason
+
+    def _notify_bot_stop_once(self):
+        """Runs the GUI stop callback at most once per bot lifetime."""
+        if self._stop_notified:
+            return
+        self._stop_notified = True
+        if self.on_bot_stop:
+            self.on_bot_stop(self.bot_id)
+
+    def _stop_bot(self, reason: str, status: str = None):
+        """Stops the worker and records why, without playing UI alerts."""
+        self._set_stop_reason(reason)
+        self.running = False
+        if status and self.on_status_update:
+            self.on_status_update(status)
+        self._notify_bot_stop_once()
+
+    def _stop_if_window_unavailable(self) -> bool:
+        """Stops cleanly if the selected game window has closed/crashed."""
+        if self.window_manager and self.window_manager.is_window_available():
+            return False
+        self._stop_bot(
+            self.STOP_WINDOW_UNAVAILABLE,
+            f"[W{self.bot_id+1}] Selected window is no longer available. Stopping bot."
+        )
+        return True
         
     def _load_template_cache(self) -> Dict[str, tuple]:
         """Loads all fish/item templates from assets folder into class-level cache.
@@ -217,7 +272,7 @@ class FishingBot:
         return FishingBot._color_template_cache
 
     def _load_empty_slot_template(self):
-        """Loads assets/empty_slot.jpg for empty inventory slot detection."""
+        """Loads assets/fishing/empty_slot.jpg for empty inventory slot detection."""
         if FishingBot._empty_slot_template is not None:
             return FishingBot._empty_slot_template
 
@@ -274,21 +329,39 @@ class FishingBot:
                 return []
 
             # Sort all candidates by score descending, then keep only those
-            # outside a 10px radius of any already-kept point (cheap NMS).
+            # outside a 10px radius of any already-kept point. A coarse spatial
+            # bucket index (>10 px) replaces the O(K^2) per-candidate scan over
+            # already-kept points with amortized O(1) lookups.
             scores = result[ys, xs]
             order = np.argsort(scores)[::-1]
 
+            BUCKET = 16
             kept = []
+            kept_buckets: dict = {}  # (bx, by) -> list of indices into kept
+            xs_arr = xs
+            ys_arr = ys
             for idx in order:
-                cx = int(xs[idx]) + half_w
-                cy = int(ys[idx]) + half_h
+                cx = int(xs_arr[idx]) + half_w
+                cy = int(ys_arr[idx]) + half_h
+                bx, by = cx // BUCKET, cy // BUCKET
                 dup = False
-                for ex, ey in kept:
-                    if abs(cx - ex) < 10 and abs(cy - ey) < 10:
-                        dup = True
+                for ddx in (-1, 0):
+                    for ddy in (-1, 0):
+                        cand = kept_buckets.get((bx + ddx, by + ddy))
+                        if not cand:
+                            continue
+                        for ki in cand:
+                            ex, ey = kept[ki]
+                            if abs(cx - ex) < 10 and abs(cy - ey) < 10:
+                                dup = True
+                                break
+                        if dup:
+                            break
+                    if dup:
                         break
                 if not dup:
                     kept.append((cx, cy))
+                    kept_buckets.setdefault((bx, by), []).append(len(kept) - 1)
 
             kept.sort(key=lambda p: (p[1] // 30, p[0]))
             return kept
@@ -365,6 +438,9 @@ class FishingBot:
     def capture_inventory_area(self) -> np.ndarray:
         """Captures the inventory area (right 270px of the game window, starting at y=300)."""
         try:
+            if self._stop_if_window_unavailable():
+                return np.zeros((100, 100, 3), dtype=np.uint8)
+
             if self.sct is None:
                 self.sct = mss()
             
@@ -412,6 +488,10 @@ class FishingBot:
         best_match = None
         best_confidence = CONFIDENCE_THRESHOLD  # Start at threshold (only accept better)
         
+        # Pre-extract the ignore set into a local list of (ix, iy) once — avoids
+        # paying the truthiness check + iterator setup inside the per-template loop.
+        ignored_list = list(ignore_positions) if ignore_positions else None
+
         for filename, (template, half_w, half_h) in templates.items():
             t_h, t_w = template.shape
 
@@ -421,51 +501,81 @@ class FishingBot:
 
             try:
                 result = match_template(inventory_gray, template, TM_CCOEFF_NORMED)
-                result_copy = result.copy()
 
-                # Try to find first non-ignored match for this template
+                # Cheap upfront peak check — avoids result.copy() (full-array
+                # allocation) and the iterative masking loop when this template
+                # has nothing above the current best, or nothing at all.
+                _, peak_val, _, peak_loc = minMaxLoc(result)
+                if peak_val <= best_confidence:
+                    continue
+
+                pt_x, pt_y = peak_loc
+                center_x = pt_x + half_w
+                center_y = pt_y + half_h
+
+                # Fast-path: top match isn't in the ignore set → take it directly,
+                # skip the result.copy() + iterative-minMaxLoc loop entirely.
+                top_ignored = False
+                if ignored_list is not None:
+                    for ix, iy in ignored_list:
+                        if abs(center_x - ix) < 10 and abs(center_y - iy) < 10:
+                            top_ignored = True
+                            break
+
+                if not top_ignored:
+                    matched_filename = filename
+                    if filename in confusable_fish:
+                        matched_filename = self._disambiguate_confusable_fish(
+                            inventory_frame, center_x, center_y, filename
+                        )
+                    best_confidence = peak_val
+                    best_match = (matched_filename, (center_x, center_y))
+                    if best_confidence >= EARLY_EXIT_THRESHOLD and filename not in confusable_fish:
+                        return best_match
+                    continue  # Move to next template
+
+                # Slow path: top match is ignored — fall back to iterative
+                # minMaxLoc with masking to find the next-best non-ignored hit
+                # within this template's response map.
+                result_copy = result.copy()
+                # Mask the already-rejected peak before re-scanning
+                mask_x1 = max(0, pt_x - (t_w >> 1))
+                mask_y1 = max(0, pt_y - (t_h >> 1))
+                mask_x2 = min(result_copy.shape[1], pt_x + (t_w >> 1) + 1)
+                mask_y2 = min(result_copy.shape[0], pt_y + (t_h >> 1) + 1)
+                result_copy[mask_y1:mask_y2, mask_x1:mask_x2] = -1.0
+
                 while True:
                     _, max_val, _, max_loc = minMaxLoc(result_copy)
-
-                    # Stop if no more good matches
-                    if max_val <= 0.5:
+                    if max_val <= best_confidence:
                         break
 
                     pt_x, pt_y = max_loc
                     center_x = pt_x + half_w
                     center_y = pt_y + half_h
 
-                    # Check if this match is in ignore list
                     is_ignored = False
-                    if ignore_positions:
-                        for ix, iy in ignore_positions:
-                            if abs(center_x - ix) < 10 and abs(center_y - iy) < 10:
-                                is_ignored = True
-                                break
+                    for ix, iy in ignored_list:
+                        if abs(center_x - ix) < 10 and abs(center_y - iy) < 10:
+                            is_ignored = True
+                            break
 
-                    # If not ignored and better than current best, accept it
-                    if not is_ignored and max_val > best_confidence:
-                        best_confidence = max_val
+                    if not is_ignored:
                         matched_filename = filename
-
-                        # Disambiguate confusable fish using color comparison
                         if filename in confusable_fish:
                             matched_filename = self._disambiguate_confusable_fish(
                                 inventory_frame, center_x, center_y, filename
                             )
-
+                        best_confidence = max_val
                         best_match = (matched_filename, (center_x, center_y))
-
-                        # Early exit on near-perfect match (but NOT for confusable fish)
                         if best_confidence >= EARLY_EXIT_THRESHOLD and filename not in confusable_fish:
                             return best_match
-                        break  # Found good match for this template, move to next template
+                        break
 
-                    # Mask out this match to try next one within same template
-                    mask_x1 = max(0, pt_x - t_w // 2)
-                    mask_y1 = max(0, pt_y - t_h // 2)
-                    mask_x2 = min(result_copy.shape[1], pt_x + t_w // 2 + 1)
-                    mask_y2 = min(result_copy.shape[0], pt_y + t_h // 2 + 1)
+                    mask_x1 = max(0, pt_x - (t_w >> 1))
+                    mask_y1 = max(0, pt_y - (t_h >> 1))
+                    mask_x2 = min(result_copy.shape[1], pt_x + (t_w >> 1) + 1)
+                    mask_y2 = min(result_copy.shape[0], pt_y + (t_h >> 1) + 1)
                     result_copy[mask_y1:mask_y2, mask_x1:mask_x2] = -1.0
 
             except Exception:
@@ -605,11 +715,11 @@ class FishingBot:
                     if self.on_status_update:
                         self.on_status_update(f"[W{self.bot_id+1}] Opening: {fish_name}")
 
-                    pyautogui.moveTo(screen_x, screen_y, _pause=False)
-                    time.sleep(0.05)
-                    pyautogui.click(button='right', _pause=False)
-                    time.sleep(self._t_open_wait)
-                    pyautogui.moveTo(win_center_x, win_center_y, _pause=False)
+                    self.human.move_to(screen_x, screen_y)
+                    self.human.sleep(0.05)
+                    self.human.click(button='right')
+                    self.human.sleep(self._t_open_wait)
+                    self.human.move_to(win_center_x, win_center_y)
 
                     # Verify while still holding the lock (no other bot can interfere)
                     time.sleep(self._t_open_wait)
@@ -657,11 +767,11 @@ class FishingBot:
 
                     if is_fish:
                         # Right-click to test if fish can be opened
-                        pyautogui.moveTo(screen_x, screen_y, _pause=False)
-                        time.sleep(0.05)
-                        pyautogui.click(button='right', _pause=False)
-                        time.sleep(self._t_open_wait)
-                        pyautogui.moveTo(win_center_x, win_center_y, _pause=False)
+                        self.human.move_to(screen_x, screen_y)
+                        self.human.sleep(0.05)
+                        self.human.click(button='right')
+                        self.human.sleep(self._t_open_wait)
+                        self.human.move_to(win_center_x, win_center_y)
 
                         # Check result while still holding the lock
                         time.sleep(self._t_open_wait)
@@ -670,28 +780,28 @@ class FishingBot:
 
                     if still_there:
                         # ========== DROP SEQUENCE (all inside lock) ==========
-                        pyautogui.moveTo(screen_x, screen_y, _pause=False)
-                        time.sleep(0.05)
-                        pyautogui.click(_pause=False)
-                        time.sleep(self._t_drop_settle)
+                        self.human.move_to(screen_x, screen_y)
+                        self.human.sleep(0.05)
+                        self.human.click()
+                        self.human.sleep(self._t_drop_settle)
 
-                        pyautogui.moveTo(win_center_x, win_center_y, _pause=False)
-                        time.sleep(0.05)
-                        pyautogui.click(_pause=False)
-                        time.sleep(self._t_drop_settle)
+                        self.human.move_to(win_center_x, win_center_y)
+                        self.human.sleep(0.05)
+                        self.human.click()
+                        self.human.sleep(self._t_drop_settle)
 
                         if drop_pos:
-                            pyautogui.moveTo(win_left + drop_pos[0], win_top + drop_pos[1], _pause=False)
-                            time.sleep(0.05)
-                            pyautogui.click(_pause=False)
-                            time.sleep(self._t_drop_settle)
+                            self.human.move_to(win_left + drop_pos[0], win_top + drop_pos[1])
+                            self.human.sleep(0.05)
+                            self.human.click()
+                            self.human.sleep(self._t_drop_settle)
 
-                        pyautogui.moveTo(win_left + confirm_pos[0], win_top + confirm_pos[1], _pause=False)
-                        time.sleep(0.05)
-                        pyautogui.click(_pause=False)
-                        time.sleep(self._t_drop_settle)
+                        self.human.move_to(win_left + confirm_pos[0], win_top + confirm_pos[1])
+                        self.human.sleep(0.05)
+                        self.human.click()
+                        self.human.sleep(self._t_drop_settle)
 
-                        pyautogui.moveTo(win_center_x, win_center_y, _pause=False)
+                        self.human.move_to(win_center_x, win_center_y)
             # ========== LOCK RELEASED ==========
 
             # Page-switch if needed — acquires its own lock internally
@@ -713,6 +823,9 @@ class FishingBot:
     def capture_full_window(self) -> np.ndarray:
         """Captures the entire game window for initial detection."""
         try:
+            if self._stop_if_window_unavailable():
+                return np.zeros((100, 100, 3), dtype=np.uint8)
+
             if self.sct is None:
                 self.sct = mss()
             
@@ -735,6 +848,11 @@ class FishingBot:
     def capture_screen(self) -> np.ndarray:
         """Captures the game region as a numpy array for processing."""
         try:
+            if self._stop_if_window_unavailable():
+                if self.region:
+                    return np.zeros((self.region.height, self.region.width, 3), dtype=np.uint8)
+                return np.zeros((100, 100, 3), dtype=np.uint8)
+
             if self.sct is None:
                 self.sct = mss()
 
@@ -766,6 +884,10 @@ class FishingBot:
     def atomic_capture_and_click(self) -> Tuple[bool, Optional[Tuple[int, int]]]:
         """Captures screen and clicks fish if in circle. Optimized single-pass detection.
         Returns: (minigame_active, fish_position_clicked or None)"""
+        # Check pause state before starting any operation
+        if self.paused:
+            return (True, None)
+
         # Local references for speed
         capture = self.capture_screen
         detect = self.detector.detect_window_and_fish
@@ -793,9 +915,18 @@ class FishingBot:
                 self._consecutive_lock_acquisitions = 0
                 return (True, None)
             
+            # Check pause again before acquiring lock
+            if self.paused:
+                return (True, None)
+
             # Fish is in circle! Now get lock and click
             # ========== PHASE 2: Fresh capture + click (WITH LOCK) ==========
             with input_lock:
+                # Check pause inside lock before any actions
+                if self.paused:
+                    self._consecutive_lock_acquisitions = 0
+                    return (True, None)
+
                 # Activate window
                 self.window_manager.activate_window(force_activate=True)
                 
@@ -817,17 +948,22 @@ class FishingBot:
                     self._consecutive_lock_acquisitions = 0
                     return (True, None)
                 
+                # Check pause one final time before clicking
+                if self.paused:
+                    self._consecutive_lock_acquisitions = 0
+                    return (True, None)
+
                 # Click at FRESH position
                 win_left, win_top, _, _ = self.window_manager.get_window_rect()
                 screen_x = win_left + region_left + fx
                 screen_y = win_top + region_top + fy
                 
-                # Optimized click sequence (uses pre-cached timing vars, no config reads here)
-                pyautogui.moveTo(screen_x, screen_y, _pause=False)
+                # Click sequence — uses the full humanized path (curved, 130-750ms).
+                # When the human-like setting is OFF, move_to falls through to instant
+                # pyautogui.moveTo so the minigame hit path stays as fast as before.
+                self.human.move_to(screen_x, screen_y)
                 time.sleep(self._t_cursor)
-                pyautogui.mouseDown(_pause=False)
-                time.sleep(self._t_hold)
-                pyautogui.mouseUp(_pause=False)
+                self.human.click(hold=self._t_hold)
                 # mouseUp is already sent to the OS — release lock immediately
                 self._consecutive_lock_acquisitions += 1
             # ========== LOCK RELEASED ==========
@@ -854,7 +990,7 @@ class FishingBot:
             return '1'
         
         num_keys = len(self.bait_keys)
-        bait_per_key = 200
+        bait_per_key = self.config.get("bait_quantity", 200)
         
         # Calculate which key index to use based on bait count
         # Keys are used from first to last as bait depletes
@@ -869,9 +1005,19 @@ class FishingBot:
     def get_tier_thresholds(self) -> list:
         """Returns list of tier thresholds based on selected keys."""
         num_keys = len(self.bait_keys)
+        bait_per_key = self.config.get("bait_quantity", 200)
         # Create thresholds: e.g., for 4 keys: [600, 400, 200, 0]
-        return [(num_keys - i - 1) * 200 for i in range(num_keys)]
+        return [(num_keys - i - 1) * bait_per_key for i in range(num_keys)]
     
+    def _click_page_tab(self, screen_x: int, screen_y: int):
+        """Clicks an inventory page tab reliably.
+        Uses explicit mouseDown + hold + mouseUp (instead of the instant click()
+        call) so the game's UI overlay has time to register the press. Must be
+        called while holding input_lock with the target window already activated."""
+        self.human.move_to(screen_x, screen_y)
+        self.human.sleep(0.10)            # cursor settle
+        self.human.click(hold=0.05)       # hold — game needs to see the down event
+
     def adjust_bait_tier(self):
         """Adjusts bait counter to next lower tier when 2 consecutive failures occur."""
         thresholds = self.get_tier_thresholds()
@@ -902,13 +1048,13 @@ class FishingBot:
         with input_lock:
             try:
                 self.window_manager.activate_window()
-                time.sleep(self._t_key_set)
+                self.human.sleep(self._t_key_set)
                 self.keyboard_controller.press(Key.ctrl)
-                time.sleep(self._t_key_hold)
+                self.human.sleep(self._t_key_hold)
                 self.keyboard_controller.press(key)
-                time.sleep(self._t_key_hold)
+                self.human.sleep(self._t_key_hold)
                 self.keyboard_controller.release(key)
-                time.sleep(self._t_key_hold)
+                self.human.sleep(self._t_key_hold)
                 self.keyboard_controller.release(Key.ctrl)
             except Exception as e:
                 if self.on_status_update:
@@ -925,20 +1071,16 @@ class FishingBot:
         with input_lock:
             try:
                 self.window_manager.activate_window()
-                time.sleep(self._t_key_set)
+                self.human.sleep(self._t_key_set)
 
                 pynput_bait = key_map.get(bait_key.upper() if len(bait_key) > 1 else bait_key, key_map.get(bait_key, bait_key))
-                self.keyboard_controller.press(pynput_bait)
-                time.sleep(self._t_key_hold)
-                self.keyboard_controller.release(pynput_bait)
+                self.human.tap_key(pynput_bait, hold=self._t_key_hold)
                 if self.on_status_update:
                     self.on_status_update(f"[W{self.bot_id+1}] Pressed key {bait_key}")
 
-                time.sleep(self._t_interkey)
+                self.human.sleep(self._t_interkey)
 
-                self.keyboard_controller.press(Key.space)
-                time.sleep(self._t_key_hold)
-                self.keyboard_controller.release(Key.space)
+                self.human.tap_key(Key.space, hold=self._t_key_hold)
                 if self.on_status_update:
                     self.on_status_update(f"[W{self.bot_id+1}] Cast fishing line")
             except Exception as e:
@@ -984,9 +1126,9 @@ class FishingBot:
                 screen_y = win_top + armor_pos[1]
                 
                 # Right-click on armor slot
-                pyautogui.moveTo(screen_x, screen_y, _pause=False)
+                self.human.move_to(screen_x, screen_y)
                 time.sleep(np.random.uniform(0.2, 0.25))  # cursor settle + human-like jitter
-                pyautogui.click(button='right', _pause=False)
+                self.human.click(button='right')
                 # click() already sent to OS — release lock now
             # ========== LOCK RELEASED ==========
             time.sleep(np.random.uniform(0.05, 0.07))  # animation settle outside lock
@@ -1005,13 +1147,11 @@ class FishingBot:
         with input_lock:
             try:
                 self.window_manager.activate_window()
-                time.sleep(self._t_key_set)
+                self.human.sleep(self._t_key_set)
 
                 pynput_key = key_map.get(key.upper() if len(key) > 1 else key, key_map.get(key, key))
 
-                self.keyboard_controller.press(pynput_key)
-                time.sleep(self._t_key_hold)
-                self.keyboard_controller.release(pynput_key)
+                self.human.tap_key(pynput_key, hold=self._t_key_hold)
 
                 if description and self.on_status_update:
                     self.on_status_update(f"[W{self.bot_id+1}] {description}")
@@ -1066,10 +1206,12 @@ class FishingBot:
             return
         
         try:
-            # Activate window before capturing
-            self.window_manager.activate_window(force_activate=True)
-            time.sleep(0.3)  # Give window time to come into focus
-
+            # mss captures by absolute screen coordinates and does NOT need the
+            # window to be focused. Calling activate_window here (without holding
+            # input_lock) would race with the other bot's click sequences and
+            # steal focus mid-click, causing missed inputs. Callers that need the
+            # window active (page switches, handle_item) activate it under the
+            # input_lock before calling this function.
             inventory_frame = self.capture_inventory_area()
             inventory_gray = cv2.cvtColor(inventory_frame, cv2.COLOR_BGR2GRAY)
             inv_h, inv_w = inventory_gray.shape
@@ -1082,6 +1224,14 @@ class FishingBot:
 
             found_count = 0
             ignored = self._ignored_positions
+
+            # Spatial bucket index over `ignored` for O(1) duplicate checks.
+            # Without this, every new candidate scans the entire ignore set
+            # (which grows monotonically as items are discovered).
+            BUCKET = 16
+            ignored_buckets: dict = {}
+            for ix, iy in ignored:
+                ignored_buckets.setdefault((ix // BUCKET, iy // BUCKET), []).append((ix, iy))
 
             for template, half_w, half_h in templates.values():
                 t_h, t_w = template.shape
@@ -1098,6 +1248,11 @@ class FishingBot:
                     if peak < CONFIDENCE_THRESHOLD:
                         continue
 
+                    half_t_w = t_w >> 1
+                    half_t_h = t_h >> 1
+                    res_w = result.shape[1]
+                    res_h = result.shape[0]
+
                     # Find ALL matches using iterative minMaxLoc with masking.
                     # Disambiguation is skipped here — we only need positions for the
                     # ignore-list, not species identity.
@@ -1110,21 +1265,32 @@ class FishingBot:
                         center_x = pt_x + half_w
                         center_y = pt_y + half_h
 
+                        bx, by = center_x // BUCKET, center_y // BUCKET
                         is_duplicate = False
-                        for ix, iy in ignored:
-                            if abs(center_x - ix) < 10 and abs(center_y - iy) < 10:
-                                is_duplicate = True
+                        for ddx in (-1, 0):
+                            for ddy in (-1, 0):
+                                cand = ignored_buckets.get((bx + ddx, by + ddy))
+                                if not cand:
+                                    continue
+                                for ix, iy in cand:
+                                    if abs(center_x - ix) < 10 and abs(center_y - iy) < 10:
+                                        is_duplicate = True
+                                        break
+                                if is_duplicate:
+                                    break
+                            if is_duplicate:
                                 break
 
                         if not is_duplicate:
                             ignored.add((center_x, center_y))
+                            ignored_buckets.setdefault((bx, by), []).append((center_x, center_y))
                             found_count += 1
 
                         # Mask out this match area to find the next one
-                        mask_x1 = max(0, pt_x - t_w // 2)
-                        mask_y1 = max(0, pt_y - t_h // 2)
-                        mask_x2 = min(result.shape[1], pt_x + t_w // 2 + 1)
-                        mask_y2 = min(result.shape[0], pt_y + t_h // 2 + 1)
+                        mask_x1 = max(0, pt_x - half_t_w)
+                        mask_y1 = max(0, pt_y - half_t_h)
+                        mask_x2 = min(res_w, pt_x + half_t_w + 1)
+                        mask_y2 = min(res_h, pt_y + half_t_h + 1)
                         result[mask_y1:mask_y2, mask_x1:mask_x2] = -1.0
 
                 except Exception:
@@ -1174,9 +1340,7 @@ class FishingBot:
             with input_lock:
                 self.window_manager.activate_window(force_activate=True)
                 win_left, win_top, _, _ = self.window_manager.get_window_rect()
-                pyautogui.moveTo(win_left + page_pos[0], win_top + page_pos[1], _pause=False)
-                time.sleep(0.05)
-                pyautogui.click(_pause=False)
+                self._click_page_tab(win_left + page_pos[0], win_top + page_pos[1])
 
             time.sleep(0.3)
             self._rescan_inventory_state()
@@ -1190,10 +1354,9 @@ class FishingBot:
         # All configured pages are full — stop the bot
         if self.on_status_update:
             self.on_status_update(f"[W{self.bot_id+1}] All inventory pages full — stopping bot")
+        self._set_stop_reason(self.STOP_INVENTORY_FULL)
         self.running = False
-        if self.on_bot_stop:
-            self.on_bot_stop(self.bot_id)
-        threading.Thread(target=play_rickroll_beep, daemon=True).start()
+        self._notify_bot_stop_once()
 
     def _startup_scan_and_process_all_pages(self):
         """At startup, navigate every configured inventory page and find one with empty slots.
@@ -1219,9 +1382,7 @@ class FishingBot:
                     with input_lock:
                         self.window_manager.activate_window(force_activate=True)
                         win_left, win_top, _, _ = self.window_manager.get_window_rect()
-                        pyautogui.moveTo(win_left + page_pos[0], win_top + page_pos[1], _pause=False)
-                        time.sleep(0.05)
-                        pyautogui.click(_pause=False)
+                        self._click_page_tab(win_left + page_pos[0], win_top + page_pos[1])
                     time.sleep(0.3)
                 else:
                     with input_lock:
@@ -1239,10 +1400,9 @@ class FishingBot:
             # All configured pages are full
             if self.on_status_update:
                 self.on_status_update(f"[W{self.bot_id+1}] All inventory pages full at startup — stopping bot")
+            self._set_stop_reason(self.STOP_INVENTORY_FULL)
             self.running = False
-            if self.on_bot_stop:
-                self.on_bot_stop(self.bot_id)
-            threading.Thread(target=play_rickroll_beep, daemon=True).start()
+            self._notify_bot_stop_once()
             return
 
         # Auto mode: scan every page and process (open/drop) items before deciding where to settle.
@@ -1263,9 +1423,7 @@ class FishingBot:
                 with input_lock:
                     self.window_manager.activate_window(force_activate=True)
                     win_left, win_top, _, _ = self.window_manager.get_window_rect()
-                    pyautogui.moveTo(win_left + page_pos[0], win_top + page_pos[1], _pause=False)
-                    time.sleep(0.05)
-                    pyautogui.click(_pause=False)
+                    self._click_page_tab(win_left + page_pos[0], win_top + page_pos[1])
                 time.sleep(0.3)
             else:
                 with input_lock:
@@ -1283,13 +1441,13 @@ class FishingBot:
         if first_page_with_empty is None:
             if self.on_status_update:
                 self.on_status_update(f"[W{self.bot_id+1}] All inventory pages full at startup — stopping bot")
+            self._set_stop_reason(self.STOP_INVENTORY_FULL)
             self.running = False
-            if self.on_bot_stop:
-                self.on_bot_stop(self.bot_id)
-            threading.Thread(target=play_rickroll_beep, daemon=True).start()
+            self._notify_bot_stop_once()
             return
 
         # Navigate back to the first page that has empty slots (if we advanced past it)
+        navigated_back = False
         if self._current_inv_page != first_page_with_empty:
             target_page_num = first_page_with_empty + 1
             page_pos = self.config.get(f'inv_page_{target_page_num}_pos')
@@ -1300,14 +1458,22 @@ class FishingBot:
                 with input_lock:
                     self.window_manager.activate_window(force_activate=True)
                     win_left, win_top, _, _ = self.window_manager.get_window_rect()
-                    pyautogui.moveTo(win_left + page_pos[0], win_top + page_pos[1], _pause=False)
-                    time.sleep(0.05)
-                    pyautogui.click(_pause=False)
-                time.sleep(0.3)
+                    self._click_page_tab(win_left + page_pos[0], win_top + page_pos[1])
+                time.sleep(0.5)  # increased: give the game time to switch pages
                 self._current_inv_page = first_page_with_empty
                 self._ignored_positions.clear()
                 self._empty_slot_positions.clear()
                 self._startup_process_page(fish_actions)
+                navigated_back = True
+
+        # Fallback: if the target page turned out to be full (items placed into its
+        # empty slots while processing other pages, or the tab click didn't register),
+        # find the next page that has space rather than starting with 0 tracked slots.
+        if navigated_back and not self._empty_slot_positions:
+            if self.on_status_update:
+                self.on_status_update(
+                    f"[W{self.bot_id+1}] Startup: page {first_page_with_empty + 1} now full — scanning for next available page")
+            self._switch_inventory_page()
 
     def _startup_process_page(self, fish_actions: dict) -> None:
         """Processes a single inventory page during startup.
@@ -1331,51 +1497,90 @@ class FishingBot:
             confusable_fish = FishingBot._confusable_fish
             keep_count = 0
 
-            # Pass 1: collect every template hit, cluster by position, then for each
-            # cluster pick the highest-confidence template as the slot's true identity.
-            # Without this clustering step, a weakly-matching 'keep' template can win
-            # over the actually-correct 'drop' template at the same slot purely
-            # because of dict iteration order, causing the slot to be ignored.
-            raw_hits = []  # (filename, cx, cy, confidence)
+            # Pass 1: collect every template hit, cluster by position with a
+            # coarse spatial bucket index, then for each cluster pick the
+            # highest-confidence template as the slot's true identity.
+            # The bucket index turns the previous O(N*M) merge (every hit linearly
+            # scanning every accumulated slot) into amortized O(N).
+            #
+            # Without this clustering step, a weakly-matching 'keep' template can
+            # win over the actually-correct 'drop' template at the same slot
+            # purely because of dict iteration order, causing the slot to be
+            # ignored.
+            BUCKET = 16  # > merge radius (10) so a slot maps to <=4 buckets to probe
+            slot_best = []                  # list of [cx, cy, best_filename, best_conf]
+            bucket_index: dict = {}         # (bx, by) -> list of slot indices
+
             for filename, (template, half_w, half_h) in templates.items():
                 t_h, t_w = template.shape
                 if t_h > inv_h or t_w > inv_w:
                     continue
                 try:
                     result = match_template(inventory_gray, template, TM_CCOEFF_NORMED)
+
+                    # Cheap upfront rejection: if the global peak is already
+                    # below threshold, this template hits nowhere.
+                    _, peak, _, _ = minMaxLoc(result)
+                    if peak < CONFIDENCE_THRESHOLD:
+                        continue
+
+                    half_t_w = t_w >> 1
+                    half_t_h = t_h >> 1
+                    res_w = result.shape[1]
+                    res_h = result.shape[0]
+
                     while True:
                         _, max_val, _, max_loc = minMaxLoc(result)
                         if max_val < CONFIDENCE_THRESHOLD:
                             break
                         pt_x, pt_y = max_loc
-                        raw_hits.append((filename, pt_x + half_w, pt_y + half_h, max_val))
-                        mask_x1 = max(0, pt_x - t_w // 2)
-                        mask_y1 = max(0, pt_y - t_h // 2)
-                        mask_x2 = min(result.shape[1], pt_x + t_w // 2 + 1)
-                        mask_y2 = min(result.shape[0], pt_y + t_h // 2 + 1)
+                        cx = pt_x + half_w
+                        cy = pt_y + half_h
+
+                        # Probe the 4 buckets that any (cx,cy) within radius 10
+                        # could fall into. Only existing slots in those buckets
+                        # are candidates for merging.
+                        bx, by = cx // BUCKET, cy // BUCKET
+                        merged = False
+                        for ddx in (-1, 0):
+                            for ddy in (-1, 0):
+                                cand_list = bucket_index.get((bx + ddx, by + ddy))
+                                if not cand_list:
+                                    continue
+                                for si in cand_list:
+                                    slot = slot_best[si]
+                                    if abs(cx - slot[0]) < 10 and abs(cy - slot[1]) < 10:
+                                        if max_val > slot[3]:
+                                            slot[2] = filename
+                                            slot[3] = max_val
+                                        merged = True
+                                        break
+                                if merged:
+                                    break
+                            if merged:
+                                break
+
+                        if not merged:
+                            slot_best.append([cx, cy, filename, max_val])
+                            bucket_index.setdefault((bx, by), []).append(len(slot_best) - 1)
+
+                        mask_x1 = max(0, pt_x - half_t_w)
+                        mask_y1 = max(0, pt_y - half_t_h)
+                        mask_x2 = min(res_w, pt_x + half_t_w + 1)
+                        mask_y2 = min(res_h, pt_y + half_t_h + 1)
                         result[mask_y1:mask_y2, mask_x1:mask_x2] = -1.0
                 except Exception:
                     continue
 
-            # Cluster hits within 10 px → one entry per physical slot, keeping
-            # the best (filename, conf) for that slot.
-            slot_best = []  # list of [cx, cy, best_filename, best_conf]
-            for filename, cx, cy, conf in raw_hits:
-                merged = False
-                for slot in slot_best:
-                    if abs(cx - slot[0]) < 10 and abs(cy - slot[1]) < 10:
-                        if conf > slot[3]:
-                            slot[2] = filename
-                            slot[3] = conf
-                        merged = True
-                        break
-                if not merged:
-                    slot_best.append([cx, cy, filename, conf])
-
             # Now classify each slot by its best-matching template's action.
+            ignored_snapshot = list(self._ignored_positions)
             for cx, cy, best_filename, _ in slot_best:
-                if any(abs(cx - ix) < 10 and abs(cy - iy) < 10
-                       for ix, iy in self._ignored_positions):
+                already_ignored = False
+                for ix, iy in ignored_snapshot:
+                    if abs(cx - ix) < 10 and abs(cy - iy) < 10:
+                        already_ignored = True
+                        break
+                if already_ignored:
                     continue
                 matched_filename = best_filename
                 if best_filename in confusable_fish:
@@ -1436,11 +1641,11 @@ class FishingBot:
                     if self.on_status_update:
                         self.on_status_update(f"[W{self.bot_id+1}] Startup opening: {fish_name}")
 
-                    pyautogui.moveTo(screen_x, screen_y, _pause=False)
-                    time.sleep(0.05)
-                    pyautogui.click(button='right', _pause=False)
-                    time.sleep(self._t_open_wait)
-                    pyautogui.moveTo(win_cx, win_cy, _pause=False)
+                    self.human.move_to(screen_x, screen_y)
+                    self.human.sleep(0.05)
+                    self.human.click(button='right')
+                    self.human.sleep(self._t_open_wait)
+                    self.human.move_to(win_cx, win_cy)
 
                     time.sleep(self._t_open_wait)
                     still_there = self._is_item_at_position(self.capture_inventory_area(), inv_x, inv_y)
@@ -1462,11 +1667,11 @@ class FishingBot:
                     still_there = True
 
                     if is_fish:
-                        pyautogui.moveTo(screen_x, screen_y, _pause=False)
-                        time.sleep(0.05)
-                        pyautogui.click(button='right', _pause=False)
-                        time.sleep(self._t_open_wait)
-                        pyautogui.moveTo(win_cx, win_cy, _pause=False)
+                        self.human.move_to(screen_x, screen_y)
+                        self.human.sleep(0.05)
+                        self.human.click(button='right')
+                        self.human.sleep(self._t_open_wait)
+                        self.human.move_to(win_cx, win_cy)
 
                         time.sleep(self._t_open_wait)
                         still_there = self._is_item_at_position(self.capture_inventory_area(), inv_x, inv_y)
@@ -1474,28 +1679,28 @@ class FishingBot:
                     if still_there:
                         drop_pos = self.config.get('drop_button_pos')
 
-                        pyautogui.moveTo(screen_x, screen_y, _pause=False)
+                        self.human.move_to(screen_x, screen_y)
                         time.sleep(np.random.uniform(0.05, 0.07))
-                        pyautogui.click(_pause=False)
-                        time.sleep(self._t_drop_settle)
+                        self.human.click()
+                        self.human.sleep(self._t_drop_settle)
 
-                        pyautogui.moveTo(win_cx, win_cy, _pause=False)
+                        self.human.move_to(win_cx, win_cy)
                         time.sleep(np.random.uniform(0.05, 0.07))
-                        pyautogui.click(_pause=False)
-                        time.sleep(self._t_drop_settle)
+                        self.human.click()
+                        self.human.sleep(self._t_drop_settle)
 
                         if drop_pos:
-                            pyautogui.moveTo(win_left + drop_pos[0], win_top + drop_pos[1], _pause=False)
+                            self.human.move_to(win_left + drop_pos[0], win_top + drop_pos[1])
                             time.sleep(np.random.uniform(0.05, 0.07))
-                            pyautogui.click(_pause=False)
-                            time.sleep(self._t_drop_settle)
+                            self.human.click()
+                            self.human.sleep(self._t_drop_settle)
 
-                        pyautogui.moveTo(win_left + confirm_pos[0], win_top + confirm_pos[1], _pause=False)
+                        self.human.move_to(win_left + confirm_pos[0], win_top + confirm_pos[1])
                         time.sleep(np.random.uniform(0.05, 0.07))
-                        pyautogui.click(_pause=False)
-                        time.sleep(self._t_drop_settle)
+                        self.human.click()
+                        self.human.sleep(self._t_drop_settle)
 
-                        pyautogui.moveTo(win_cx, win_cy, _pause=False)
+                        self.human.move_to(win_cx, win_cy)
 
                         # Verify drop succeeded while still holding lock
                         time.sleep(self._t_drop_settle)
@@ -1529,7 +1734,7 @@ class FishingBot:
                     self.on_status_update(f"[W{self.bot_id+1}] Error loading classic fish template: {e}")
         else:
             if self.on_status_update:
-                self.on_status_update(f"[W{self.bot_id+1}] Classic fish template not found at assets/classic_fish.jpg")
+                self.on_status_update(f"[W{self.bot_id+1}] Classic fish template not found at assets/fishing/classic_fish.jpg")
         
         return FishingBot._classic_fish_template
     
@@ -1542,39 +1747,66 @@ class FishingBot:
                 self.on_status_update(f"[W{self.bot_id+1}] No classic fish template, using fallback timing")
             return True  # Fallback: proceed anyway
         
-        start_time = time.time()
+        start_time = time.perf_counter()
         t_h, t_w = template.shape
 
-        # Pre-compute all scaled variants once — reused on every poll iteration
-        _scales_raw = [0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.25, 2.5, 2.75, 3.0]
-        scaled_templates = []
-        for _s in _scales_raw:
-            _nw, _nh = int(t_w * _s), int(t_h * _s)
-            if _nw >= 10 and _nh >= 10:
-                _interp = cv2.INTER_AREA if _s < 1 else cv2.INTER_LINEAR
-                scaled_templates.append((_s, _nw, _nh, cv2.resize(template, (_nw, _nh), interpolation=_interp)))
+        # Build (and class-cache) scaled variants once — shared across all calls
+        # and all bot instances. Previously rebuilt on every wait_for_classic_fish
+        # invocation, allocating ~20 resize buffers per cast.
+        if FishingBot._classic_fish_scaled_cache is None:
+            _scales_raw = [0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.7, 0.8, 0.9,
+                           1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.25, 2.5, 2.75, 3.0]
+            _scaled = []
+            for _s in _scales_raw:
+                _nw, _nh = int(t_w * _s), int(t_h * _s)
+                if _nw >= 10 and _nh >= 10:
+                    _interp = cv2.INTER_AREA if _s < 1 else cv2.INTER_LINEAR
+                    _scaled.append((_s, _nw, _nh, cv2.resize(template, (_nw, _nh), interpolation=_interp)))
+            FishingBot._classic_fish_scaled_cache = _scaled
 
-        while self.running and time.time() - start_time < timeout:
+        scaled_templates = FishingBot._classic_fish_scaled_cache
+
+        # Promote the last-known-good scale to the front so subsequent polls
+        # (and subsequent casts) early-exit on the very first matchTemplate.
+        last_scale = FishingBot._classic_fish_last_scale
+        if last_scale is not None:
+            scaled_templates = sorted(
+                scaled_templates,
+                key=lambda st: 0 if st[0] == last_scale else 1,
+            )
+
+        # Local refs for tight inner loop
+        match_template = cv2.matchTemplate
+        minMaxLoc = cv2.minMaxLoc
+        TM_CCOEFF_NORMED = cv2.TM_CCOEFF_NORMED
+        cvtColor = cv2.cvtColor
+        BGR2GRAY = cv2.COLOR_BGR2GRAY
+        ACCEPT_THRESHOLD = 0.7  # Lowered early-exit to match acceptance threshold
+
+        capture_full_window = self.capture_full_window
+        perf_counter = time.perf_counter
+
+        while self.running and perf_counter() - start_time < timeout:
             if self.paused:
                 time.sleep(0.1)
                 continue
 
             try:
-                frame = self.capture_full_window()
-                frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                frame = capture_full_window()
+                frame_gray = cvtColor(frame, BGR2GRAY)
 
                 # Crop to 250px wide centered bar, upper half only for performance
                 f_h, f_w = frame_gray.shape
-                center_x = f_w // 2
+                center_x = f_w >> 1
                 crop_left = max(0, center_x - 125)
                 crop_right = min(f_w, center_x + 125)
-                crop_bottom = f_h // 2  # Only upper half
+                crop_bottom = f_h >> 1  # Only upper half
                 frame_gray = frame_gray[:crop_bottom, crop_left:crop_right]
 
                 f_h, f_w = frame_gray.shape
 
                 # Multi-scale template matching (uses pre-computed scaled templates)
-                best_match_val = 0
+                best_match_val = 0.0
                 best_scale = 1.0
 
                 for scale, new_w, new_h, scaled_template in scaled_templates:
@@ -1582,19 +1814,21 @@ class FishingBot:
                     if new_h > f_h or new_w > f_w:
                         continue
 
-                    # Template matching
-                    result = cv2.matchTemplate(frame_gray, scaled_template, cv2.TM_CCOEFF_NORMED)
-                    _, max_val, _, _ = cv2.minMaxLoc(result)
+                    result = match_template(frame_gray, scaled_template, TM_CCOEFF_NORMED)
+                    _, max_val, _, _ = minMaxLoc(result)
 
                     if max_val > best_match_val:
                         best_match_val = max_val
                         best_scale = scale
 
-                    # Early exit if we found a very good match
-                    if max_val >= 0.8:
+                    # Early exit at acceptance threshold — no need to keep
+                    # exploring scales once we have a winning match.
+                    if max_val >= ACCEPT_THRESHOLD:
                         break
-                
-                if best_match_val >= 0.7:  # Found the classic fish indicator
+
+                if best_match_val >= ACCEPT_THRESHOLD:  # Found the classic fish indicator
+                    # Persist the winning scale for the next poll/cast
+                    FishingBot._classic_fish_last_scale = best_scale
                     # Start timer IMMEDIATELY after detection (configurable delay)
                     delay = self.config.get('classic_fishing_delay', 3.0)
                     # Use interruptible sleep that checks running/paused state
@@ -1640,7 +1874,8 @@ class FishingBot:
         self._t_qs_after    = self.config.get('timing_quickskip_after',   0.100)
 
         # Reset bait if starting with 0 or negative bait
-        max_bait = len(self.bait_keys) * 200
+        bait_per_key = self.config.get("bait_quantity", 200)
+        max_bait = len(self.bait_keys) * bait_per_key
         if self.bait_counter <= 0:
             self.bait_counter = max_bait
             if self.on_bait_update:
@@ -1650,6 +1885,9 @@ class FishingBot:
         
         if self.on_status_update:
             self.on_status_update(f"[W{self.bot_id+1}] Bot started! Bait: {self.bait_counter}")
+
+        if self._stop_if_window_unavailable():
+            return
         
         # Scan all inventory pages at startup, process open/drop items, then settle on
         # the first page that still has empty slots.
@@ -1658,6 +1896,9 @@ class FishingBot:
         _was_paused = False
 
         while self.running and self.bait_counter > 0:
+            if self._stop_if_window_unavailable():
+                break
+
             if self.paused:
                 _was_paused = True
                 time.sleep(0.1)
@@ -1677,6 +1918,8 @@ class FishingBot:
                 # Only play minigame if Classic Fishing system is NOT enabled
                 if not self.config.get('classic_fishing', False):
                     minigame_detected = self.wait_for_minigame_window(timeout=6)
+                    if not self.running:
+                        break
                     if not minigame_detected:
                         self.consecutive_failures += 1
                         if self.on_status_update:
@@ -1685,11 +1928,10 @@ class FishingBot:
                         if self.consecutive_failures >= 5:
                             self.adjust_bait_tier()
                             if self.bait_counter <= 0:
-                                if self.on_status_update:
-                                    self.on_status_update(f"[W{self.bot_id+1}] Bait depleted after consecutive failures. Stopping bot.")
-                                self.running = False
-                                if self.on_bot_stop:
-                                    self.on_bot_stop(self.bot_id)
+                                self._stop_bot(
+                                    self.STOP_BAIT_DEPLETED,
+                                    f"[W{self.bot_id+1}] Bait depleted after consecutive failures. Stopping bot."
+                                )
                                 break
                         
                         continue
@@ -1772,11 +2014,10 @@ class FishingBot:
                         if self.consecutive_failures >= 2:
                             self.adjust_bait_tier()
                             if self.bait_counter <= 0:
-                                if self.on_status_update:
-                                    self.on_status_update(f"[W{self.bot_id+1}] Bait depleted after consecutive failures. Stopping bot.")
-                                self.running = False
-                                if self.on_bot_stop:
-                                    self.on_bot_stop(self.bot_id)
+                                self._stop_bot(
+                                    self.STOP_BAIT_DEPLETED,
+                                    f"[W{self.bot_id+1}] Bait depleted after consecutive failures. Stopping bot."
+                                )
                                 break
                             
                         # Press CTRL+G once per failure to dismount horse if that's the issue
@@ -1854,25 +2095,67 @@ class FishingBot:
                     self.on_status_update(f"[W{self.bot_id+1}] Error in play_game: {e}")
                 time.sleep(0.5)
         
+        if self.stop_reason is None:
+            if self._manually_stopped:
+                self._set_stop_reason(self.STOP_MANUAL)
+            elif self.bait_counter <= 0:
+                self._set_stop_reason(self.STOP_BAIT_DEPLETED)
+            else:
+                self._set_stop_reason(self.STOP_ERROR)
+
         if self.on_status_update:
             self.on_status_update(f"[W{self.bot_id+1}] Bot finished! Total games: {self.total_games}")
         self.running = False
-        if self.on_bot_stop:
-            self.on_bot_stop(self.bot_id)
+        self._notify_bot_stop_once()
     
     def start(self):
         """Starts the bot"""
+        self._manually_stopped = False  # Reset flag when starting
+        self.stop_reason = None
+        self._stop_notified = False
         self.running = True
+        if self.config.get('jigsaw_solver_enabled', False):
+            try:
+                from jigsaw_bot import JigsawBot
+                jigsaw_bot = JigsawBot(
+                    self.window_manager,
+                    self.config,
+                    bot_id=self.bot_id,
+                    on_status_update=self.on_status_update,
+                    on_bot_stop=self.on_bot_stop,
+                )
+                self._jigsaw_bot = jigsaw_bot
+                jigsaw_bot.running = True
+                while self.running and jigsaw_bot.running:
+                    jigsaw_bot.paused = self.paused
+                    jigsaw_bot.start()
+                    break
+                self.running = False
+                return
+            except Exception as e:
+                if self.on_status_update:
+                    self.on_status_update(f"[W{self.bot_id+1}] Jigsaw bot failed: {e}")
+                self._stop_bot(self.STOP_ERROR)
+                return
         self.play_game()
     
     def stop(self):
         """Stops the bot"""
+        self._manually_stopped = True  # Mark that user manually stopped the bot
+        self._set_stop_reason(self.STOP_MANUAL)
         self.running = False
+        if hasattr(self, '_jigsaw_bot') and self._jigsaw_bot:
+            self._jigsaw_bot.stop()
         if self.on_status_update:
             self.on_status_update(f"[W{self.bot_id+1}] Bot stopped")
 
 
 if __name__ == "__main__":
-    from bot_gui import BotGUI
-    gui = BotGUI()
-    gui.run()
+    from utils import DEBUG_MODE_EN
+    if DEBUG_MODE_EN:
+        from bot_gui import BotGUI
+        gui = BotGUI()
+        gui.run()
+    else:
+        from qt_gui import main
+        main()

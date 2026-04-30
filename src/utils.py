@@ -20,35 +20,45 @@ DEBUG_MODE_EN = False
 DEBUG_PRINTS = False
 
 
+def get_project_root() -> str:
+    """Return the repository root in development, or the bundle root in PyInstaller."""
+    if hasattr(sys, '_MEIPASS'):
+        return sys._MEIPASS
+    return os.path.dirname(os.path.dirname(__file__))
+
+
+def _asset_candidates(base_dir: str, filename: str) -> list:
+    normalized = filename.replace("\\", os.sep).replace("/", os.sep)
+    asset_root = os.path.join(base_dir, "assets")
+
+    if normalized in ("asset_root", "assets_root"):
+        return [asset_root]
+    if normalized == "assets":
+        # Backwards-compatible alias used by the fishing template loaders.
+        return [os.path.join(asset_root, "fishing")]
+    if normalized.startswith("assets" + os.sep):
+        return [os.path.join(base_dir, normalized)]
+
+    return [
+        os.path.join(base_dir, normalized),
+        os.path.join(asset_root, normalized),
+        os.path.join(asset_root, "fishing", normalized),
+        os.path.join(asset_root, "ui", normalized),
+        os.path.join(asset_root, "jigsaw", normalized),
+    ]
+
+
 def get_resource_path(filename: str) -> str:
     """Get the path to a bundled resource (works both in dev and in PyInstaller exe)
     
     Assets like images (.gif, .ico, .jpg, .png) are looked up in the assets folder.
     """
-    if hasattr(sys, '_MEIPASS'):
-        # Running as PyInstaller bundle
-        # PyInstaller extracts assets to _MEIPASS/assets/ based on build.spec configuration
-        if filename.endswith(('.gif', '.ico', '.jpg', '.png')) or filename == 'assets':
-            # Asset files go in assets subfolder
-            return os.path.join(sys._MEIPASS, 'assets', filename) if filename != 'assets' else os.path.join(sys._MEIPASS, 'assets')
-        else:
-            # Other files go in root
-            return os.path.join(sys._MEIPASS, filename)
-    else:
-        # Running as script - check if file should be in assets folder
-        base_dir = os.path.dirname(os.path.dirname(__file__))  # Go up from src to project root
-        
-        # Check if it's an asset file (images, icons, etc.)
-        if filename.endswith(('.gif', '.ico', '.jpg', '.png')) or filename == 'assets':
-            return os.path.join(base_dir, 'assets', filename) if filename != 'assets' else os.path.join(base_dir, 'assets')
-        
-        # For other files, check assets folder first
-        assets_path = os.path.join(base_dir, 'assets', filename)
-        if os.path.exists(assets_path):
-            return assets_path
-        
-        # Default: look in project root
-        return os.path.join(base_dir, filename)
+    base_dir = get_project_root()
+    candidates = _asset_candidates(base_dir, filename)
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return candidates[0]
 
 
 def set_window_icon(window, icon_path: str):

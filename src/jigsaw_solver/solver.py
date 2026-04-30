@@ -2,7 +2,10 @@
 Solver interface for the jigsaw puzzle.
 """
 from abc import ABC, abstractmethod
-from jigsaw import Jigsaw
+try:
+    from .jigsaw import Jigsaw
+except ImportError:  # Allows running this module directly from src/jigsaw_solver.
+    from jigsaw import Jigsaw  # type: ignore
 
 
 class Solver(ABC):

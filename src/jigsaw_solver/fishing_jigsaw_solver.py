@@ -5,8 +5,8 @@ A solver for the fishing jigsaw puzzle game using dynamic programming
 to find optimal moves. Includes GUI application.
 
 Usage:
-    python fishing_jigsaw_solver.py          # Launch GUI application
-    python fishing_jigsaw_solver.py --cli    # Use command-line interface
+    python -m jigsaw_solver.fishing_jigsaw_solver          # Launch GUI application
+    python -m jigsaw_solver.fishing_jigsaw_solver --cli    # Use command-line interface
 """
 import os
 import sys

@@ -23,7 +23,7 @@ except ImportError:
 from utils import get_resource_path, MAX_WINDOWS, DEBUG_MODE_EN, DEBUG_PRINTS, load_window_icon
 from window_manager import WindowManager
 from fishing_bot import FishingBot
-from debug_ui import IgnoredPositionsWindow, FishDetectorDebugWindow, StatusLogWindow, InventoryDetectionDebugWindow
+from debug_ui import IgnoredPositionsWindow, FishDetectorDebugWindow, StatusLogWindow, InventoryDetectionDebugWindow, JigsawSolverDebugWindow
 
 
 class FishSelectionWindow:
@@ -596,7 +596,7 @@ class TimingSettingsWindow:
 class BotGUI:
     """GUI for the fishing bot - supports up to 8 simultaneous windows"""
     
-    BOT_VERSION = "1.1.1"  # Version for config validation and GUI display
+    BOT_VERSION = "1.2"  # Version for config validation and GUI display
     ACCENT_COLOR = "#FFBB00"  # Gold color used throughout the GUI
     
     def __init__(self):
@@ -640,7 +640,11 @@ class BotGUI:
         self.ignored_positions_windows: Dict[int, IgnoredPositionsWindow] = {}  # bot_id -> IgnoredPositionsWindow
         self.fish_detector_debug_windows: Dict[int, FishDetectorDebugWindow] = {}  # bot_id -> FishDetectorDebugWindow
         self.inventory_detection_debug_windows: Dict[int, InventoryDetectionDebugWindow] = {}  # bot_id -> InventoryDetectionDebugWindow
-        
+        self.jigsaw_debug_windows: Dict[int, JigsawSolverDebugWindow] = {}  # bot_id -> JigsawSolverDebugWindow
+        self.jigsaw_bots: Dict[int, 'JigsawBot'] = {}  # bot_id -> JigsawBot (separate from fishing bots)
+        self.jigsaw_solver_window = None
+        self.jigsaw_grid_setup_window = None
+
         # Global keyboard listener for F5 pause
         self.global_key_listener = None
         if keyboard:
@@ -654,17 +658,27 @@ class BotGUI:
         
         # Flag to prevent sound alert from playing multiple times
         self._sound_alert_played = False
+        self._session_started_bot_ids = set()
+        self._session_bait_depleted_bot_ids = set()
+        self._session_non_bait_stop_reasons = {}
         
         # Config file path in the current working directory
         self.config_file = os.path.join(os.getcwd(), "bot_config.json")
         
         self.config = {
             'version': self.BOT_VERSION,  # Bot version for config validation
-            'human_like_clicking': True,
+            'human_like_clicking': False,
             'quick_skip': True,
             'sound_alert_on_finish': True,
             'classic_fishing': False,
             'classic_fishing_delay': 3.0,  # Delay in seconds after fish detection
+            'jigsaw_solver_enabled': False,
+            'jigsaw_crate_priority': 'normal_first',
+            'jigsaw_detection_threshold': 0.80,
+            'jigsaw_action_delay': 0.15,
+            'jigsaw_debug_screenshots': False,
+            'jigsaw_dry_run': False,
+            'jigsaw_grid_bounds': None,
             'auto_fish_handling': False,
             'fish_actions': {},  # {filename: 'keep'|'drop'|'open'}
             'drop_button_pos': None,  # (x, y) relative to window - drop/sell button
@@ -1011,6 +1025,16 @@ class BotGUI:
                                               activebackground="#2a2a2a",
                                               font=("Courier New", 9))
         self.classic_fishing_check.pack(anchor=tk.W, pady=1)
+
+        self.jigsaw_solver_btn = tk.Button(left_options_frame,
+                                      text="Open Jigsaw Solver",
+                                      command=self.open_jigsaw_solver,
+                                      bg="#555555", fg=BotGUI.ACCENT_COLOR,
+                                      activebackground="#666666",
+                                      font=("Courier New", 9, "bold"),
+                                      cursor="hand2",
+                                      padx=8, pady=3)
+        self.jigsaw_solver_btn.pack(anchor=tk.W, pady=2)
         
         # Delay input for classic fishing (below checkbox)
         classic_delay_frame = tk.Frame(left_options_frame, bg="#2a2a2a")
@@ -1033,7 +1057,7 @@ class BotGUI:
         # Human-like clicking
         self.human_like_var = tk.BooleanVar(value=self.config.get('human_like_clicking', True))
         self.human_like_check = tk.Checkbutton(left_options_frame, 
-                                    text="Human-like clicking",
+                                    text="Human like everything",
                                     variable=self.human_like_var,
                                     bg="#2a2a2a", fg="#ffffff",
                                     selectcolor="#1a1a1a",
@@ -1567,6 +1591,17 @@ class BotGUI:
                         self.config['classic_fishing'] = saved_config['classic_fishing']
                     if 'classic_fishing_delay' in saved_config:
                         self.config['classic_fishing_delay'] = saved_config['classic_fishing_delay']
+                    for _k in (
+                        'jigsaw_solver_enabled',
+                        'jigsaw_crate_priority',
+                        'jigsaw_detection_threshold',
+                        'jigsaw_action_delay',
+                        'jigsaw_debug_screenshots',
+                        'jigsaw_dry_run',
+                        'jigsaw_grid_bounds',
+                    ):
+                        if _k in saved_config:
+                            self.config[_k] = saved_config[_k]
                     # Restore bait keys
                     if 'bait_keys' in saved_config:
                         self.config['bait_keys'] = saved_config['bait_keys']
@@ -1636,6 +1671,13 @@ class BotGUI:
                 'sound_alert_on_finish': self.config.get('sound_alert_on_finish', True),
                 'classic_fishing': self.config.get('classic_fishing', False),
                 'classic_fishing_delay': self.config.get('classic_fishing_delay', 3.0),
+                'jigsaw_solver_enabled': self.config.get('jigsaw_solver_enabled', False),
+                'jigsaw_crate_priority': self.config.get('jigsaw_crate_priority', 'special_first'),
+                'jigsaw_detection_threshold': self.config.get('jigsaw_detection_threshold', 0.80),
+                'jigsaw_action_delay': self.config.get('jigsaw_action_delay', 0.15),
+                'jigsaw_debug_screenshots': self.config.get('jigsaw_debug_screenshots', False),
+                'jigsaw_dry_run': self.config.get('jigsaw_dry_run', False),
+                'jigsaw_grid_bounds': self.config.get('jigsaw_grid_bounds'),
                 'auto_fish_handling': self.config.get('auto_fish_handling', False),
                 'fish_actions': self.config.get('fish_actions', {}),
                 'drop_button_pos': self.config.get('drop_button_pos'),
@@ -1827,6 +1869,10 @@ class BotGUI:
             self.classic_delay_entry.config(state=tk.DISABLED)
         
         self.save_config()
+
+    def toggle_jigsaw_solver(self):
+        """Legacy callback kept for old config/UI bindings."""
+        self.open_jigsaw_solver()
     
     def update_classic_delay(self, event=None):
         """Updates the classic fishing delay from the entry field."""
@@ -1988,6 +2034,14 @@ class BotGUI:
             self.reset_btn.config(fg=new_color)
         if hasattr(self, 'select_fishes_btn'):
             self.select_fishes_btn.config(fg=new_color)
+        if hasattr(self, 'jigsaw_solver_btn'):
+            self.jigsaw_solver_btn.config(fg=new_color)
+        if hasattr(self, 'jigsaw_start_btn'):
+            self.jigsaw_start_btn.config(fg=new_color)
+        if hasattr(self, 'jigsaw_define_grid_btn'):
+            self.jigsaw_define_grid_btn.config(fg=new_color)
+        if hasattr(self, 'jigsaw_set_confirm_btn'):
+            self.jigsaw_set_confirm_btn.config(fg=new_color)
         if hasattr(self, 'drop_btn_pos_btn'):
             self.drop_btn_pos_btn.config(fg=new_color)
         if hasattr(self, 'confirm_btn_pos_btn'):
@@ -2220,6 +2274,7 @@ class BotGUI:
                 self.config['confirm_button_pos'] = (rel_x, rel_y)
                 self.confirm_btn_pos_label.config(text=f"({rel_x},{rel_y})", fg="#ffffff")
                 self.add_status(f"Confirm button position set: ({rel_x}, {rel_y})")
+                self._refresh_jigsaw_solver_window()
             elif mode.startswith('inv_page_'):
                 page_num = int(mode.split('_')[-1])
                 self.config[f'inv_page_{page_num}_pos'] = (rel_x, rel_y)
@@ -2368,6 +2423,8 @@ class BotGUI:
     
     def start_or_pause_bots(self):
         """Combined Start/Pause/Resume handler - decides action based on current state."""
+        if self.jigsaw_solver_window is not None:
+            return  # Start All is disabled while jigsaw solver window is open
         any_running = any(bot.running for bot in self.bots.values()) if self.bots else False
         
         if not any_running:
@@ -2391,10 +2448,11 @@ class BotGUI:
             return
         
         any_paused = any(bot.paused for bot in self.bots.values() if bot.running)
+        new_paused_state = not any_paused  # What the new state will be after toggle
         
         for bot_id, bot in self.bots.items():
             if bot.running:
-                bot.paused = not any_paused
+                bot.paused = new_paused_state
                 # Update status indicator
                 if bot_id in self.window_status_labels:
                     if bot.paused:
@@ -2402,7 +2460,15 @@ class BotGUI:
                     else:
                         self.window_status_labels[bot_id].config(text="🟢", fg="#00ff00")
         
-        status = "PAUSED" if not any_paused else "RESUMED"
+        # Update button text immediately to reflect new state (even though buttons are disabled during cooldown)
+        if new_paused_state:
+            # Bots are now paused - show Resume button
+            self.start_pause_btn.config(text="▶ Resume All (F5)", bg="#888888", activebackground="#999999")
+        else:
+            # Bots are now running - show Pause button
+            self.start_pause_btn.config(text="⏸ Pause All (F5)", bg="#888888", activebackground="#999999")
+
+        status = "PAUSED" if new_paused_state else "RESUMED"
         self.add_status(f"All bots {status} (F5)")
     
     def update_stats(self, bot_id: int, hits: int, total_games: int, bait: int):
@@ -2464,6 +2530,468 @@ class BotGUI:
         if bot_id in self.window_bait_labels:
             self.window_bait_labels[bot_id].config(text=f"B:{new_bait}")
         self.save_config()
+
+    def open_jigsaw_solver(self):
+        """Opens the standalone jigsaw solver control window."""
+        if any(bot.running for bot in self.bots.values()):
+            messagebox.showwarning("Fishbot running", "Stop Fishbot before opening the jigsaw solver.")
+            return
+
+        if self.jigsaw_solver_window is not None:
+            try:
+                self.jigsaw_solver_window.lift()
+                self.jigsaw_solver_window.focus_force()
+                self._refresh_jigsaw_solver_window()
+                return
+            except tk.TclError:
+                self.jigsaw_solver_window = None
+
+        win = tk.Toplevel(self.root)
+        self.jigsaw_solver_window = win
+        win.title("Fishing Jigsaw Solver")
+        win.geometry("520x420")
+        win.configure(bg="#1a1a1a")
+        win.resizable(True, True)
+        load_window_icon(win)
+
+        tk.Label(
+            win,
+            text="Fishing Jigsaw Solver",
+            bg="#1a1a1a",
+            fg=BotGUI.ACCENT_COLOR,
+            font=("Courier New", 13, "bold"),
+        ).pack(fill=tk.X, padx=10, pady=(10, 4))
+
+        self.jigsaw_summary_var = tk.StringVar(value="Ready")
+        tk.Label(
+            win,
+            textvariable=self.jigsaw_summary_var,
+            bg="#1a1a1a",
+            fg="#dddddd",
+            font=("Courier New", 9),
+            anchor="w",
+            justify=tk.LEFT,
+        ).pack(fill=tk.X, padx=10, pady=(0, 8))
+
+        self.jigsaw_grid_var = tk.StringVar(value="")
+        tk.Label(
+            win,
+            textvariable=self.jigsaw_grid_var,
+            bg="#1a1a1a",
+            fg="#aaaaaa",
+            font=("Courier New", 9),
+            anchor="w",
+            justify=tk.LEFT,
+        ).pack(fill=tk.X, padx=10, pady=(0, 8))
+
+        # Confirm button coords row
+        confirm_row = tk.Frame(win, bg="#1a1a1a")
+        confirm_row.pack(fill=tk.X, padx=10, pady=(0, 4))
+        confirm_pos = self.config.get('confirm_button_pos')
+        confirm_text = f"({confirm_pos[0]},{confirm_pos[1]})" if confirm_pos else "Not set"
+        confirm_color = "#ffffff" if confirm_pos else "#e74c3c"
+        tk.Label(confirm_row, text="Confirm Coords:", bg="#1a1a1a", fg="#aaaaaa",
+                 font=("Courier New", 9)).pack(side=tk.LEFT, padx=(0, 4))
+        self.jigsaw_confirm_label = tk.Label(confirm_row, text=confirm_text, bg="#1a1a1a",
+                                             fg=confirm_color, font=("Courier New", 9))
+        self.jigsaw_confirm_label.pack(side=tk.LEFT, padx=(0, 8))
+        self.jigsaw_set_confirm_btn = tk.Button(
+            confirm_row,
+            text="Set Confirm Coords",
+            command=lambda: self.start_position_capture('confirm'),
+            bg="#555555", fg=BotGUI.ACCENT_COLOR,
+            activebackground="#666666",
+            font=("Courier New", 9),
+            cursor="hand2",
+            padx=6, pady=2,
+        )
+        self.jigsaw_set_confirm_btn.pack(side=tk.LEFT)
+
+        list_frame = tk.Frame(win, bg="#111111", highlightthickness=1, highlightbackground="#333333")
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+        self.jigsaw_rows_frame = tk.Frame(list_frame, bg="#111111")
+        self.jigsaw_rows_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+
+        buttons = tk.Frame(win, bg="#1a1a1a")
+        buttons.pack(fill=tk.X, padx=10, pady=10)
+        self.jigsaw_define_grid_btn = tk.Button(
+            buttons,
+            text="Define Grid",
+            command=self.define_jigsaw_grid,
+            bg="#444444",
+            fg=BotGUI.ACCENT_COLOR,
+            activebackground="#555555",
+            font=("Courier New", 10, "bold"),
+            cursor="hand2",
+            padx=12,
+            pady=8,
+        )
+        self.jigsaw_define_grid_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.jigsaw_start_btn = tk.Button(
+            buttons,
+            text="Start Jigsaw",
+            command=self.toggle_jigsaw_solver_workers,
+            bg="#555555",
+            fg=BotGUI.ACCENT_COLOR,
+            activebackground="#666666",
+            font=("Courier New", 10, "bold"),
+            cursor="hand2",
+            padx=12,
+            pady=8,
+        )
+        self.jigsaw_start_btn.pack(side=tk.LEFT)
+        tk.Button(
+            buttons,
+            text="Close",
+            command=self._close_jigsaw_solver_window,
+            bg="#333333",
+            fg="#dddddd",
+            activebackground="#444444",
+            font=("Courier New", 10),
+            cursor="hand2",
+            padx=12,
+            pady=8,
+        ).pack(side=tk.RIGHT)
+
+        win.protocol("WM_DELETE_WINDOW", self._close_jigsaw_solver_window)
+        self._refresh_jigsaw_solver_window()
+        self.update_all_button_states()
+
+    def _close_jigsaw_solver_window(self):
+        if self.jigsaw_solver_window is not None:
+            try:
+                self.jigsaw_solver_window.destroy()
+            except tk.TclError:
+                pass
+        self.jigsaw_solver_window = None
+        self.update_all_button_states()
+
+    def _refresh_jigsaw_solver_window(self):
+        if self.jigsaw_solver_window is None:
+            return
+        selected = [self.window_selections[i].get() for i in range(MAX_WINDOWS) if self.window_selections[i].get()]
+        running = len([bot for bot in self.jigsaw_bots.values() if bot.running])
+        self.jigsaw_summary_var.set(f"Selected windows: {len(selected)}   Running jigsaw workers: {running}")
+        self.jigsaw_start_btn.config(text="Stop Jigsaw" if running else "Start Jigsaw")
+        self.jigsaw_define_grid_btn.config(state=tk.DISABLED if running else tk.NORMAL)
+        self.jigsaw_set_confirm_btn.config(state=tk.DISABLED if running else tk.NORMAL)
+        confirm_pos = self.config.get('confirm_button_pos')
+        if confirm_pos:
+            self.jigsaw_confirm_label.config(text=f"({confirm_pos[0]},{confirm_pos[1]})", fg="#ffffff")
+        else:
+            self.jigsaw_confirm_label.config(text="Not set", fg="#e74c3c")
+        grid_bounds = self.config.get("jigsaw_grid_bounds")
+        if self._has_jigsaw_grid_bounds():
+            self.jigsaw_grid_var.set(
+                f"Grid: x={int(grid_bounds[0])} y={int(grid_bounds[1])} "
+                f"w={int(grid_bounds[2])} h={int(grid_bounds[3])}"
+            )
+        else:
+            self.jigsaw_grid_var.set("Grid: not defined. Use Define Grid before starting.")
+
+        for child in self.jigsaw_rows_frame.winfo_children():
+            child.destroy()
+        if not selected:
+            tk.Label(
+                self.jigsaw_rows_frame,
+                text="Select at least one game window in the main window first.",
+                bg="#111111",
+                fg="#aaaaaa",
+                font=("Courier New", 9),
+                anchor="w",
+            ).pack(fill=tk.X, pady=4)
+            return
+
+        for idx, name in enumerate(selected, start=1):
+            state = "RUNNING" if idx - 1 in self.jigsaw_bots and self.jigsaw_bots[idx - 1].running else "READY"
+            color = "#00ff88" if state == "RUNNING" else "#dddddd"
+            tk.Label(
+                self.jigsaw_rows_frame,
+                text=f"W{idx}: {name}  [{state}]",
+                bg="#111111",
+                fg=color,
+                font=("Courier New", 9),
+                anchor="w",
+            ).pack(fill=tk.X, pady=2)
+
+    def _has_jigsaw_grid_bounds(self) -> bool:
+        bounds = self.config.get("jigsaw_grid_bounds")
+        if not bounds or len(bounds) != 4:
+            return False
+        try:
+            x, y, w, h = [int(v) for v in bounds]
+        except (TypeError, ValueError):
+            return False
+        return x >= 0 and y >= 0 and w > 0 and h > 0
+
+    def define_jigsaw_grid(self):
+        """Opens a translucent overlay for manually aligning the jigsaw grid."""
+        if any(bot.running for bot in self.jigsaw_bots.values()):
+            messagebox.showwarning("Jigsaw running", "Stop the jigsaw solver before redefining the grid.")
+            return
+
+        selected_names = [self.window_selections[i].get() for i in range(MAX_WINDOWS) if self.window_selections[i].get()]
+        if not selected_names:
+            messagebox.showerror("No windows selected", "Select at least one game window before defining the grid.")
+            return
+
+        all_windows = WindowManager.get_all_windows()
+        window_dict = {name: win for name, win in all_windows}
+        target_name = selected_names[0]
+        if target_name not in window_dict:
+            messagebox.showerror("Window not found", "Refresh/select the game windows first.")
+            return
+
+        wm = WindowManager()
+        wm.selected_window = window_dict[target_name]
+        try:
+            wm.activate_window(force_activate=True)
+        except Exception:
+            pass
+        self.root.after(150, lambda: self._open_jigsaw_grid_overlay(wm, target_name))
+
+    def _open_jigsaw_grid_overlay(self, wm: WindowManager, target_name: str):
+        if self.jigsaw_grid_setup_window is not None:
+            try:
+                self.jigsaw_grid_setup_window.destroy()
+            except tk.TclError:
+                pass
+            self.jigsaw_grid_setup_window = None
+
+        win_left, win_top, win_w, win_h = wm.get_window_rect()
+        if win_w <= 0 or win_h <= 0:
+            messagebox.showerror("Window unavailable", "Could not read the selected game window position.")
+            return
+
+        existing = self.config.get("jigsaw_grid_bounds")
+        if existing and len(existing) == 4:
+            grid = [int(existing[0]), int(existing[1]), int(existing[2]), int(existing[3])]
+        else:
+            default_w, default_h = 264, 176
+            grid = [
+                max(0, (win_w - default_w) // 2),
+                max(0, (win_h - default_h) // 2),
+                min(default_w, win_w),
+                min(default_h, win_h),
+            ]
+
+        overlay = tk.Toplevel(self.root)
+        self.jigsaw_grid_setup_window = overlay
+        overlay.title("Define Jigsaw Grid")
+        overlay.geometry(f"{win_w}x{win_h}+{win_left}+{win_top}")
+        overlay.overrideredirect(True)
+        overlay.attributes("-topmost", True)
+        try:
+            overlay.attributes("-alpha", 0.65)
+        except tk.TclError:
+            pass
+
+        canvas = tk.Canvas(overlay, bg="#000000", highlightthickness=0, cursor="fleur")
+        canvas.pack(fill=tk.BOTH, expand=True)
+        drag_state = {"mode": None, "x": 0, "y": 0, "grid": grid[:]}
+
+        def clamp_grid():
+            drag_state["grid"][2] = max(60, min(drag_state["grid"][2], win_w))
+            drag_state["grid"][3] = max(40, min(drag_state["grid"][3], win_h))
+            drag_state["grid"][0] = max(0, min(drag_state["grid"][0], win_w - drag_state["grid"][2]))
+            drag_state["grid"][1] = max(0, min(drag_state["grid"][1], win_h - drag_state["grid"][3]))
+
+        def draw():
+            clamp_grid()
+            canvas.delete("all")
+            gx, gy, gw, gh = drag_state["grid"]
+            canvas.create_rectangle(0, 0, win_w, win_h, fill="#000000", outline="")
+            canvas.create_rectangle(gx, gy, gx + gw, gy + gh, outline="#FFD700", width=3)
+            for col in range(1, 6):
+                x = gx + (gw * col / 6.0)
+                canvas.create_line(x, gy, x, gy + gh, fill="#FFD700", width=1)
+            for row in range(1, 4):
+                y = gy + (gh * row / 4.0)
+                canvas.create_line(gx, y, gx + gw, y, fill="#FFD700", width=1)
+            canvas.create_rectangle(gx + gw - 12, gy + gh - 12, gx + gw + 2, gy + gh + 2, fill="#FFD700", outline="#000000")
+            canvas.create_rectangle(12, 12, 440, 76, fill="#000000", outline="#FFD700", width=1)
+            canvas.create_text(
+                24,
+                25,
+                anchor="nw",
+                fill="#FFFFFF",
+                font=("Courier New", 9, "bold"),
+                text=f"Drag grid to align. Drag bottom-right handle to resize.\nTarget: {target_name}",
+            )
+            canvas.create_text(
+                24,
+                58,
+                anchor="nw",
+                fill="#FFD700",
+                font=("Courier New", 9),
+                text=f"x={gx} y={gy} w={gw} h={gh}    Enter=confirm   Esc=cancel",
+            )
+
+        def on_press(event):
+            gx, gy, gw, gh = drag_state["grid"]
+            drag_state["x"] = event.x
+            drag_state["y"] = event.y
+            if abs(event.x - (gx + gw)) <= 18 and abs(event.y - (gy + gh)) <= 18:
+                drag_state["mode"] = "resize"
+            elif gx <= event.x <= gx + gw and gy <= event.y <= gy + gh:
+                drag_state["mode"] = "move"
+            else:
+                drag_state["mode"] = None
+
+        def on_motion(event):
+            mode = drag_state["mode"]
+            if not mode:
+                return
+            dx = event.x - drag_state["x"]
+            dy = event.y - drag_state["y"]
+            drag_state["x"] = event.x
+            drag_state["y"] = event.y
+            if mode == "resize":
+                drag_state["grid"][2] += dx
+                drag_state["grid"][3] += dy
+            else:
+                drag_state["grid"][0] += dx
+                drag_state["grid"][1] += dy
+            draw()
+
+        def on_wheel(event):
+            step = 4 if event.delta > 0 else -4
+            drag_state["grid"][2] += step * 6
+            drag_state["grid"][3] += step * 4
+            draw()
+
+        def confirm(_event=None):
+            clamp_grid()
+            self.config["jigsaw_grid_bounds"] = [int(v) for v in drag_state["grid"]]
+            self.save_config()
+            self.add_status(f"Jigsaw grid set: {self.config['jigsaw_grid_bounds']}")
+            self._close_jigsaw_grid_overlay()
+            self._refresh_jigsaw_solver_window()
+
+        def cancel(_event=None):
+            self._close_jigsaw_grid_overlay()
+
+        canvas.bind("<ButtonPress-1>", on_press)
+        canvas.bind("<B1-Motion>", on_motion)
+        canvas.bind("<MouseWheel>", on_wheel)
+        overlay.bind("<Return>", confirm)
+        overlay.bind("<Escape>", cancel)
+        overlay.focus_force()
+        draw()
+
+    def _close_jigsaw_grid_overlay(self):
+        if self.jigsaw_grid_setup_window is not None:
+            try:
+                self.jigsaw_grid_setup_window.destroy()
+            except tk.TclError:
+                pass
+        self.jigsaw_grid_setup_window = None
+
+    def toggle_jigsaw_solver_workers(self):
+        if self.jigsaw_grid_setup_window is not None:
+            messagebox.showwarning(
+                "Grid definition in progress",
+                "Cannot start the solver while defining the grid. Close the grid definition overlay first (Esc)."
+            )
+            return
+        if any(bot.running for bot in self.jigsaw_bots.values()):
+            self.stop_jigsaw_solver_workers()
+        else:
+            self.start_jigsaw_solver_workers()
+
+    def start_jigsaw_solver_workers(self):
+        """Starts jigsaw workers from the standalone solver window."""
+        if any(bot.running for bot in self.bots.values()):
+            messagebox.showwarning("Fishbot running", "Stop Fishbot before starting the jigsaw solver.")
+            return
+        if not self.config.get("confirm_button_pos"):
+            messagebox.showerror(
+                "Confirm coordinate required",
+                "Set the Confirm coordinate in Inventory > Action Coordinates before starting the jigsaw solver.",
+            )
+            return
+        if not self._has_jigsaw_grid_bounds():
+            messagebox.showerror(
+                "Jigsaw grid required",
+                "Use Define Grid and align the ghost grid over the empty puzzle grid before starting.",
+            )
+            return
+
+        all_windows = WindowManager.get_all_windows()
+        window_dict = {name: win for name, win in all_windows}
+        selected_names = [self.window_selections[i].get() for i in range(MAX_WINDOWS) if self.window_selections[i].get()]
+        if not selected_names:
+            messagebox.showerror("No windows selected", "Select at least one game window before starting the jigsaw solver.")
+            return
+        if any(name not in window_dict for name in selected_names):
+            messagebox.showerror("Window not found", "Refresh/select the game windows first.")
+            return
+
+        try:
+            from jigsaw_bot import JigsawBot
+        except Exception as e:
+            messagebox.showerror("Jigsaw unavailable", f"Could not load jigsaw solver:\n{e}")
+            return
+
+        self.config["jigsaw_solver_enabled"] = True
+        self.save_config()
+        self.jigsaw_bots.clear()
+        for bot_id, selected_name in enumerate(selected_names):
+            wm = WindowManager()
+            wm.selected_window = window_dict[selected_name]
+            cfg = dict(self.config)
+            cfg["jigsaw_solver_enabled"] = True
+            bot = JigsawBot(
+                wm,
+                cfg,
+                bot_id=bot_id,
+                on_status_update=self.add_status,
+                on_progress_update=lambda _worker_id, count: None,
+                on_bot_stop=self._on_jigsaw_bot_stopped,
+            )
+            thread = threading.Thread(target=bot.start, daemon=True, name=f"JigsawBot-{bot_id + 1}")
+            self.jigsaw_bots[bot_id] = bot
+            self.bot_threads[bot_id] = thread
+            if DEBUG_MODE_EN:
+                self.jigsaw_debug_windows[bot_id] = JigsawSolverDebugWindow(self.root, bot)
+            thread.start()
+            self.add_status(f"[W{bot_id+1}] Jigsaw bot started for: {selected_name}")
+
+        self.set_config_widgets_state("disabled")
+        self._refresh_jigsaw_solver_window()
+        self.add_status(f"Started {len(selected_names)} jigsaw bot(s)")
+
+    def stop_jigsaw_solver_workers(self):
+        for bot_id, bot in list(self.jigsaw_bots.items()):
+            bot.stop()
+            if bot_id in self.jigsaw_debug_windows:
+                self.jigsaw_debug_windows[bot_id].destroy()
+                del self.jigsaw_debug_windows[bot_id]
+        self.jigsaw_bots.clear()
+        self.config["jigsaw_solver_enabled"] = False
+        self.save_config()
+        self.set_config_widgets_state("normal")
+        self._refresh_jigsaw_solver_window()
+        self.update_all_button_states()
+        self.add_status("Jigsaw solver stopped")
+
+    def _on_jigsaw_bot_stopped(self, bot_id: int):
+        self.root.after(0, lambda: self._cleanup_jigsaw_bot(bot_id))
+
+    def _cleanup_jigsaw_bot(self, bot_id: int):
+        if bot_id in self.jigsaw_debug_windows:
+            self.jigsaw_debug_windows[bot_id].destroy()
+            del self.jigsaw_debug_windows[bot_id]
+        if bot_id in self.jigsaw_bots:
+            del self.jigsaw_bots[bot_id]
+        if bot_id in self.bot_threads:
+            del self.bot_threads[bot_id]
+        if not self.jigsaw_bots and not self.bots:
+            self.config["jigsaw_solver_enabled"] = False
+            self.set_config_widgets_state("normal")
+            self.save_config()
+        self._refresh_jigsaw_solver_window()
+        self.update_all_button_states()
     
     def start_all_bots(self):
         """Starts bots for all selected windows."""
@@ -2473,10 +3001,11 @@ class BotGUI:
             return
         self.last_action_time = current_time
         self.disable_buttons_for_cooldown()
+        jigsaw_mode = False
         
         # Check that all mandatory inventory page positions (1-4) are set
         missing_pages = [p for p in range(1, 5) if not self.config.get(f'inv_page_{p}_pos')]
-        if missing_pages:
+        if missing_pages and not jigsaw_mode:
             missing_str = ", ".join(f"Page {p}" for p in missing_pages)
             messagebox.showerror("Inventory Pages Not Configured",
                                f"All 4 inventory page tab coordinates must be set before starting!\n\n"
@@ -2487,7 +3016,7 @@ class BotGUI:
 
         # Check if bait keys are selected FIRST (before checking bait amounts)
         selected_bait_keys = self.get_selected_bait_keys()
-        if not selected_bait_keys:
+        if not jigsaw_mode and not selected_bait_keys:
             messagebox.showerror("No Bait Keys Selected", 
                                "Please select at least one bait key!\n\n"
                                "Available bait keys: 1, 2, 3, 4, F1, F2, F3, F4")
@@ -2496,7 +3025,7 @@ class BotGUI:
         # Check if any selected window has 0 bait - force user to reset bait before starting
         windows_with_no_bait = [i + 1 for i in range(MAX_WINDOWS) 
                                 if self.window_selections[i].get() and self.window_stats[i]['bait'] <= 0]
-        if windows_with_no_bait:
+        if windows_with_no_bait and not jigsaw_mode:
             window_list = ", ".join(f"W{w}" for w in windows_with_no_bait)
             messagebox.showerror("No Bait", 
                                f"Bait counter is at 0 for: {window_list}\n\n"
@@ -2505,7 +3034,7 @@ class BotGUI:
             return
         
         # Check if confirm position is configured when any item is set to 'drop' (drop position is optional)
-        if self.config.get('auto_fish_handling', False):
+        if self.config.get('auto_fish_handling', False) and not jigsaw_mode:
             fish_actions = self.config.get('fish_actions', {})
             items_to_drop = [name for name, action in fish_actions.items() if action == 'drop']
             
@@ -2548,12 +3077,16 @@ class BotGUI:
         
         # Reset sound alert flag for new session
         self._sound_alert_played = False
+        self._session_started_bot_ids = set()
+        self._session_bait_depleted_bot_ids = set()
+        self._session_non_bait_stop_reasons = {}
         
         # Get config
         self.config['human_like_clicking'] = self.human_like_var.get()
         self.config['quick_skip'] = self.quick_skip_var.get()
         self.config['sound_alert_on_finish'] = self.sound_alert_var.get()
         self.config['classic_fishing'] = self.classic_fishing_var.get()
+        self.config['jigsaw_solver_enabled'] = False
         # Update delay from entry field
         try:
             self.config['classic_fishing_delay'] = float(self.classic_delay_var.get())
@@ -2564,37 +3097,37 @@ class BotGUI:
         # Get all available windows
         all_windows = WindowManager.get_all_windows()
         window_dict = {name: win for name, win in all_windows}
-        
-        # Start a bot for each selected window
+
+        # Start a bot for each selected window (fishing mode)
         started_count = 0
         for bot_id in range(MAX_WINDOWS):
             selected_name = self.window_selections[bot_id].get()
             if not selected_name:
                 continue
-            
+
             if selected_name not in window_dict:
                 self.add_status(f"[W{bot_id+1}] Window not found: {selected_name}")
                 continue
-            
+
             # Skip if bot already running for this window
             if bot_id in self.bots and self.bots[bot_id].running:
                 continue
-            
+
             selected_window = window_dict[selected_name]
-            
+
             # Create window manager for this bot
             wm = WindowManager()
             wm.selected_window = selected_window
             self.window_managers[bot_id] = wm
-            
+
             # Create and configure bot
             # Use current bait for this window (preserves remaining bait if bot was stopped)
             current_bait = self.window_stats[bot_id]['bait'] if self.window_stats[bot_id]['bait'] > 0 else self.bait
             bot = FishingBot(
-                None, 
-                self.config.copy(), 
-                wm, 
-                bait_counter=current_bait, 
+                None,
+                self.config.copy(),
+                wm,
+                bait_counter=current_bait,
                 bait_keys=selected_bait_keys.copy(),
                 bot_id=bot_id
             )
@@ -2602,38 +3135,39 @@ class BotGUI:
             bot.on_stats_update = self.update_stats
             bot.on_bait_update = self.update_bait_from_bot
             bot.on_bot_stop = self.on_bot_stopped
-            
+
             bot.running = True
             self.bots[bot_id] = bot
-            
+            self._session_started_bot_ids.add(bot_id)
+
             # Initialize stats
             self.window_stats[bot_id] = {'hits': 0, 'games': 0, 'bait': self.bait}
-            
+
             # Create ignored positions debug window (only if DEBUG_MODE_EN is true)
             if DEBUG_MODE_EN:
                 self.ignored_positions_windows[bot_id] = IgnoredPositionsWindow(self.root, bot)
                 self.fish_detector_debug_windows[bot_id] = FishDetectorDebugWindow(self.root, bot)
                 self.inventory_detection_debug_windows[bot_id] = InventoryDetectionDebugWindow(self.root, bot)
-            
+
             # Start bot thread
             thread = threading.Thread(target=bot.start, daemon=True)
             thread.start()
             self.bot_threads[bot_id] = thread
-            
+
             # Update status indicator
             self.window_status_labels[bot_id].config(text="🟢", fg="#00ff00")
             self.window_combos[bot_id].config(state="disabled")
-            
+
             started_count += 1
             self.add_status(f"[W{bot_id+1}] Bot started for: {selected_name}")
-        
+
         if started_count == 0:
             messagebox.showerror("Error", "Please select at least one window!")
             return
-        
+
         # Disable configuration widgets while bots are running
         self.set_config_widgets_state('disabled')
-        
+
         self.add_status(f"Started {started_count} bot(s)")
     
     def stop_all_bots(self):
@@ -2644,19 +3178,29 @@ class BotGUI:
             return
         self.last_action_time = current_time
         self.disable_buttons_for_cooldown()
-        
+
         for bot_id, bot in list(self.bots.items()):
             bot.running = False
             bot.stop()
+            self._session_non_bait_stop_reasons[bot_id] = FishingBot.STOP_MANUAL
             self.window_status_labels[bot_id].config(text="⚪", fg="#888888")
             self.window_combos[bot_id].config(state="readonly")
-        
+
+        for bot_id, bot in list(self.jigsaw_bots.items()):
+            bot.running = False
+            if bot_id in self.jigsaw_debug_windows:
+                self.jigsaw_debug_windows[bot_id].destroy()
+                del self.jigsaw_debug_windows[bot_id]
+
         self.bots.clear()
+        self.jigsaw_bots.clear()
         self.bot_threads.clear()
-        
+        self.config["jigsaw_solver_enabled"] = False
+        self._refresh_jigsaw_solver_window()
+
         # Re-enable configuration widgets when all bots stop
         self.set_config_widgets_state('normal')
-        
+
         self.add_status("All bots stopped")
     
     def update_all_button_states(self):
@@ -2679,8 +3223,12 @@ class BotGUI:
                 # Show Pause button
                 self.start_pause_btn.config(text="⏸ Pause All (F5)", bg="#888888", activebackground="#999999")
         else:
-            # No bots running - show Start button
-            self.start_pause_btn.config(state=tk.NORMAL, text="▶ Start All", bg="#888888", activebackground="#999999")
+            # No bots running - show Start button (disabled while jigsaw solver window is open)
+            jigsaw_open = self.jigsaw_solver_window is not None
+            self.start_pause_btn.config(
+                state=tk.DISABLED if jigsaw_open else tk.NORMAL,
+                text="▶ Start All", bg="#888888", activebackground="#999999"
+            )
             self.stop_all_btn.config(state=tk.DISABLED)
         
         # Update active windows count
@@ -2692,6 +3240,10 @@ class BotGUI:
         state: 'normal' to enable, 'disabled' to disable."""
         # Classic fishing checkbox and delay entry
         self.classic_fishing_check.config(state=state)
+        if hasattr(self, 'jigsaw_solver_btn'):
+            self.jigsaw_solver_btn.config(state=state)
+        if hasattr(self, 'jigsaw_define_grid_btn'):
+            self.jigsaw_define_grid_btn.config(state=state)
         self.classic_delay_entry.config(state=state)
         
         # Human-like clicking checkbox
@@ -2757,18 +3309,40 @@ class BotGUI:
         if hasattr(self, 'refresh_windows_btn'):
             self.refresh_windows_btn.config(state=state)
     
+    def _maybe_play_no_bait_alert(self):
+        """Plays the no-bait alert once, off the UI thread, for true bait depletion."""
+        if self._sound_alert_played or not self.config.get('sound_alert_on_finish', True):
+            return
+        if not self._session_started_bot_ids:
+            return
+        if self._session_non_bait_stop_reasons:
+            return
+        if self._session_bait_depleted_bot_ids != self._session_started_bot_ids:
+            return
+
+        self._sound_alert_played = True
+        from utils import play_rickroll_beep
+        threading.Thread(target=play_rickroll_beep, name="no-bait-alert", daemon=True).start()
+
     def on_bot_stopped(self, bot_id: int):
         """Updates UI when a bot stops running."""
+        bot = self.bots.get(bot_id)
+        reason = getattr(bot, 'stop_reason', None)
+        if reason == FishingBot.STOP_BAIT_DEPLETED:
+            self._session_bait_depleted_bot_ids.add(bot_id)
+        elif reason is not None:
+            self._session_non_bait_stop_reasons[bot_id] = reason
+
         if bot_id in self.window_status_labels:
             self.window_status_labels[bot_id].config(text="🔴", fg="#e74c3c")
         if bot_id in self.window_combos:
             self.window_combos[bot_id].config(state="readonly")
-        
+
         # Destroy ignored positions window
         if bot_id in self.ignored_positions_windows:
             self.ignored_positions_windows[bot_id].destroy()
             del self.ignored_positions_windows[bot_id]
-        
+
         # Destroy fish detector debug window
         if bot_id in self.fish_detector_debug_windows:
             self.fish_detector_debug_windows[bot_id].destroy()
@@ -2779,24 +3353,24 @@ class BotGUI:
             self.inventory_detection_debug_windows[bot_id].destroy()
             del self.inventory_detection_debug_windows[bot_id]
 
+        # Destroy jigsaw debug window
+        if bot_id in self.jigsaw_debug_windows:
+            self.jigsaw_debug_windows[bot_id].destroy()
+            del self.jigsaw_debug_windows[bot_id]
+
         # Remove from active bots
         if bot_id in self.bots:
             del self.bots[bot_id]
+        if bot_id in self.jigsaw_bots:
+            del self.jigsaw_bots[bot_id]
         if bot_id in self.bot_threads:
             del self.bot_threads[bot_id]
-        
+
         # Check if all bots stopped
-        if not self.bots:
+        if not self.bots and not self.jigsaw_bots:
             # Re-enable configuration widgets when all bots stop
             self.set_config_widgets_state('normal')
-            
-            # Play sound alert if all selected windows are out of bait (only once per session)
-            if self.config.get('sound_alert_on_finish', True) and not self._sound_alert_played:
-                total_bait = sum(self.window_stats[i]['bait'] for i in range(MAX_WINDOWS) if self.window_selections[i].get())
-                if total_bait <= 0:
-                    self._sound_alert_played = True
-                    from utils import play_rickroll_beep
-                    play_rickroll_beep()
+            self._maybe_play_no_bait_alert()
         
         self.update_all_button_states()
     
@@ -2815,6 +3389,9 @@ class BotGUI:
         # Stop all running bots
         for bot in self.bots.values():
             bot.running = False
+        for bot in self.jigsaw_bots.values():
+            bot.running = False
+        self._close_jigsaw_grid_overlay()
         
         # Stop global keyboard listener
         if self.global_key_listener:

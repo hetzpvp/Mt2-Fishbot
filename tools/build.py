@@ -3,14 +3,14 @@ Build script for MT2 Fishing Bot
 Handles versioning and PyInstaller build process
 
 Usage:
-    python build.py                      - Build with current version
-    python build.py --clean              - Clean build artifacts before building
-    python build.py --version X.X.X      - Build with specific version (updates version.py)
-    python build.py --no-build           - Only update versions without building
-    python build.py --verify             - Verify build environment matches required versions exactly
-    python build.py --update-versions    - Update required versions to currently installed packages
-    python build.py --setup              - Install all required dependencies in .venv
-    python build.py --analyze-size       - Analyze what's taking up space in the build
+    python tools/build.py                      - Build with current version
+    python tools/build.py --clean              - Clean build artifacts before building
+    python tools/build.py --version X.X.X      - Build with specific version (updates version.py)
+    python tools/build.py --no-build           - Only update versions without building
+    python tools/build.py --verify             - Verify build environment matches required versions exactly
+    python tools/build.py --update-versions    - Update required versions to currently installed packages
+    python tools/build.py --setup              - Install all required dependencies in .venv
+    python tools/build.py --analyze-size       - Analyze what's taking up space in the build
 """
 
 import os
@@ -23,7 +23,8 @@ from pathlib import Path
 from datetime import datetime
 
 # File paths (defined early for venv check)
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_DIR = os.path.dirname(TOOLS_DIR)
 VENV_DIR = os.path.join(SCRIPT_DIR, ".venv")
 
 def ensure_venv():
@@ -62,14 +63,17 @@ def ensure_venv():
 # Ensure we're running in the virtual environment before doing anything else
 ensure_venv()
 
+SRC_DIR = os.path.join(SCRIPT_DIR, "src")
+if SRC_DIR not in sys.path:
+    sys.path.insert(0, SRC_DIR)
+
 # Import version from version.py (after venv is ensured)
 from version import VERSION
 
 # File paths (SCRIPT_DIR and VENV_DIR already defined above)
-SRC_DIR = os.path.join(SCRIPT_DIR, "src")
 MAIN_SCRIPT = os.path.join(SRC_DIR, "fishing_bot.py")
-SPEC_FILE = os.path.join(SCRIPT_DIR, "build.spec")
-VERSION_FILE = os.path.join(SCRIPT_DIR, "version.py")
+SPEC_FILE = os.path.join(SCRIPT_DIR, "packaging", "build.spec")
+VERSION_FILE = os.path.join(SRC_DIR, "version.py")
 
 # Patterns to find and replace
 APP_NAME_BASE = "Fishing Puzzle Player"
@@ -112,22 +116,22 @@ def print_section(title):
 
 def print_success(message):
     """Print a success message."""
-    print(f"{Colors.OKGREEN}✓ {message}{Colors.ENDC}")
+    print(f"{Colors.OKGREEN}[OK] {message}{Colors.ENDC}")
 
 
 def print_warning(message):
     """Print a warning message."""
-    print(f"{Colors.WARNING}⚠ {message}{Colors.ENDC}")
+    print(f"{Colors.WARNING}[WARN] {message}{Colors.ENDC}")
 
 
 def print_error(message):
     """Print an error message."""
-    print(f"{Colors.FAIL}✗ {message}{Colors.ENDC}")
+    print(f"{Colors.FAIL}[ERROR] {message}{Colors.ENDC}")
 
 
 def print_info(message):
     """Print an info message."""
-    print(f"{Colors.OKBLUE}ℹ {message}{Colors.ENDC}")
+    print(f"{Colors.OKBLUE}[INFO] {message}{Colors.ENDC}")
 
 
 def verify_dependencies():
@@ -138,15 +142,18 @@ def verify_dependencies():
     # Update these versions to match your production environment
     # BEGIN_REQUIRED_VERSIONS
     required_versions = {
-        'Python': '3.14.2',
-        'PyInstaller': '6.17.0',
-        'Pillow': '12.1.0',
+        'Python': '3.14.4',
+        'PyInstaller': '6.20.0',
+        'Pillow': '12.2.0',
+        'PySide6': '6.11.0',
         'pynput': '1.8.1',
-        'opencv-python-headless': '4.12.0',
-        'numpy': '2.2.6',
-        'psutil': '7.2.1',
+        'opencv-python-headless': '4.13.0',
+        'numpy': '2.4.4',
+        'numba': '0.65.1',
+        'llvmlite': '0.47.0',
+        'psutil': '7.2.2',
         'PyAutoGUI': '0.9.54',
-        'mss': '10.1.0',
+        'mss': '10.2.0',
         'pygetwindow': '0.0.9',
     }
     # END_REQUIRED_VERSIONS
@@ -166,9 +173,12 @@ def verify_dependencies():
     import_names = {
         'PyInstaller': 'PyInstaller',
         'Pillow': 'PIL',
+        'PySide6': 'PySide6',
         'pynput': 'pynput',
         'opencv-python-headless': 'cv2',
         'numpy': 'numpy',
+        'numba': 'numba',
+        'llvmlite': 'llvmlite',
         'psutil': 'psutil',
         'PyAutoGUI': 'pyautogui',
         'mss': 'mss',
@@ -257,8 +267,12 @@ def verify_files():
         MAIN_SCRIPT,
         SPEC_FILE,
         VERSION_FILE,
-        os.path.join(SCRIPT_DIR, 'assets', 'monkey.ico'),
-        os.path.join(SCRIPT_DIR, 'assets', 'monkey-eating.gif'),
+        os.path.join(SCRIPT_DIR, 'assets', 'ui', 'monkey.ico'),
+        os.path.join(SCRIPT_DIR, 'assets', 'ui', 'monkey-eating.gif'),
+        os.path.join(SCRIPT_DIR, 'src', 'jigsaw_solver', 'deterministic.py'),
+        os.path.join(SCRIPT_DIR, 'src', 'jigsaw_solver', 'jigsaw.py'),
+        os.path.join(SCRIPT_DIR, 'src', 'jigsaw_solver', 'solver.py'),
+        os.path.join(SCRIPT_DIR, 'assets', 'jigsaw'),
     ]
     
     missing = []
@@ -388,7 +402,13 @@ def clean_build_artifacts():
     """Removes build artifacts from previous builds."""
     print_info("Cleaning build artifacts...")
     
-    dirs_to_clean = ['build', 'dist', '__pycache__', os.path.join('src', '__pycache__')]
+    dirs_to_clean = [
+        'build',
+        'dist',
+        '__pycache__',
+        os.path.join('src', '__pycache__'),
+        os.path.join('src', 'jigsaw_solver', '__pycache__'),
+    ]
     
     cleaned = 0
     for dir_name in dirs_to_clean:
@@ -490,9 +510,12 @@ def update_required_versions():
     packages = {
         'PyInstaller': 'PyInstaller',
         'Pillow': 'PIL',
+        'PySide6': 'PySide6',
         'pynput': 'pynput',
         'opencv-python-headless': 'cv2',
         'numpy': 'numpy',
+        'numba': 'numba',
+        'llvmlite': 'llvmlite',
         'psutil': 'psutil',
         'PyAutoGUI': 'pyautogui',
         'mss': 'mss',
@@ -578,7 +601,7 @@ def update_required_versions():
             f.write(new_content)
         
         print_success("Updated required_versions in build.py")
-        print_info("Run 'python build.py --verify' to verify against new versions")
+        print_info("Run 'python tools/build.py --verify' to verify against new versions")
         return True
             
     except Exception as e:
@@ -594,9 +617,12 @@ def install_dependencies():
     packages = [
         'PyInstaller',
         'Pillow',
+        'PySide6',
         'pynput',
         'opencv-python-headless',  # Headless version (no GUI dependencies)
         'numpy',
+        'numba',
+        'llvmlite',
         'psutil',
         'PyAutoGUI',
         'mss',
@@ -621,8 +647,8 @@ def install_dependencies():
         
         print()
         print_success("All dependencies installed successfully!")
-        print_info("Run 'python build.py --verify' to verify installation")
-        print_info("Run 'python build.py --update-versions' to save installed versions")
+        print_info("Run 'python tools/build.py --verify' to verify installation")
+        print_info("Run 'python tools/build.py --update-versions' to save installed versions")
         return True
         
     except subprocess.CalledProcessError as e:
@@ -703,14 +729,14 @@ def parse_arguments():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 Examples:
-  python build.py                      # Build with current version
-  python build.py --clean              # Clean and build
-  python build.py --version 1.0.6      # Update to version 1.0.6 and build
-  python build.py --verify             # Verify environment matches required versions
-  python build.py --update-versions    # Update required versions to currently installed
-  python build.py --setup              # Install all required dependencies
-  python build.py --analyze-size       # Analyze build size
-  python build.py --no-build           # Update versions without building
+  python tools/build.py                      # Build with current version
+  python tools/build.py --clean              # Clean and build
+  python tools/build.py --version 1.0.6      # Update to version 1.0.6 and build
+  python tools/build.py --verify             # Verify environment matches required versions
+  python tools/build.py --update-versions    # Update required versions to currently installed
+  python tools/build.py --setup              # Install all required dependencies
+  python tools/build.py --analyze-size       # Analyze build size
+  python tools/build.py --no-build           # Update versions without building
         '''
     )
     

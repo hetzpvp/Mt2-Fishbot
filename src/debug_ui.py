@@ -563,7 +563,7 @@ class FishDetectorDebugWindow(DebugWindow):
         if template is None:
             cv2.putText(viz_frame, "NO CLASSIC FISH TEMPLATE!", (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-            cv2.putText(viz_frame, "Add assets/classic_fish.jpg", (20, 70),
+            cv2.putText(viz_frame, "Add assets/fishing/classic_fish.jpg", (20, 70),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
             status_msg.append("Classic fish: NO TEMPLATE")
             return
@@ -834,6 +834,456 @@ class InventoryDetectionDebugWindow(DebugWindow):
                 lines.append(f"         ↳ {runner_fname:<22} {runner_conf:.2f}")
 
         self.text_var.set("\n".join(lines) if lines else "No items detected.")
+
+    def destroy(self):
+        if self._update_loop_id and self.window:
+            self.window.after_cancel(self._update_loop_id)
+        super().destroy()
+
+
+class JigsawSolverDebugWindow(DebugWindow):
+    """Debug window for the jigsaw solver's internal decision stream."""
+
+    _REFRESH_MS = 350
+
+    def __init__(self, parent: tk.Misc, bot):
+        super().__init__(parent)
+        self.bot = bot
+        self._update_loop_id = None
+        self._photo = None
+        self._events_seen = 0
+        self._step_mode = False
+        self._create_window()
+        self._schedule_update()
+
+    def _create_window(self):
+        bot_id = self.bot.bot_id
+        self.window = tk.Toplevel(self.parent)
+        self.window.title(f"Jigsaw Solver Debug [W{bot_id + 1}]")
+        self.window.geometry("900x860")
+        self.window.configure(bg="#1a1a1a")
+        self.window.resizable(True, True)
+        self._apply_icon()
+        self._create_header(f"Jigsaw Solver Debug [W{bot_id + 1}]")
+
+        top = tk.Frame(self.window, bg="#1a1a1a")
+        top.pack(fill=tk.X, padx=8, pady=(8, 4))
+
+        self.state_var = tk.StringVar(value="Waiting for jigsaw solver...")
+        tk.Label(
+            top,
+            textvariable=self.state_var,
+            justify=tk.LEFT,
+            anchor="w",
+            font=("Courier New", 9, "bold"),
+            bg="#1a1a1a",
+            fg="#FFD700",
+        ).pack(fill=tk.X)
+
+        # Step-control toolbar
+        ctrl = tk.Frame(self.window, bg="#1a1a1a")
+        ctrl.pack(fill=tk.X, padx=8, pady=(0, 2))
+
+        self._step_btn = tk.Button(
+            ctrl, text="▶ Step", width=10,
+            command=self._on_step,
+            bg="#2a2a2a", fg="#FFD700", activebackground="#444444",
+            font=("Courier New", 9, "bold"), relief=tk.FLAT,
+        )
+        self._step_btn.pack(side=tk.LEFT, padx=(0, 6))
+
+        self._run_pause_btn = tk.Button(
+            ctrl, text="⏸ Pause", width=10,
+            command=self._on_toggle_step_mode,
+            bg="#2a2a2a", fg="#00ff88", activebackground="#444444",
+            font=("Courier New", 9, "bold"), relief=tk.FLAT,
+        )
+        self._run_pause_btn.pack(side=tk.LEFT, padx=(0, 6))
+
+        self._step_label = tk.Label(
+            ctrl, text="Running", bg="#1a1a1a", fg="#888888",
+            font=("Courier New", 8),
+        )
+        self._step_label.pack(side=tk.LEFT)
+
+        self.canvas = tk.Canvas(
+            self.window,
+            width=864,
+            height=420,
+            bg="black",
+            highlightthickness=1,
+            highlightbackground="#333333",
+        )
+        self.canvas.pack(fill=tk.BOTH, expand=False, padx=8, pady=4)
+
+        lower = tk.PanedWindow(self.window, orient=tk.VERTICAL, bg="#1a1a1a", sashrelief=tk.RAISED)
+        lower.pack(fill=tk.BOTH, expand=True, padx=8, pady=(4, 8))
+
+        self.detail_text = tk.Text(
+            lower,
+            height=9,
+            bg="#111111",
+            fg="#e0e0e0",
+            insertbackground="#e0e0e0",
+            font=("Courier New", 9),
+            wrap=tk.WORD,
+            state=tk.DISABLED,
+        )
+        self.event_text = tk.Text(
+            lower,
+            height=12,
+            bg="#111111",
+            fg="#00ff88",
+            insertbackground="#00ff88",
+            font=("Courier New", 8),
+            wrap=tk.WORD,
+            state=tk.DISABLED,
+        )
+        lower.add(self.detail_text)
+        lower.add(self.event_text)
+
+        self.window.protocol("WM_DELETE_WINDOW", self.hide)
+
+    def _on_step(self):
+        """Signal the bot to execute exactly one iteration."""
+        if not self._step_mode:
+            self._on_toggle_step_mode()
+        getattr(self.bot, "step", lambda: None)()
+
+    def _on_toggle_step_mode(self):
+        """Toggle between step-by-step and free-running modes."""
+        self._step_mode = not self._step_mode
+        getattr(self.bot, "set_step_mode", lambda _: None)(self._step_mode)
+        if self._step_mode:
+            self._run_pause_btn.config(text="▶ Run", fg="#FFD700")
+            self._step_label.config(text="Step mode — click Step to advance")
+        else:
+            self._run_pause_btn.config(text="⏸ Pause", fg="#00ff88")
+            self._step_label.config(text="Running")
+
+    def _schedule_update(self):
+        if self.window:
+            self._update_loop_id = self.window.after(self._REFRESH_MS, self._tick)
+
+    def _tick(self):
+        if not self.window:
+            return
+        try:
+            self._update_display()
+        except Exception as e:
+            if DEBUG_PRINTS:
+                print(f"[JigsawSolverDebugWindow] tick error: {e}")
+        self._schedule_update()
+
+    def _update_display(self):
+        snapshot = getattr(self.bot, "debug_snapshot", lambda: {})()
+        events = getattr(self.bot, "debug_events", lambda: [])()
+        self._draw_snapshot(snapshot)
+        self._write_detail(snapshot)
+        if len(events) != self._events_seen:
+            self._write_events(events)
+            self._events_seen = len(events)
+
+    def _draw_snapshot(self, snapshot: dict):
+        frame = snapshot.get("frame")
+        panel_h = 420
+        panel_w = 430
+        live_w = 430
+
+        solver_panel = self._render_solver_panel(snapshot, panel_w, panel_h)
+
+        if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
+            live = np.zeros((panel_h, live_w, 3), dtype=np.uint8)
+            cv2.putText(
+                live,
+                "Waiting for capture...",
+                (40, panel_h // 2),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 215, 255),
+                2,
+            )
+        else:
+            overlay = frame.copy()
+            grid_bounds = snapshot.get("grid_bounds")
+            display_region = None
+            if grid_bounds:
+                x, y, w, h = grid_bounds
+                cv2.rectangle(overlay, (x, y), (x + w, y + h), (0, 255, 255), 2)
+                cv2.putText(overlay, "grid", (x, max(12, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+                self._draw_grid_cells(overlay, grid_bounds, snapshot)
+                display_region = self._grid_focus_region(overlay.shape, grid_bounds, 100)
+
+            slot_centers = snapshot.get("slot_centers") or {}
+            available = set(snapshot.get("available_sections") or [])
+            missing = set(snapshot.get("missing_sections") or [])
+            for section, point in slot_centers.items():
+                color = (0, 220, 0) if section in available else (0, 0, 255) if section in missing else (0, 165, 255)
+                px, py = int(point[0]), int(point[1])
+                cv2.circle(overlay, (px, py), 16, color, 2)
+                cv2.putText(overlay, section, (px - 30, py - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1)
+
+            target = snapshot.get("decision_target")
+            if target:
+                tx, ty = int(target[0]), int(target[1])
+                cv2.drawMarker(overlay, (tx, ty), (255, 0, 255), cv2.MARKER_CROSS, 22, 2)
+                cv2.putText(overlay, "place", (tx + 8, ty - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 0, 255), 1)
+
+            if display_region is not None:
+                x1, y1, x2, y2 = display_region
+                overlay = overlay[y1:y2, x1:x2]
+
+            live = self._fit_into(overlay, live_w, panel_h)
+
+        cv2.putText(live, "LIVE", (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 215, 255), 2)
+        cv2.putText(solver_panel, "EXPECTED", (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 215, 255), 2)
+
+        divider = np.full((panel_h, 4, 3), 60, dtype=np.uint8)
+        combined = np.hstack([live, divider, solver_panel])
+        combined_rgb = cv2.cvtColor(combined, cv2.COLOR_BGR2RGB)
+        self._photo = ImageTk.PhotoImage(Image.fromarray(combined_rgb))
+        h, w = combined.shape[:2]
+        self.canvas.config(width=w, height=h)
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, anchor=tk.NW, image=self._photo)
+
+    def _fit_into(self, img: np.ndarray, target_w: int, target_h: int) -> np.ndarray:
+        """Resize img preserving aspect, padded into a (target_h, target_w) BGR canvas."""
+        h, w = img.shape[:2]
+        if h == 0 or w == 0:
+            return np.zeros((target_h, target_w, 3), dtype=np.uint8)
+        scale = min(target_w / w, target_h / h)
+        disp_w = max(1, int(w * scale))
+        disp_h = max(1, int(h * scale))
+        resized = cv2.resize(img, (disp_w, disp_h), interpolation=cv2.INTER_AREA)
+        canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+        oy = (target_h - disp_h) // 2
+        ox = (target_w - disp_w) // 2
+        canvas[oy:oy + disp_h, ox:ox + disp_w] = resized
+        return canvas
+
+    def _render_solver_panel(self, snapshot: dict, width: int, height: int) -> np.ndarray:
+        """Render the solver-style abstract board + piece preview the bot expected.
+
+        Mirrors fishing_jigsaw_solver.JigsawApp:
+          - filled cells -> gold
+          - chosen placement cells -> green
+          - empty cells -> dark gray
+          - piece figure rendered on the right side
+        """
+        panel = np.full((height, width, 3), 26, dtype=np.uint8)
+
+        cell = 44
+        board_cols, board_rows = 6, 4
+        board_w = board_cols * cell
+        board_h = board_rows * cell
+        margin_x = 18
+        board_x = margin_x
+        board_y = 50
+
+        filled = set(snapshot.get("filled_cells") or [])
+        placement = set(snapshot.get("placement_cells") or [])
+        decision_action = snapshot.get("decision_action")
+
+        gold = (0, 215, 255)        # filled (BGR)
+        green = (60, 200, 60)       # expected placement
+        empty = (60, 60, 60)
+        outline = (200, 200, 200)
+
+        for row in range(board_rows):
+            for col in range(board_cols):
+                idx = row * board_cols + col
+                x1 = board_x + col * cell
+                y1 = board_y + row * cell
+                x2 = x1 + cell
+                y2 = y1 + cell
+                if idx in filled:
+                    color = gold
+                elif idx in placement and decision_action == "place":
+                    color = green
+                else:
+                    color = empty
+                cv2.rectangle(panel, (x1, y1), (x2, y2), color, -1)
+                cv2.rectangle(panel, (x1, y1), (x2, y2), outline, 1)
+
+        # Header text describing what the bot expected
+        piece_id = snapshot.get("piece_id") or "?"
+        figure_index = snapshot.get("figure_index")
+        decision_reason = snapshot.get("decision_reason", "")
+        chosen_action = snapshot.get("chosen_action")
+
+        cv2.putText(panel, "Solver board", (board_x, board_y - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1)
+
+        # Piece preview box (right of the board)
+        piece_box_x = board_x + board_w + 20
+        piece_box_y = board_y
+        piece_cell = 28
+        piece_grid = 4  # show 4x4 region (max piece is 4x3)
+        piece_box_w = piece_grid * piece_cell
+        piece_box_h = piece_grid * piece_cell
+
+        cv2.putText(panel, "Piece", (piece_box_x, piece_box_y - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1)
+        cv2.rectangle(panel, (piece_box_x - 2, piece_box_y - 2),
+                      (piece_box_x + piece_box_w + 2, piece_box_y + piece_box_h + 2),
+                      (90, 90, 90), 1)
+
+        piece_cells = self._piece_cells_for_figure(figure_index)
+        for row in range(piece_grid):
+            for col in range(piece_grid):
+                x1 = piece_box_x + col * piece_cell
+                y1 = piece_box_y + row * piece_cell
+                x2 = x1 + piece_cell
+                y2 = y1 + piece_cell
+                if (col, row) in piece_cells:
+                    color = (60, 60, 220)  # red
+                else:
+                    color = (40, 40, 40)
+                cv2.rectangle(panel, (x1, y1), (x2, y2), color, -1)
+                cv2.rectangle(panel, (x1, y1), (x2, y2), (90, 90, 90), 1)
+
+        # Footer text
+        info_y = board_y + board_h + 28
+        line_h = 18
+        info_lines = [
+            f"piece_id : {piece_id}",
+            f"figure   : {figure_index if figure_index is not None else '-'}",
+            f"action   : {chosen_action if chosen_action is not None else '-'}",
+            f"decision : {snapshot.get('decision_action', '-')}",
+            f"reason   : {decision_reason[:40]}",
+            f"filled   : {len(filled)}/24",
+        ]
+        for i, line in enumerate(info_lines):
+            cv2.putText(
+                panel,
+                line,
+                (margin_x, info_y + i * line_h),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.42,
+                (200, 200, 200),
+                1,
+            )
+
+        # Legend
+        legend_y = height - 22
+        cv2.rectangle(panel, (margin_x, legend_y - 10), (margin_x + 14, legend_y + 4), gold, -1)
+        cv2.putText(panel, "filled", (margin_x + 20, legend_y + 2), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+        cv2.rectangle(panel, (margin_x + 90, legend_y - 10), (margin_x + 104, legend_y + 4), green, -1)
+        cv2.putText(panel, "expected", (margin_x + 110, legend_y + 2), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+        cv2.rectangle(panel, (margin_x + 200, legend_y - 10), (margin_x + 214, legend_y + 4), (60, 60, 220), -1)
+        cv2.putText(panel, "piece", (margin_x + 220, legend_y + 2), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+
+        return panel
+
+    # (col, row) offsets in the piece's own frame, derived directly from the
+    # FIGURES bitmasks in fishing_jigsaw_solver.py. The encoding shifts a cell
+    # at (col, row) by (col * N + row), so cells step ROW-first within a column
+    # — i.e. FIGURES[1] (0b1110_0000) is a *vertical* line, not horizontal.
+    _PIECE_OFFSETS = {
+        0: [(0, 0)],                                  # F0 single cell
+        1: [(0, 0), (0, 1), (0, 2)],                  # F1 vertical line of 3
+        2: [(0, 0), (0, 1), (1, 1)],                  # F2 L-shape
+        3: [(0, 0), (1, 0), (1, 1)],                  # F3 Reverse L-shape
+        4: [(0, 0), (0, 1), (1, 0), (1, 1)],          # F4 2x2 square
+        5: [(0, 0), (1, 0), (1, 1), (2, 1)],          # F5 S-shape
+    }
+
+    def _piece_cells_for_figure(self, figure_index):
+        if figure_index is None:
+            return set()
+        try:
+            return set(self._PIECE_OFFSETS.get(int(figure_index), []))
+        except (TypeError, ValueError):
+            return set()
+
+    def _grid_focus_region(self, shape, grid_bounds, border: int):
+        frame_h, frame_w = shape[:2]
+        x, y, w, h = grid_bounds
+        x1 = max(0, x - border)
+        y1 = max(0, y - border)
+        x2 = min(frame_w, x + w + border)
+        y2 = min(frame_h, y + h + border)
+        return (x1, y1, x2, y2)
+
+    def _draw_grid_cells(self, overlay: np.ndarray, grid_bounds, snapshot: dict):
+        x, y, w, h = grid_bounds
+        cell_w = w / 6.0
+        cell_h = h / 4.0
+        filled = set(snapshot.get("filled_cells") or [])
+        placement = set(snapshot.get("placement_cells") or [])
+        candidates = snapshot.get("decision_candidates") or []
+        best_preview = set(candidates[0].get("cells", [])) if candidates else set()
+
+        for row in range(4):
+            for col in range(6):
+                idx = row * 6 + col
+                x1 = int(round(x + col * cell_w))
+                y1 = int(round(y + row * cell_h))
+                x2 = int(round(x + (col + 1) * cell_w))
+                y2 = int(round(y + (row + 1) * cell_h))
+                if idx in placement:
+                    color = (255, 0, 255)
+                    label = "P"
+                elif idx in filled:
+                    color = (0, 200, 255)
+                    label = "F"
+                elif idx in best_preview:
+                    color = (180, 80, 255)
+                    label = "B"
+                else:
+                    color = (80, 80, 80)
+                    label = ""
+                cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 1)
+                if label:
+                    cv2.putText(
+                        overlay,
+                        label,
+                        (x1 + 4, y1 + 14),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.42,
+                        color,
+                        1,
+                    )
+
+    def _write_detail(self, snapshot: dict):
+        status = snapshot.get("status", "Waiting for jigsaw solver...")
+        self.state_var.set(status)
+        lines = [
+            f"Grid: found={snapshot.get('grid_found')} conf={snapshot.get('grid_confidence', 0.0):.2f} mask={snapshot.get('board_mask', 0):024b}",
+            f"Cells: filled={len(snapshot.get('filled_cells') or [])}/24 empty={24 - len(snapshot.get('filled_cells') or [])}",
+            f"Slots: available={sorted(snapshot.get('available_sections') or [])} missing={sorted(snapshot.get('missing_sections') or [])} conf={snapshot.get('slot_confidence', {})}",
+            f"Inventory page: {snapshot.get('inventory_page', '-')}",
+            f"Crate: {snapshot.get('crate_section', '-')} at {snapshot.get('crate_center', '-')}",
+            f"Piece: {snapshot.get('piece_id', '-')} figure={snapshot.get('figure_index', '-')} conf={snapshot.get('piece_confidence', 0.0):.2f}",
+            f"Decision: {snapshot.get('decision_action', '-')} target={snapshot.get('decision_target', '-')} reason={snapshot.get('decision_reason', '-')}",
+            self._format_candidates(snapshot.get("decision_candidates") or [], snapshot.get("chosen_action")),
+        ]
+        self.detail_text.config(state=tk.NORMAL)
+        self.detail_text.delete("1.0", tk.END)
+        self.detail_text.insert(tk.END, "\n".join(lines))
+        self.detail_text.config(state=tk.DISABLED)
+
+    def _format_candidates(self, candidates, chosen_action):
+        if not candidates:
+            return "Legal placements: none recorded yet"
+        rows = ["Legal placements (lower score is better):"]
+        for item in candidates[:8]:
+            marker = "*" if item.get("action") == chosen_action else " "
+            rows.append(
+                f" {marker} action={item.get('action'):>2} offset={item.get('offset')} "
+                f"score={item.get('score', 0.0):.3f} cells={item.get('cells')}"
+            )
+        return "\n".join(rows)
+
+    def _write_events(self, events):
+        self.event_text.config(state=tk.NORMAL)
+        self.event_text.delete("1.0", tk.END)
+        for event in events[-120:]:
+            ts = time.strftime("%H:%M:%S", time.localtime(event.get("time", time.time())))
+            name = event.get("event", "event")
+            detail = event.get("detail", "")
+            self.event_text.insert(tk.END, f"[{ts}] {name:<18} {detail}\n")
+        self.event_text.see(tk.END)
+        self.event_text.config(state=tk.DISABLED)
 
     def destroy(self):
         if self._update_loop_id and self.window:

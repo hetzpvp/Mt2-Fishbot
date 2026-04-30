@@ -1,0 +1,1 @@
+"""Fishing Jigsaw solver package."""

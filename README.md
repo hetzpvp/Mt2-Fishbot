@@ -1,4 +1,4 @@
-# MT2 Fishing Bot — v1.1
+# MT2 Fishing Bot — v1.2
 **THIS PROJECT WAS BUILT FOR EDUCATIONAL AND LEARNING PURPOSES ONLY!**
 
 Free fishing minigame bot for Metin2. No subscriptions, no licenses.
@@ -9,7 +9,7 @@ Free fishing minigame bot for Metin2. No subscriptions, no licenses.
 
 ## Preview
 
-![GUI Demo](gui_demo.png)
+![GUI Demo](docs/gui_demo.png)
 
 ---
 
@@ -21,7 +21,7 @@ Free fishing minigame bot for Metin2. No subscriptions, no licenses.
 
 ## Download
 
-**Latest Version:** 1.1 (2026)
+**Latest Version:** 1.2 (2026)
 
 ---
 
@@ -31,12 +31,12 @@ Free fishing minigame bot for Metin2. No subscriptions, no licenses.
 - **Visual processing only** — Completely undetectable
 - **Dual fishing modes** — Both new minigame and classic fishing supported
 - **Automatic inventory management** — Multi-page support (up to 8 pages) with auto-switching when full
-- **Intelligent fish handling** — Keep/open/drop/sell per fish type with automatic position detection
+- **Intelligent fish handling** — Keep/open/drop per fish type with automatic position detection
+- **Integrated jigsaw solver** — Automatically solves the fishing jigsaw minigame
 - **Quick skip modes** — Horse (CTRL+G) or armor slot equip/unequip
 - **Configurable bait system** — Up to 4 bait hotkeys (1-4, F1-F4), 200 bait each
 - **Advanced timing control** — Customizable click/key input delays for compatibility with different servers
 - **GUI customization** — Accent color picker with RGB wave animation effects
-- **Live debug tools** — Status log, inventory state visualization, fish detector overlay
 - **F5 pause/resume** — Pause/resume all bots instantly
 
 ---
@@ -49,7 +49,7 @@ Free fishing minigame bot for Metin2. No subscriptions, no licenses.
 
 1. Execute the bot as administrator
 2. Select target Metin2 windows (up to 8 clients)
-3. **NEW — Configure inventory page tabs** (mandatory for page switching)
+3. **Configure inventory page tabs** (mandatory for page switching)
    - Click "Page 1" button and click the inventory page 1 tab in your game
    - Repeat for Pages 2, 3, and 4 (Pages 5-8 are optional)
    - This allows the bot to automatically switch pages when your inventory fills up
@@ -60,12 +60,16 @@ Free fishing minigame bot for Metin2. No subscriptions, no licenses.
    - ⚠️ Quick skip (Horse mode) requires a horse!
    - ⚠️ Quick skip (Armor mode) requires armor equipped and coordinates set!
    - ⚠️ Automatic fish handling requires inventory to be open!
-6. (Optional) Customize timing settings for your server
+6. Place bait in each selected hotkey slot
+7. Start the bot!
+8. Press **F5** to pause/resume all bots
+
+(Optional) Enable the jigsaw solver
+   - Toggle "Jigsaw Solver" in the GUI to automate the fishing jigsaw minigame
+(Optional) Customize timing settings for your server
    - Click "⏱ Timing Settings..." to adjust click/key input delays
    - Default timings work for most servers; only adjust if needed
-7. Place bait in each selected hotkey slot
-8. Start the bot!
-9. Press **F5** to pause/resume all bots
+
 
 ---
 
@@ -89,6 +93,15 @@ Free fishing minigame bot for Metin2. No subscriptions, no licenses.
   - Pages 5-8 are **optional** (only set if your game has extra pages)
   - Bot auto-switches pages when all slots on the current page are occupied
 
+### Jigsaw Solver
+- **Jigsaw Solver** — Automatically detects and solves the fishing jigsaw minigame
+  - Toggle on/off from the main GUI
+  - **Dry-run mode** — Simulates clicks without performing them (for testing)
+  - **Crate priority** — Choose whether to fill normal or empty crates first
+  - **Detection threshold** — Confidence level for piece recognition (default: 0.8)
+  - **Action delay** — Delay between jigsaw clicks in seconds (default: 0.15)
+  - Debug screenshots can be saved for troubleshooting
+
 ### Bait & Casting
 - **Bait Management** — Configurable hotkeys (1-4 or F1-F4)
   - Each key = 200 bait (select 1-4 keys for 200-800 total bait)
@@ -99,7 +112,7 @@ Free fishing minigame bot for Metin2. No subscriptions, no licenses.
   - **Armor mode** — Right-click configured armor slot (equip ↔ unequip)
 
 ### Input Timing
-- **NEW — Timing Settings** ⏱
+- **Timing Settings** ⏱
   - Fine-tune all click/key input delays for compatibility with different servers
   - Categories:
     - **Fish Clicking** — Cursor settle, mouse button hold, post-click settle
@@ -117,7 +130,7 @@ Free fishing minigame bot for Metin2. No subscriptions, no licenses.
   - **RGB Wave Effect** (optional) — Animated rainbow color cycling
 - **Display Options**
   - Show status log — Real-time activity messages (useful for debugging)
-  - Debug mode (show ignored positions, fish detector overlay) — Enable in `utils.py` if needed
+  - Debug mode (show ignored positions, fish detector overlay, inventory overlay, jigsaw overlay)
 
 ---
 
@@ -133,11 +146,21 @@ Free fishing minigame bot for Metin2. No subscriptions, no licenses.
 - For drop actions, set drop button and confirm button coordinates
 - Check that the timing settings are appropriate for your server (⏱ Timing Settings)
 
+**Q: Jigsaw solver not detecting pieces?**
+- Lower the detection threshold in jigsaw settings
+- Ensure the jigsaw grid is fully visible on screen
+
+**Q: Bot stops switching inventory pages?**
+- Confirm all 4 mandatory page tabs are calibrated (Page 1–4 buttons)
+- Ensure page tab coordinates match your current screen resolution
+
 ---
 
 ## Version History
 
-- **v1.1 (Latest)** — Multi-page inventory management, configurable timing settings, improved auto-drop stability
+- **v1.2.0 (Latest)** — Integrated jigsaw puzzle solver, jigsaw debug window and new GUI
+- **v1.1.1** — New debug windows: inventory detection overlay, ignored positions grid
+- **v1.1.0** — Multi-page inventory management, configurable timing settings, improved auto-drop stability
 - **v1.0.5** — Redesigned GUI with better layout
 - **v1.0.4** — Bug fixes for goldfish/zander detection, improved drop reliability
 - **v1.0.3** — Fish drop mechanism implementation
@@ -153,7 +176,7 @@ Free fishing minigame bot for Metin2. No subscriptions, no licenses.
 - **Administrator required** — Must run as admin for mouse/keyboard input injection
 - **Game settings** — Display scale should be 100% for best detection (auto-scales but may need adjustment)
 - **Inventory mode** — Auto fish handling works best when inventory is mostly empty at startup
-- **Network latency** — If your server has high ping, may need to increase item handling timing delays
+- **Network latency** — If your server has high ping, increase item handling timing delays
 - **Window positioning** — Game window must remain visible (can be in background but not minimized)
 
 ---

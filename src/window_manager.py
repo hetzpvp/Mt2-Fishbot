@@ -2,12 +2,16 @@
 Window Manager and Game Region classes for the Fishing Bot
 """
 
+import ctypes
 import time
 from dataclasses import dataclass
 from typing import List, Tuple
 
 import pygetwindow as gw
 from utils import DEBUG_PRINTS
+
+_user32 = ctypes.windll.user32
+_SW_RESTORE = 9
 
 
 class WindowManager:
@@ -17,6 +21,21 @@ class WindowManager:
         self.selected_window = None
         self._rect_cache = None
         self._rect_cache_time = 0.0
+
+    def is_window_available(self) -> bool:
+        """Returns False when the selected window handle no longer exists."""
+        if not self.selected_window:
+            return False
+
+        try:
+            hwnd = getattr(self.selected_window, "_hWnd", None)
+            if not hwnd or not _user32.IsWindow(hwnd):
+                self.invalidate_rect_cache()
+                return False
+            return True
+        except Exception:
+            self.invalidate_rect_cache()
+            return False
     
     @staticmethod
     def get_all_windows() -> List[Tuple[str, gw.Win32Window]]:
@@ -77,37 +96,52 @@ class WindowManager:
         return result
     
     def activate_window(self, force_activate: bool = False):
-        """Activates and brings the selected window to focus"""
+        """Activates and brings the selected window to focus.
+        Retries until GetForegroundWindow confirms our HWND is active, so that
+        callers holding input_lock can be sure the click lands on the right window.
+        Uses ctypes directly instead of pygetwindow.activate() to avoid a GIL
+        corruption bug in pygetwindow 0.0.9 on Python 3.13+."""
         if not self.selected_window:
             return
         try:
-            # Check if window is already active (skip activation for speed)
+            target_hwnd = self.selected_window._hWnd
+            if not target_hwnd or not _user32.IsWindow(target_hwnd):
+                self.invalidate_rect_cache()
+                return
+
+            # Fast path: already active — skip everything.
             if not force_activate:
-                try:
-                    active_win = gw.getActiveWindow()
-                    if active_win and active_win._hWnd == self.selected_window._hWnd:
-                        return  # Already active, skip
-                except:
-                    pass
-            
-            # Try to activate the window (single attempt for speed)
+                if _user32.GetForegroundWindow() == target_hwnd:
+                    return
+
+            # Restore if minimized before trying to activate.
             try:
-                # Restore window if minimized
-                if self.selected_window.isMinimized:
-                    self.selected_window.restore()
+                if _user32.IsIconic(target_hwnd):
+                    _user32.ShowWindow(target_hwnd, _SW_RESTORE)
                     time.sleep(0.05)
-                
-                # Activate the window
-                self.selected_window.activate()
-                time.sleep(0.025)  # Minimal delay
             except Exception:
-                # Retry once on failure
+                pass
+
+            # Retry loop: call SetForegroundWindow and verify via GetForegroundWindow.
+            # Windows can silently ignore SetForegroundWindow when the calling
+            # thread doesn't own the foreground, causing the click to land on
+            # whatever window is currently in front (typically the other bot's
+            # window). Three attempts with 30 ms gaps covers all real-world cases.
+            for attempt in range(3):
                 try:
-                    time.sleep(0.05)
-                    self.selected_window.activate()
-                    time.sleep(0.025)
-                except:
+                    _user32.SetForegroundWindow(target_hwnd)
+                except Exception:
                     pass
+
+                time.sleep(0.030)  # Let OS process the activation request
+
+                if _user32.GetForegroundWindow() == target_hwnd:
+                    return  # Confirmed active — safe to click
+
+            # Fell through all attempts — log once and continue (best effort).
+            if DEBUG_PRINTS:
+                print(f"Warning: could not confirm window activation after 3 attempts")
+
         except Exception as e:
             if DEBUG_PRINTS:
                 print(f"Error activating window: {e}")

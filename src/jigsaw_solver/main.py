@@ -5,14 +5,18 @@ A solver for the fishing jigsaw puzzle game using dynamic programming
 to find optimal moves.
 
 Usage:
-    python main.py          # Launch GUI application
-    python main.py --cli    # Use command-line interface
+    python -m jigsaw_solver.main          # Launch GUI application
+    python -m jigsaw_solver.main --cli    # Use command-line interface
 """
 import sys
 import random
 
-from jigsaw import Jigsaw, FIGURES, SKIP_ACTION
-from deterministic import get_solver
+try:
+    from .jigsaw import Jigsaw, FIGURES, SKIP_ACTION
+    from .deterministic import get_solver
+except ImportError:  # Allows running this module directly from src/jigsaw_solver.
+    from jigsaw import Jigsaw, FIGURES, SKIP_ACTION  # type: ignore
+    from deterministic import get_solver  # type: ignore
 
 
 def cli_mode():
@@ -76,7 +80,10 @@ def cli_mode():
 
 def gui_mode():
     """Run in GUI mode."""
-    from app import main
+    try:
+        from .app import main
+    except ImportError:
+        from app import main  # type: ignore
     main()
 
 
