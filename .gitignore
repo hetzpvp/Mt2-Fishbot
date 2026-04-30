@@ -33,3 +33,7 @@ bot_config.json
 Thumbs.db
 .DS_Store
 Minigame.code-workspace
+
+.claude/
+packaging/
+CLAUDE.md
