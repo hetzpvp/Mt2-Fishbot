@@ -8,6 +8,7 @@ import json
 import os
 import threading
 import time
+import webbrowser
 import tkinter as tk
 from tkinter import ttk, messagebox
 from typing import Optional, Dict
@@ -23,7 +24,7 @@ try:
 except ImportError:
     keyboard = None
 
-from utils import get_resource_path, MAX_WINDOWS, DEBUG_MODE_EN, DEBUG_PRINTS, load_window_icon
+from utils import get_resource_path, MAX_WINDOWS, DEBUG_MODE_EN, DEBUG_PRINTS, load_window_icon, DISCORD_INVITE_URL
 from window_manager import WindowManager
 from fishing_bot import FishingBot
 from debug_ui import IgnoredPositionsWindow, FishDetectorDebugWindow, StatusLogWindow, InventoryDetectionDebugWindow, JigsawSolverDebugWindow
@@ -599,7 +600,7 @@ class TimingSettingsWindow:
 class BotGUI:
     """GUI for the fishing bot - supports up to 8 simultaneous windows"""
     
-    BOT_VERSION = "2.0.0"  # Version for config validation and GUI display
+    BOT_VERSION = "2.0.1"  # Version for config validation and GUI display
     ACCENT_COLOR = "#FFBB00"  # Gold color used throughout the GUI
     
     def __init__(self):
@@ -772,11 +773,14 @@ class BotGUI:
                         bg="#000000", fg=BotGUI.ACCENT_COLOR)
         title.pack(anchor=tk.CENTER)
         
-        # Discord info
-        discord_label = tk.Label(title_container, text="Discord: boristei", 
-                                font=("Courier New", 10), 
-                                bg="#000000", fg=BotGUI.ACCENT_COLOR)
-        discord_label.pack(anchor=tk.CENTER)
+        # Discord support server button
+        discord_btn = tk.Button(title_container, text="Discord Server Support",
+                                font=("Courier New", 10, "bold"),
+                                bg="#5865F2", fg="white",
+                                activebackground="#4752c4", activeforeground="white",
+                                relief=tk.FLAT, bd=0, padx=10, pady=2, cursor="hand2",
+                                command=lambda: webbrowser.open(DISCORD_INVITE_URL))
+        discord_btn.pack(anchor=tk.CENTER, pady=(2, 0))
         
         # Right GIF (only if loaded)
         if self.photo_images:

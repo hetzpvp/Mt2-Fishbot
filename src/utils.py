@@ -94,6 +94,9 @@ input_lock = PriorityInputLock()
 # Max simultaneous game windows
 MAX_WINDOWS = 8
 
+# Support Discord server invite (shown as a clickable button in the GUI header)
+DISCORD_INVITE_URL = "https://discord.gg/vZaHCRFqW7"
+
 # Debug mode - enable/disable IgnoredPositionsWindow
 DEBUG_MODE_EN = False
 

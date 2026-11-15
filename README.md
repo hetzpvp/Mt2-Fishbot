@@ -1,9 +1,11 @@
-# MT2 Fishing Bot — v2.0.0
+# MT2 Fishing Bot — v2.0.1
 
 Free fishing-minigame bot for Metin2. No subscriptions, no licenses.
 **Built for educational and learning purposes only.**
 
-[Video tutorial](https://youtu.be/M0THxnio894) · [Download](releases/windows/) · Discord: `boristei`
+[Video tutorial](https://youtu.be/M0THxnio894) · [Download](releases/windows/) · [Discord server support](https://discord.gg/vZaHCRFqW7)
+
+**Download v2.0.1 (Windows .exe):** [MediaFire](https://www.mediafire.com/file/krsxje62vlvt2e0/Fishing_Puzzle_Player_v2.0.1.exe/file) · [VirusTotal scan](https://www.virustotal.com/gui/url/83eec99981cce231faf64ecd89b88359f5d598da6bb95e0ff1e9b1f6a60e3c58?nocache=1)
 
 ![GUI](docs/gui_demo.png)
 

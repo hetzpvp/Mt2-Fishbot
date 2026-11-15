@@ -33,11 +33,11 @@ elif sys.platform.startswith("linux"):
     os.environ.setdefault("QT_QPA_PLATFORM", "xcb;wayland")
 
 from PySide6.QtCore import (
-    QByteArray, QEvent, QObject, QPoint, QSize, Qt, QTimer, Signal,
+    QByteArray, QEvent, QObject, QPoint, QSize, Qt, QTimer, QUrl, Signal,
 )
 from PySide6.QtGui import (
-    QColor, QFont, QFontDatabase, QIcon, QKeySequence, QMovie, QPainter,
-    QPalette, QPixmap, QShortcut,
+    QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QKeySequence,
+    QMovie, QPainter, QPalette, QPixmap, QShortcut,
 )
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
@@ -53,7 +53,8 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 from utils import (  # noqa: E402
-    DEBUG_MODE_EN, DEBUG_PRINTS, MAX_WINDOWS, get_project_root, get_resource_path,
+    DEBUG_MODE_EN, DEBUG_PRINTS, DISCORD_INVITE_URL, MAX_WINDOWS, get_project_root,
+    get_resource_path,
     load_window_icon, play_rickroll_beep,
 )
 from window_manager import WindowManager  # noqa: E402
@@ -202,6 +203,19 @@ def build_qss(accent: str = C["accent"]) -> str:
         font-size: 11px;
         font-weight: 600;
     }}
+    QPushButton#DiscordBtn {{
+        background: #5865F2;
+        color: white;
+        border: 1px solid #4752c4;
+        border-radius: 11px;
+        padding: 0 12px;
+        font-family: {MONO};
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 1px;
+    }}
+    QPushButton#DiscordBtn:hover {{ background: #6d78f5; }}
+    QPushButton#DiscordBtn:pressed {{ background: #4752c4; }}
     .HlValueIdle {{ color: {C['green']}; font-family: {MONO}; font-size: 11px; font-weight: 600; }}
     .HlValueRun  {{ color: {C['accent']}; font-family: {MONO}; font-size: 11px; font-weight: 600; }}
 
@@ -1053,7 +1067,14 @@ class Header(QFrame):
         subrow.setContentsMargins(0, 0, 0, 0)
         subrow.setSpacing(8)
         subrow.setAlignment(Qt.AlignCenter)
-        self._discord_pill = self._make_hl("DISCORD", "boristei", value_class="HlValue")
+        self._discord_pill = QPushButton("DISCORD SERVER SUPPORT")
+        self._discord_pill.setObjectName("DiscordBtn")
+        self._discord_pill.setFixedHeight(22)
+        self._discord_pill.setCursor(Qt.PointingHandCursor)
+        self._discord_pill.setToolTip(f"Join the support server: {DISCORD_INVITE_URL}")
+        self._discord_pill.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl(DISCORD_INVITE_URL))
+        )
         self._input_pill, self._input_value = self._make_hl_pair("INPUT", "—")
         self._status_pill, self._status_value = self._make_hl_status("STATUS", "● IDLE")
         subrow.addStretch(1)
