@@ -1,4 +1,4 @@
-# MT2 Fishing Bot — v1.2.0
+# MT2 Fishing Bot — v2.0.0
 **THIS PROJECT WAS BUILT FOR EDUCATIONAL AND LEARNING PURPOSES ONLY!**
 
 Free fishing minigame bot for Metin2. No subscriptions, no licenses.
@@ -21,7 +21,7 @@ Free fishing minigame bot for Metin2. No subscriptions, no licenses.
 
 ## Download
 
-**Latest Version:** 1.2.0 (2026)
+**Latest Version:** 2.0.0 (2026)
 
 ---
 
@@ -158,7 +158,8 @@ Free fishing minigame bot for Metin2. No subscriptions, no licenses.
 
 ## Version History
 
-- **v1.2.0 (Latest)** — Integrated jigsaw puzzle solver, jigsaw debug window and new GUI
+- **v2.0.0 (Latest)** — Linux port (X11/Wine) with an OS abstraction layer
+- **v1.2.0** — Integrated jigsaw puzzle solver, jigsaw debug window and new GUI
 - **v1.1.1** — New debug windows: inventory detection overlay, ignored positions grid
 - **v1.1.0** — Multi-page inventory management, configurable timing settings, improved auto-drop stability
 - **v1.0.5** — Redesigned GUI with better layout
@@ -172,7 +173,7 @@ Free fishing minigame bot for Metin2. No subscriptions, no licenses.
 
 ## Known Limitations
 
-- **Windows only** — Requires Windows 7 or newer
+- **Windows** — Requires Windows 7 or newer. **Linux** (game under Wine) is in progress: see [docs/LINUX.md](docs/LINUX.md)
 - **Administrator required** — Must run as admin for mouse/keyboard input injection
 - **Game settings** — Display scale should be 100% for best detection (auto-scales but may need adjustment)
 - **Inventory mode** — Auto fish handling works best when inventory is mostly empty at startup
@@ -180,6 +181,10 @@ Free fishing minigame bot for Metin2. No subscriptions, no licenses.
 - **Window positioning** — Game window must remain visible (can be in background but not minimized)
 
 ---
+
+## Testing without the game
+
+`python tools/minigame_sim` opens a simulated game window (fishing minigame in several looks, inventory, jigsaw event) that the bot can be pointed at, and `python tools/minigame_sim/bench.py` plays every look headless. See [docs/SIMULATOR.md](docs/SIMULATOR.md).
 
 ## Planned Updates
 

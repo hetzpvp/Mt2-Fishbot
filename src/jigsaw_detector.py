@@ -720,6 +720,6 @@ class JigsawDetector:
     def _crate_order(priority: str) -> List[str]:
         if priority == "normal_first":
             return ["normal"]
-        if priority == "special_first":
+        if priority in ("special_first", "special_when_better"):
             return ["special", "normal"]
         return ["normal"]

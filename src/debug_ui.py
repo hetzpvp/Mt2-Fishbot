@@ -10,7 +10,14 @@ from typing import Optional
 import cv2
 import numpy as np
 from PIL import Image, ImageTk
-from mss import mss
+from screen_capture import WindowCapture
+
+
+def _debug_capture(bot) -> WindowCapture:
+    """Own capture object for a debug window (one per thread, like the bot's).
+    Same method as the bot: a desktop copy where that works, the game
+    window's own pixels where it does not (Linux under XWayland)."""
+    return WindowCapture(bot.window_manager, bot.config.get("capture_backend", "auto"))
 
 from utils import get_resource_path, DEBUG_PRINTS, load_window_icon
 
@@ -139,7 +146,7 @@ class IgnoredPositionsWindow(DebugWindow):
         self.bot = bot_instance
         self.canvas = None
         self.photo_image = None
-        self.sct = None  # Own mss instance — mss is not thread-safe to share across threads
+        self.sct = None  # Own WindowCapture — capture objects are not thread-safe to share
         self._create_window()
         self._update_loop_id = None
 
@@ -213,22 +220,17 @@ class IgnoredPositionsWindow(DebugWindow):
                 return
 
             if self.sct is None:
-                self.sct = mss()
+                self.sct = _debug_capture(self.bot)
 
             try:
-                win_left, win_top, win_width, win_height = self.bot.window_manager.get_window_rect()
+                _, _, win_width, win_height = self.bot.window_manager.get_window_rect()
 
                 # Capture the right-side inventory strip (same region the bot scans)
-                monitor = {
-                    "left": win_left + win_width - self.bot._inventory_width,
-                    "top": win_top + self.bot._inventory_y_offset,
-                    "width": self.bot._inventory_width,
-                    "height": max(0, win_height - self.bot._inventory_y_offset - 30)
-                }
-
-                sct_img = self.sct.grab(monitor)
-                inventory_frame = np.array(sct_img)
-                inventory_frame = cv2.cvtColor(inventory_frame, cv2.COLOR_BGRA2BGR)
+                inventory_frame = self.sct.grab(
+                    win_width - self.bot._inventory_width,
+                    self.bot._inventory_y_offset,
+                    self.bot._inventory_width,
+                    max(0, win_height - self.bot._inventory_y_offset - 30))
 
             except Exception as e:
                 if DEBUG_PRINTS:
@@ -329,6 +331,9 @@ class IgnoredPositionsWindow(DebugWindow):
     def destroy(self):
         if self._update_loop_id and self.window:
             self.window.after_cancel(self._update_loop_id)
+        if getattr(self, "sct", None) is not None:
+            self.sct.close()
+            self.sct = None
         super().destroy()
 
 
@@ -340,7 +345,7 @@ class FishDetectorDebugWindow(DebugWindow):
         self.bot = bot_instance
         self.canvas = None
         self.photo_image = None
-        self.sct = None  # Own mss instance — mss is not thread-safe to share across threads
+        self.sct = None  # Own WindowCapture — capture objects are not thread-safe to share
         self.status_label = None
         self._create_window()
         self._update_loop_id = None
@@ -431,21 +436,11 @@ class FishDetectorDebugWindow(DebugWindow):
                 return
 
             if self.sct is None:
-                self.sct = mss()
+                self.sct = _debug_capture(self.bot)
 
             try:
-                win_left, win_top, win_width, win_height = self.bot.window_manager.get_window_rect()
-
-                monitor = {
-                    "left": win_left,
-                    "top": win_top,
-                    "width": win_width,
-                    "height": win_height
-                }
-
-                sct_img = self.sct.grab(monitor)
-                frame = np.array(sct_img)
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+                _, _, win_width, win_height = self.bot.window_manager.get_window_rect()
+                frame = self.sct.grab(0, 0, win_width, win_height)
 
             except Exception as e:
                 self.status_label.config(text=f"Status: Capture failed - {str(e)[:40]}")
@@ -514,8 +509,10 @@ class FishDetectorDebugWindow(DebugWindow):
         Mirrors the exact detection logic the bot uses so this view shows
         what the bot actually sees during a minigame.
         """
-        window_bounds = self.bot.detector.find_fishing_window_bounds(frame)
-        window_active, fish_pos = self.bot.detector.detect_window_and_fish(frame)
+        # observe_only: this runs on the GUI thread with a full-window frame
+        # and must not disturb what the bot's detector is learning.
+        window_bounds = self.bot.detector.find_fishing_window_bounds(frame, observe_only=True)
+        window_active, fish_pos = self.bot.detector.detect_window_and_fish(frame, observe_only=True)
 
         if window_bounds:
             x, y, bw, bh = window_bounds
@@ -641,6 +638,9 @@ class FishDetectorDebugWindow(DebugWindow):
     def destroy(self):
         if self._update_loop_id and self.window:
             self.window.after_cancel(self._update_loop_id)
+        if getattr(self, "sct", None) is not None:
+            self.sct.close()
+            self.sct = None
         super().destroy()
 
 
@@ -662,7 +662,6 @@ class InventoryDetectionDebugWindow(DebugWindow):
         self.bot = bot
         self._update_loop_id = None
         self._photo = None
-        self._sct = mss()
         self._create_window()
         self._schedule_update()
 
@@ -838,6 +837,9 @@ class InventoryDetectionDebugWindow(DebugWindow):
     def destroy(self):
         if self._update_loop_id and self.window:
             self.window.after_cancel(self._update_loop_id)
+        if getattr(self, "sct", None) is not None:
+            self.sct.close()
+            self.sct = None
         super().destroy()
 
 
@@ -1288,4 +1290,7 @@ class JigsawSolverDebugWindow(DebugWindow):
     def destroy(self):
         if self._update_loop_id and self.window:
             self.window.after_cancel(self._update_loop_id)
+        if getattr(self, "sct", None) is not None:
+            self.sct.close()
+            self.sct = None
         super().destroy()

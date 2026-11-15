@@ -1,6 +1,6 @@
-"""Mouse input backends used by Humanizer.
+"""Mouse and keyboard input backends used by Humanizer.
 
-Two backends ship with the bot:
+Windows:
 
 - ``pyautogui`` (always-available fallback): uses pyautogui → ``SendInput``.
   Easy and works everywhere, but every event carries the ``LLMHF_INJECTED``
@@ -11,19 +11,36 @@ Two backends ship with the bot:
   input stack. No injected flag, no hook visibility — events are
   indistinguishable from a real USB mouse to user-mode code.
 
+Linux (game under Wine):
+
+- ``uinput`` (preferred): a virtual mouse and keyboard created through
+  /dev/uinput (platforms/uinput.py). Kernel-level like Interception, and the
+  only injection that works fully on Wayland desktops.
+
+- ``xtest`` (fallback): pynput's X11 XTest injection. Fine on an Xorg
+  session; on Wayland it may be limited to X11 windows or need a permission.
+
 ``create_mouse_backend(config)`` returns an instance and stashes the
 backend's ``name`` so the GUI can display which one is in use. When
-``config['input_backend'] == 'auto'`` (the default) we try Interception
-first and silently fall back to pyautogui if the driver isn't installed.
+``config['input_backend'] == 'auto'`` (the default) we try the kernel-level
+backend first and silently fall back if it isn't available.
+``create_keyboard_controller(config)`` does the same for the keyboard and
+returns an object with pynput's ``press(key)`` / ``release(key)`` interface.
 """
 
 from __future__ import annotations
 
 import ctypes
+import threading
 from ctypes import wintypes
 from typing import Optional, Tuple
 
-import pyautogui
+try:
+    import pyautogui
+except Exception:  # not installed on Linux, where it is not used
+    pyautogui = None
+
+import platforms
 
 from interception_wrapper import (
     INTERCEPTION_MOUSE_LEFT_BUTTON_DOWN,
@@ -164,7 +181,128 @@ class InterceptionMouseBackend:
             self._drv = None
 
 
+# --- Linux: uinput (preferred) and XTest (fallback) ------------------------
+
+class PynputMouseBackend:
+    """XTest injection through pynput (Linux fallback when uinput is not
+    permitted)."""
+
+    name = "xtest"
+    display_name = "XTest"
+
+    def __init__(self):
+        from pynput.mouse import Button, Controller
+        self._c = Controller()
+        self._buttons = {"left": Button.left, "right": Button.right, "middle": Button.middle}
+
+    def move_to(self, x: float, y: float) -> None:
+        self._c.position = (int(x), int(y))
+
+    def position(self) -> Tuple[int, int]:
+        x, y = self._c.position
+        return (int(x), int(y))
+
+    def mouse_down(self, button: str = "left") -> None:
+        self._c.press(self._buttons.get(button, self._buttons["left"]))
+
+    def mouse_up(self, button: str = "left") -> None:
+        self._c.release(self._buttons.get(button, self._buttons["left"]))
+
+    def click(self, button: str = "left") -> None:
+        self._c.click(self._buttons.get(button, self._buttons["left"]))
+
+    def close(self) -> None:
+        return
+
+
+# One virtual mouse / keyboard for the whole process (all input is serialized
+# by input_lock anyway, and each device costs a settle delay to create).
+_uinput_lock = threading.Lock()
+_shared_uinput_mouse = None
+_shared_uinput_keyboard = None
+
+
+def _linux_desktop() -> bool:
+    """Linux with the OS layer active (tests switch it off: platforms.native = None)."""
+    return platforms.IS_LINUX and platforms.native is not None
+
+
+def _linux_wants_uinput(requested: str) -> bool:
+    # "interception" may come from a config written on Windows: same intent.
+    return requested in ("auto", "uinput", "interception")
+
+
+def _get_uinput_mouse():
+    global _shared_uinput_mouse
+    from platforms import uinput, x11
+    with _uinput_lock:
+        if _shared_uinput_mouse is None:
+            _shared_uinput_mouse = uinput.UInputMouse(
+                desktop_size=x11.desktop_size(), cursor_query=x11.cursor_position)
+        else:
+            _shared_uinput_mouse.set_desktop_size(x11.desktop_size())  # monitors may have changed
+        return _shared_uinput_mouse
+
+
+def _get_uinput_keyboard():
+    global _shared_uinput_keyboard
+    from platforms import uinput, x11
+    with _uinput_lock:
+        if _shared_uinput_keyboard is None:
+            _shared_uinput_keyboard = uinput.UInputKeyboard(char_lookup=x11.evdev_code_for_char)
+        return _shared_uinput_keyboard
+
+
+def _probe_linux(requested: str) -> Tuple[str, Optional[str]]:
+    if requested in ("pyautogui", "xtest"):
+        return ("xtest", None)
+    from platforms import uinput
+    err = uinput.check_access()
+    return ("xtest", err) if err else ("uinput", None)
+
+
+def _create_linux_mouse(requested: str, status_callback, bot_id: int):
+    if _linux_wants_uinput(requested):
+        try:
+            return _get_uinput_mouse()
+        except Exception as e:
+            if status_callback:
+                try:
+                    status_callback(f"[W{bot_id+1}] uinput unavailable ({e}); using XTest")
+                except Exception:
+                    pass
+    return PynputMouseBackend()
+
+
+def create_keyboard_controller(config: Optional[dict] = None, status_callback=None,
+                               bot_id: int = 0):
+    """Keyboard with pynput's press(key)/release(key) interface, or None when
+    no keyboard injection is available. Keys are pynput ``Key`` members or
+    single characters, as before."""
+    cfg = config or {}
+    requested = str(cfg.get("input_backend", "auto")).lower()
+    if _linux_desktop() and _linux_wants_uinput(requested):
+        try:
+            return _get_uinput_keyboard()
+        except Exception as e:
+            if status_callback:
+                try:
+                    status_callback(f"[W{bot_id+1}] uinput keyboard unavailable ({e}); using XTest")
+                except Exception:
+                    pass
+    try:
+        from pynput.keyboard import Controller
+        return Controller()
+    except Exception:
+        return None
+
+
 # --- Probing & factory ----------------------------------------------------
+
+# Process-wide Interception backend (see create_mouse_backend).
+_shared_interception = None
+_shared_interception_key = None
+_shared_lock = threading.Lock()
 
 # Cached probe result so the GUI and each bot don't re-open the driver.
 _probed_backend_name: Optional[str] = None
@@ -186,6 +324,10 @@ def probe_backend(config: Optional[dict] = None) -> Tuple[str, Optional[str]]:
     global _probed_backend_name, _probe_error
     cfg = config or {}
     requested = str(cfg.get("input_backend", "auto")).lower()
+
+    if _linux_desktop():
+        _probed_backend_name, _probe_error = _probe_linux(requested)
+        return (_probed_backend_name, _probe_error)
 
     if requested == "pyautogui":
         _probed_backend_name = "pyautogui"
@@ -236,18 +378,34 @@ def create_mouse_backend(config: Optional[dict] = None, status_callback=None,
     cfg = config or {}
     requested = str(cfg.get("input_backend", "auto")).lower()
 
+    if _linux_desktop():
+        return _create_linux_mouse(requested, status_callback, bot_id)
+
     if requested == "pyautogui" or not is_supported_platform():
         return PyAutoGuiMouseBackend()
 
     dll_path = cfg.get("interception_dll_path") or None
     preferred_device = cfg.get("interception_mouse_device")
 
-    drv = InterceptionDriver.open(dll_path)
-    if drv is not None:
-        device = drv.find_default_mouse(preferred_device)
-        if device is not None:
-            return InterceptionMouseBackend(drv)
-        drv.close()
+    # One driver context for the whole process. Every bot used to open its own
+    # (and never closed it), leaking a kernel context per start. All input is
+    # serialized by input_lock anyway, so a single shared backend is enough.
+    global _shared_interception, _shared_interception_key
+    key = (dll_path, preferred_device)
+    with _shared_lock:
+        if _shared_interception is not None and _shared_interception_key == key \
+                and _shared_interception._drv is not None:
+            _shared_interception._refresh_virtual_desktop()  # monitors may have changed
+            return _shared_interception
+
+        drv = InterceptionDriver.open(dll_path)
+        if drv is not None:
+            device = drv.find_default_mouse(preferred_device)
+            if device is not None:
+                _shared_interception = InterceptionMouseBackend(drv)
+                _shared_interception_key = key
+                return _shared_interception
+            drv.close()
 
     # Failure path: in "auto" we silently fall back; in explicit
     # "interception" we still fall back so the bot can run, but log to the

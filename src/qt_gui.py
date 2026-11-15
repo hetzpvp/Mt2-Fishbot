@@ -19,11 +19,18 @@ import threading
 from typing import Dict, List, Optional, Tuple
 
 # High-DPI awareness must be set before any Qt window is created.
-try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(1)
-except Exception:
-    pass
-os.environ.setdefault("QT_QPA_PLATFORM", "windows:dpiawareness=0")
+if sys.platform == "win32":
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
+    os.environ.setdefault("QT_QPA_PLATFORM", "windows:dpiawareness=0")
+elif sys.platform.startswith("linux"):
+    # X11 (XWayland on a Wayland desktop) first, like the game under Wine:
+    # the global F5 listener and the click-to-capture listener (pynput,
+    # X11 RECORD) then also see keys/clicks while this window has focus.
+    # Native Wayland is the fallback when Qt's xcb plugin can't load.
+    os.environ.setdefault("QT_QPA_PLATFORM", "xcb;wayland")
 
 from PySide6.QtCore import (
     QByteArray, QEvent, QObject, QPoint, QSize, Qt, QTimer, Signal,
@@ -1635,6 +1642,9 @@ class SettingsTab(QWidget):
     open_timing = Signal()
     config_changed = Signal()
     accent_changed = Signal(str)
+    forget_profile = Signal()
+    profile_load_requested = Signal(str)   # path
+    profile_save_requested = Signal(str)   # path
 
     BAIT_KEYS = ["1", "2", "3", "4", "F1", "F2", "F3", "F4"]
     SWATCHES = [
@@ -1771,13 +1781,52 @@ class SettingsTab(QWidget):
         qs.body_layout.addLayout(qs_row)
         layout.addWidget(qs)
 
+        # --- Detection & capture ---
+        dc = Card("Detection & Capture")
+        self.adaptive_check = QCheckBox("Adapt to re-skinned minigames (learn panel and fish colors)")
+        self.adaptive_check.setToolTip(
+            "When the standard colors find no minigame after a cast, the bot learns this "
+            "client's panel and fish colors by itself and remembers them."
+        )
+        self.adaptive_check.toggled.connect(self._on_changed)
+        dc.body_layout.addWidget(self.adaptive_check)
+        self.window_capture_check = QCheckBox("Per-window capture (game windows may overlap)")
+        self.window_capture_check.setToolTip(
+            "Reads each game window directly instead of copying the screen, so windows can "
+            "cover each other. Used only after it has been checked against the screen; "
+            "clients that block it fall back to screen capture automatically."
+        )
+        self.window_capture_check.toggled.connect(self._on_changed)
+        dc.body_layout.addWidget(self.window_capture_check)
+        self.recast_tune_check = QCheckBox("Shorten the wait before the next cast automatically")
+        self.recast_tune_check.setToolTip(
+            "Without Quick Skip the bot waits before casting again. With this on it starts at "
+            "'Wait before next cast' from Timing Settings and shortens the wait step by step "
+            "while casts keep getting a bite; the first wait that is too short for this server "
+            "costs one missed cast, after which the last working wait is kept."
+        )
+        self.recast_tune_check.toggled.connect(self._on_changed)
+        dc.body_layout.addWidget(self.recast_tune_check)
+        dc_row = QHBoxLayout()
+        dc_row.setSpacing(10)
+        self.forget_profile_btn = QPushButton("  Forget learned colors")
+        self.forget_profile_btn.setProperty("class", "Btn")
+        self.forget_profile_btn.setIcon(make_icon("reset", 12, C["text"]))
+        self.forget_profile_btn.setCursor(Qt.PointingHandCursor)
+        self.forget_profile_btn.clicked.connect(self.forget_profile.emit)
+        dc_row.addWidget(self.forget_profile_btn)
+        self.learned_label = self._mono_label("", color=C["text_mute"])
+        dc_row.addWidget(self.learned_label, 1)
+        dc.body_layout.addLayout(dc_row)
+        layout.addWidget(dc)
+        self._capture_backend = "auto"
+        self._has_learned_profile = False
+
         # --- Profiles ---
         pr = Card("Profiles & Presets")
         pr_row = QHBoxLayout()
         pr_row.setSpacing(8)
-        self.profile_combo = QComboBox()
-        self.profile_combo.addItems(["Default Profile"])
-        pr_row.addWidget(self.profile_combo, 1)
+        pr_row.addWidget(self._mono_label("Whole configuration as a file"), 1)
         self.profile_load_btn = QPushButton("  Load")
         self.profile_load_btn.setProperty("class", "Btn")
         self.profile_load_btn.setIcon(make_icon("folder", 12, C["text"]))
@@ -1793,7 +1842,7 @@ class SettingsTab(QWidget):
         pr.body_layout.addLayout(pr_row)
         pr_hint = QLabel(
             "Profiles store coordinates, fish actions, bait keys and timing. "
-            "Saved next to bot_config.json."
+            "Loading one replaces the current settings."
         )
         pr_hint.setStyleSheet(f"color: {C['text_mute']}; font-family: {MONO}; font-size: 10px;")
         pr.body_layout.addWidget(pr_hint)
@@ -1896,6 +1945,11 @@ class SettingsTab(QWidget):
         for k, cb in self.bait_checks.items():
             cb.setChecked(k in bk)
         self.bait_qty_input.setText(str(cfg.get("bait_quantity", 200)))
+        self.adaptive_check.setChecked(bool(cfg.get("adaptive_detection", True)))
+        self.recast_tune_check.setChecked(bool(cfg.get("adaptive_recast_wait", True)))
+        self._capture_backend = str(cfg.get("capture_backend", "auto")).lower()
+        self.window_capture_check.setChecked(self._capture_backend != "screen")
+        self.setLearnedProfile(cfg.get("detection_profile"))
         self.qs_enable.setChecked(cfg.get("quick_skip", False))
         mode = cfg.get("quick_skip_mode", "horse")
         self.qs_horse.setChecked(mode == "horse")
@@ -1928,13 +1982,31 @@ class SettingsTab(QWidget):
             cfg["bait_quantity"] = 200
         cfg["quick_skip"] = self.qs_enable.isChecked()
         cfg["quick_skip_mode"] = "armor" if self.qs_armor.isChecked() else "horse"
+        cfg["adaptive_detection"] = self.adaptive_check.isChecked()
+        cfg["adaptive_recast_wait"] = self.recast_tune_check.isChecked()
+        if not self.window_capture_check.isChecked():
+            cfg["capture_backend"] = "screen"
+        else:
+            # Keep an explicit "window" (always per-window) set by hand in the file
+            cfg["capture_backend"] = "window" if self._capture_backend == "window" else "auto"
+        self._capture_backend = cfg["capture_backend"]
+
+    def setLearnedProfile(self, profile) -> None:
+        """Reflects whether a self-learned minigame color profile is stored."""
+        self._has_learned_profile = isinstance(profile, dict)
+        if self._has_learned_profile:
+            self.learned_label.setText(f"Using learned colors: {profile.get('name', 'custom')}")
+        else:
+            self.learned_label.setText("Using standard colors")
+        self._update_disabled_state()
 
     def selectedBaitKeys(self) -> List[str]:
         return [k for k, cb in self.bait_checks.items() if cb.isChecked()]
 
     def setConfigEnabled(self, enabled: bool) -> None:
         for w in (self.classic_check, self.classic_delay_input, self.human_check,
-                  self.sound_check, self.qs_enable, self.qs_horse, self.qs_armor):
+                  self.sound_check, self.qs_enable, self.qs_horse, self.qs_armor,
+                  self.adaptive_check, self.window_capture_check, self.recast_tune_check):
             w.setEnabled(enabled if w not in (self.qs_horse, self.qs_armor) else (enabled and self.qs_enable.isChecked()))
         for cb in self.bait_checks.values():
             cb.setEnabled(enabled)
@@ -1953,30 +2025,21 @@ class SettingsTab(QWidget):
         for w in (self.timing_btn, self.profile_load_btn, self.profile_save_btn):
             w.setDisabled(disabled)
             w.setCursor(Qt.ForbiddenCursor if disabled else Qt.PointingHandCursor)
-        self.profile_combo.setEnabled(not disabled)
+        self.forget_profile_btn.setDisabled(disabled or not self._has_learned_profile)
         self.bait_qty_input.setDisabled(disabled)
         self.bait_qty_input.setCursor(Qt.ForbiddenCursor if disabled else Qt.IBeamCursor)
 
-    # Profile actions (placeholder — uses JSON files next to bot_config.json)
+    # Profile actions — the window owns the configuration, so it does the I/O.
     def _profile_load(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Load profile", os.getcwd(), "JSON (*.json)")
         if path:
-            QMessageBox.information(self, "Profile", f"Profile loading: {os.path.basename(path)}\n(Reload the app after replacing bot_config.json.)")
+            self.profile_load_requested.emit(path)
 
     def _profile_save(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(self, "Save profile", os.path.join(os.getcwd(), "profile.json"), "JSON (*.json)")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save profile", os.path.join(os.getcwd(), "profile.json"), "JSON (*.json)")
         if path:
-            try:
-                cfg_path = os.path.join(os.getcwd(), "bot_config.json")
-                if os.path.exists(cfg_path):
-                    with open(cfg_path, "r") as src, open(path, "w") as dst:
-                        dst.write(src.read())
-                    QMessageBox.information(self, "Profile", f"Saved {os.path.basename(path)}")
-            except Exception as e:
-                QMessageBox.warning(self, "Profile", f"Save failed: {e}")
-
-    def _profile_duplicate(self) -> None:
-        QMessageBox.information(self, "Profile", "Duplicate is a placeholder in this build.")
+            self.profile_save_requested.emit(path)
 
 
 # ============================================================================
@@ -2237,8 +2300,8 @@ class TimingModal(QDialog):
             ("Post-click settle",          "timing_post_click",    35, 10, 100),
         ]),
         ("Click Rhythm (Human-like)", [
-            ("Min delay between attempts", "timing_human_min", 150,  50,  800),
-            ("Max delay between attempts", "timing_human_max", 400, 100, 1200),
+            ("Min reaction delay", "timing_human_min", 150,  50,  800),
+            ("Max reaction delay", "timing_human_max", 400, 100, 1200),
         ]),
         ("Key Presses", [
             ("Key hold duration",     "timing_key_hold",   25, 10, 100),
@@ -2246,6 +2309,8 @@ class TimingModal(QDialog):
         ]),
         ("Bait & Cast", [
             ("Bait → Cast key delay", "timing_cast_interkey", 50, 20, 200),
+            ("Max wait for a bite",    "timing_minigame_timeout", 6000, 3000, 30000),
+            ("Wait before next cast",  "timing_recast_wait",      4000,    0, 10000),
         ]),
         ("Item Handling", [
             ("Wait for item after catch",    "timing_catch_wait",     400, 100, 1500),
@@ -2324,7 +2389,7 @@ class TimingModal(QDialog):
                 row.addWidget(slider, 1)
                 val = QLabel(f"{value_ms}ms")
                 val.setStyleSheet(f"color: {C['accent']}; font-family: {MONO}; font-size: 11px;")
-                val.setFixedWidth(60)
+                val.setFixedWidth(68)
                 val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 slider.valueChanged.connect(lambda v, lab=val: lab.setText(f"{v}ms"))
                 row.addWidget(val)
@@ -2841,7 +2906,8 @@ class JigsawGridOverlay(QWidget):
 
 
 class JigsawWindowRow(QFrame):
-    """Read-only row mirroring the dashboard's WindowRow — number + window name + crates."""
+    """One window in the Jigsaw Solver — same look as the dashboard's WindowRow:
+    number, window name, status pill, counters, and the worker's last message."""
 
     def __init__(self, index: int, window_name: str, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -2865,21 +2931,46 @@ class JigsawWindowRow(QFrame):
         self.name_label.setStyleSheet(
             f"font-family: {MONO}; font-size: 11px; color: {C['text']};"
         )
-        self.name_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        layout.addWidget(self.name_label, 1)
+        self.name_label.setMinimumWidth(90)
+        self.name_label.setMaximumWidth(220)
+        self.name_label.setToolTip(window_name)
+        layout.addWidget(self.name_label, 0)
 
-        self.crates_lbl = QLabel("Opened Crates: 0")
-        self.crates_lbl.setStyleSheet(
-            f"font-family: {MONO}; font-size: 10px; color: {C['accent']};"
-        )
-        self.crates_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.crates_lbl.setMinimumWidth(170)
-        self.crates_lbl.setContentsMargins(0, 0, 8, 0)
-        self.crates_lbl.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.pill = Pill("● READY", "idle")
+        self.pill.setFixedWidth(76)
+        layout.addWidget(self.pill, 0)
+
+        self.crates_lbl = QLabel("C 0")
+        self.crates_lbl.setToolTip("Crates opened")
+        self.crates_lbl.setStyleSheet(f"font-family: {MONO}; font-size: 10px; color: {C['accent']};")
+        self.crates_lbl.setMinimumWidth(44)
         layout.addWidget(self.crates_lbl, 0)
 
+        self.boards_lbl = QLabel("B 0")
+        self.boards_lbl.setToolTip("Boards completed")
+        self.boards_lbl.setStyleSheet(f"font-family: {MONO}; font-size: 10px; color: {C['accent']};")
+        self.boards_lbl.setMinimumWidth(36)
+        layout.addWidget(self.boards_lbl, 0)
+
+        self.status_lbl = QLabel("")
+        self.status_lbl.setStyleSheet(f"font-family: {MONO}; font-size: 10px; color: {C['text_dim']};")
+        self.status_lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)   # elide, never widen the dialog
+        layout.addWidget(self.status_lbl, 1)
+
     def setCrates(self, count: int) -> None:
-        self.crates_lbl.setText(f"Opened Crates: {count}")
+        self.crates_lbl.setText(f"C {count}")
+
+    def setBoards(self, count: int) -> None:
+        self.boards_lbl.setText(f"B {count}")
+
+    def setMessage(self, message: str) -> None:
+        self.status_lbl.setText(message)
+        self.status_lbl.setToolTip(message)
+
+    def setStatus(self, kind: str, text: str) -> None:
+        self.pill.setText("● " + text)
+        self.pill.setKind(kind)
+        self.setActive(kind == "active")
 
     def setActive(self, active: bool) -> None:
         self.setProperty("active", "true" if active else "false")
@@ -2898,7 +2989,7 @@ class JigsawWindowRow(QFrame):
 class JigsawSolverDialog(QDialog):
     status_line = Signal(int, str)
     progress_line = Signal(int, int)
-    stopped = Signal(int)
+    stopped = Signal(int, object)  # bot_id, bot instance
     paused_changed = Signal(int, bool)
 
     def __init__(self, parent: "FishbotWindow"):
@@ -2909,6 +3000,7 @@ class JigsawSolverDialog(QDialog):
         self.resize(720, 360)
         self._bots: Dict[int, object] = {}
         self._threads: Dict[int, threading.Thread] = {}
+        self._old_threads: List[threading.Thread] = []
         self._rows: Dict[int, Dict[str, QLabel]] = {}
         self._debug_windows: Dict[int, object] = {}
 
@@ -2958,7 +3050,7 @@ class JigsawSolverDialog(QDialog):
         self.summary_label.setStyleSheet(f"color: {C['text_dim']}; font-family: {MONO}; font-size: 11px;")
         bl.addWidget(self.summary_label)
 
-        windows_card = Card("Game Windows (read-only)")
+        windows_card = Card("Game Windows")
         windows_card.body_layout.setSpacing(2)
         windows_card.body_layout.setContentsMargins(10, 8, 10, 8)
         windows_card.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
@@ -2982,6 +3074,27 @@ class JigsawSolverDialog(QDialog):
         info_row.addStretch(1)
         bl.addLayout(info_row)
         self._refresh_config_labels()
+
+        self.special_first_check = QCheckBox("Open special crates first (when the special slot has one)")
+        self.special_first_check.setToolTip(
+            "Off: only normal crates are opened. On: special crates are used while there are any, "
+            "then normal ones. An empty slot is refilled from the inventory pages."
+        )
+        self.special_first_check.setChecked(
+            self.parent_window.config.get("jigsaw_crate_priority") == "special_first")
+        self.special_first_check.toggled.connect(self._on_priority_toggled)
+        bl.addWidget(self.special_first_check)
+
+        self.special_smart_check = QCheckBox("Open a special crate only where its 3x2 piece saves rounds")
+        self.special_smart_check.setToolTip(
+            "A special crate always gives the 3x2 piece. With this on, one is opened only on boards "
+            "where that piece is expected to save at least one round compared with normal crates "
+            "(or when no normal crate is left). Empty slots are refilled from the inventory pages."
+        )
+        self.special_smart_check.setChecked(
+            self.parent_window.config.get("jigsaw_crate_priority") == "special_when_better")
+        self.special_smart_check.toggled.connect(self._on_smart_toggled)
+        bl.addWidget(self.special_smart_check)
 
         bl.addStretch(1)
 
@@ -3066,12 +3179,42 @@ class JigsawSolverDialog(QDialog):
         label.setStyleSheet(f"font-family: {MONO}; font-size: 11px; color: {C['text_dim']};")
         return label
 
+    def _on_priority_toggled(self, checked: bool) -> None:
+        if checked and self.special_smart_check.isChecked():
+            self.special_smart_check.blockSignals(True)
+            self.special_smart_check.setChecked(False)
+            self.special_smart_check.blockSignals(False)
+        self._save_priority()
+
+    def _on_smart_toggled(self, checked: bool) -> None:
+        if checked and self.special_first_check.isChecked():
+            self.special_first_check.blockSignals(True)
+            self.special_first_check.setChecked(False)
+            self.special_first_check.blockSignals(False)
+        self._save_priority()
+
+    def _save_priority(self) -> None:
+        if self.special_smart_check.isChecked():
+            priority = "special_when_better"
+        elif self.special_first_check.isChecked():
+            priority = "special_first"
+        else:
+            priority = "normal_first"
+        self.parent_window.config["jigsaw_crate_priority"] = priority
+        self.parent_window.save_config()
+
+    def _set_setup_enabled(self, enabled: bool) -> None:
+        for widget in (self.define_grid_btn, self.set_confirm_btn, self.special_first_check,
+                       self.special_smart_check):
+            widget.setEnabled(enabled)
+
     def _toggle(self) -> None:
         if self.is_running():
             if self._bots and any(getattr(b, "paused", False) for b in self._bots.values()):
                 for b in self._bots.values():
                     b.paused = False
                 self._on_paused_changed(-1, False)
+                self._append_log("Jigsaw solver resumed")
                 return
             self._stop()
             return
@@ -3135,6 +3278,16 @@ class JigsawSolverDialog(QDialog):
             QMessageBox.critical(self, "Jigsaw unavailable", f"Could not load jigsaw solver:\n{e}")
             return
 
+        # Workers from the previous run must be gone, or two would drive the
+        # same window at once.
+        for thread in list(self._threads.values()) + self._old_threads:
+            thread.join(timeout=1.5)
+        self._old_threads = [t for t in list(self._threads.values()) + self._old_threads if t.is_alive()]
+        if self._old_threads:
+            QMessageBox.information(self, "Still stopping",
+                                    "The previous jigsaw run is still finishing. Try again in a moment.")
+            return
+
         self._rebuild_rows()
         self._bots.clear()
         self._threads.clear()
@@ -3149,9 +3302,11 @@ class JigsawSolverDialog(QDialog):
                 bot_id=bot_id,
                 on_status_update=lambda msg, i=bot_id: self.status_line.emit(i, msg),
                 on_progress_update=lambda _worker_id, count, i=bot_id: self.progress_line.emit(i, count),
-                on_bot_stop=lambda _worker_id, i=bot_id: self.stopped.emit(i),
                 on_pause_change=lambda _worker_id, paused, i=bot_id: self.paused_changed.emit(i, paused),
             )
+            # Bind the instance so a late stop from a previous run of this slot
+            # is not mistaken for the worker running there now.
+            bot.on_bot_stop = lambda _worker_id, i=bot_id, b=bot: self.stopped.emit(i, b)
             thread = threading.Thread(target=bot.start, daemon=True, name=f"JigsawBot-{bot_id + 1}")
             self._bots[bot_id] = bot
             self._threads[bot_id] = thread
@@ -3163,13 +3318,14 @@ class JigsawSolverDialog(QDialog):
             thread.start()
             row = self._rows.get(bot_id)
             if row:
-                row["row"].setActive(True)
+                row["row"].setStatus("active", "RUNNING")
+                row["row"].setMessage("")
 
-        self.start_btn.setText("  Stop Jigsaw (F5)")
+        self.start_btn.setText("  Stop Jigsaw")
         self.start_btn.setIcon(make_icon("stop", 12, "#1a1108"))
-        self.define_grid_btn.setEnabled(False)
-        self.set_confirm_btn.setEnabled(False)
-        self.summary_label.setText(f"Running {len(self._bots)} jigsaw worker(s)")
+        self._set_setup_enabled(False)
+        self.summary_label.setText(f"Running on {len(self._bots)} window(s) — F5 pauses / resumes")
+        self.parent_window.header.setStatus("● JIGSAW", "running")
         self._append_log(f"Started jigsaw solver on {len(self._bots)} window(s)")
 
     def _stop(self) -> None:
@@ -3177,12 +3333,16 @@ class JigsawSolverDialog(QDialog):
             bot.stop()
         self._append_log("Stopping jigsaw solver workers...")
 
-    def _on_stopped(self, bot_id: int) -> None:
+    def _on_stopped(self, bot_id: int, bot: object = None) -> None:
+        if self._bots.get(bot_id) is not bot:
+            return  # stale notification from an earlier run
         row = self._rows.get(bot_id)
         if row:
-            row["row"].setActive(False)
+            row["row"].setStatus("error", "STOPPED")
         self._bots.pop(bot_id, None)
-        self._threads.pop(bot_id, None)
+        thread = self._threads.pop(bot_id, None)
+        if thread is not None and thread.is_alive():
+            self._old_threads.append(thread)  # about to exit; _start() waits for it
         window = self._debug_windows.pop(bot_id, None)
         if window is not None:
             try:
@@ -3190,30 +3350,39 @@ class JigsawSolverDialog(QDialog):
             except Exception:
                 pass
         if self._bots:
-            self.summary_label.setText(f"Running {len(self._bots)} jigsaw worker(s)")
+            self._on_paused_changed(-1, False)   # refresh the summary / button for the rest
             return
         self.start_btn.setText("  Start Jigsaw")
         self.start_btn.setIcon(make_icon("play", 12, "#1a1108"))
-        self.define_grid_btn.setEnabled(True)
-        self.set_confirm_btn.setEnabled(True)
+        self._set_setup_enabled(True)
         self.summary_label.setText("Stopped")
+        self.parent_window.header.setStatus("● IDLE", "idle")
 
     def _on_paused_changed(self, bot_id: int, paused: bool) -> None:
         if not self._bots:
             return
-        any_paused = any(getattr(b, "paused", False) for b in self._bots.values())
-        if any_paused:
+        paused_ids = [i for i, b in self._bots.items() if getattr(b, "paused", False)]
+        for i in self._bots:
+            row = self._rows.get(i)
+            if row:
+                if i in paused_ids:
+                    row["row"].setStatus("warn", "PAUSED")
+                else:
+                    row["row"].setStatus("active", "RUNNING")
+        if paused_ids:
             self.start_btn.setText("  Resume Jigsaw (F5)")
             self.start_btn.setIcon(make_icon("play", 12, "#1a1108"))
-            self.summary_label.setText(f"Paused — {len(self._bots)} jigsaw worker(s)")
+            self.summary_label.setText(
+                f"Paused: {len(paused_ids)} of {len(self._bots)} window(s) — see the row for the reason")
+            self.parent_window.header.setStatus("● PAUSED", "idle")
         else:
             self.start_btn.setText("  Stop Jigsaw")
             self.start_btn.setIcon(make_icon("stop", 12, "#1a1108"))
-            self.summary_label.setText(f"Running {len(self._bots)} jigsaw worker(s)")
+            self.summary_label.setText(f"Running on {len(self._bots)} window(s) — F5 pauses / resumes")
+            self.parent_window.header.setStatus("● JIGSAW", "running")
 
     def _append_status(self, bot_id: int, message: str) -> None:
         self._set_status(bot_id, message)
-        self._append_log(message)
         if self.parent_window.status_log_window is not None:
             try:
                 self.parent_window.status_log_window.add_message(message)
@@ -3221,8 +3390,13 @@ class JigsawSolverDialog(QDialog):
                 pass
 
     def _append_log(self, message: str) -> None:
-        # Log widget removed; per-row status + global status log are the user-facing surfaces.
-        return
+        # Dialog-level events go to the shared status log (per-window ones are
+        # shown in their row and logged by _append_status).
+        if self.parent_window.status_log_window is not None:
+            try:
+                self.parent_window.status_log_window.add_message(f"[Jigsaw] {message}")
+            except Exception:
+                pass
 
     def _refresh_config_labels(self) -> None:
         big = f"font-family: {MONO}; font-size: 14px; font-weight: 600;"
@@ -3268,10 +3442,16 @@ class JigsawSolverDialog(QDialog):
         row = self._rows.get(bot_id)
         if row:
             row["row"].setCrates(crates_completed)
+            bot = self._bots.get(bot_id)
+            if bot is not None:
+                row["row"].setBoards(int(getattr(bot, "boards_completed", 0)))
 
     def _set_status(self, bot_id: int, status: str) -> None:
-        # Per-window status column removed; status is shown via summary_label and global status log.
-        return
+        """Shows the worker's latest message in its row (without the [Wn] tag)."""
+        row = self._rows.get(bot_id)
+        if row:
+            text = status.split("] ", 1)[1] if status.startswith("[W") and "] " in status else status
+            row["row"].setMessage(text)
 
     def _rebuild_rows(self) -> None:
         for row in self._rows.values():
@@ -3292,7 +3472,7 @@ class JigsawSolverDialog(QDialog):
     def _resize_for_rows(self, n_rows: int) -> None:
         # Tightly fit the dialog to the actual content rather than a tall fixed-base.
         # Header + cache row + summary + grid/confirm + buttons + Card chrome ≈ 270px.
-        base_h = 270
+        base_h = 300
         per_row = 30  # 28px row + 2px spacing
         target_h = base_h + max(1, n_rows) * per_row
         target_h = max(330, min(800, target_h))
@@ -3318,7 +3498,8 @@ class JigsawSolverDialog(QDialog):
 class FishbotWindow(QMainWindow):
     BTC_ADDRESS = "3AGrrTflv9QZsMPEoezYTRbf9JyW4nQtHu"
     _f5_toggle = Signal()        # emitted from pynput thread → queued to main thread
-    _sig_bot_stopped = Signal(int)         # bot_id
+    _sig_bot_stopped = Signal(int, object) # bot_id, bot instance
+    _sig_profile_learned = Signal(object)  # detection profile dict
     _sig_row_stats = Signal(int, int, int) # bot_id, games, bait
     _sig_status_log = Signal(str)
 
@@ -3332,6 +3513,8 @@ class FishbotWindow(QMainWindow):
         "timing_key_hold":          0.025,
         "timing_key_settle":        0.030,
         "timing_cast_interkey":     0.050,
+        "timing_minigame_timeout":  6.000,
+        "timing_recast_wait":       4.000,
         "timing_catch_wait":        0.400,
         "timing_open_wait":         0.100,
         "timing_dead_fish_check":   0.100,
@@ -3402,6 +3585,12 @@ class FishbotWindow(QMainWindow):
         self.config_path = os.path.join(os.getcwd(), "bot_config.json")
         self.bots: Dict[int, "FishingBot"] = {}
         self.bot_threads: Dict[int, threading.Thread] = {}
+        self._stopping_threads: List[threading.Thread] = []
+        # Window chosen per slot, kept even while that window is not open, so
+        # starting the bot before the game does not wipe the saved selection.
+        self._remembered_windows: List[str] = [""] * MAX_WINDOWS
+        self._restoring_rows = False
+        self._last_bait_cap: Optional[int] = None
         self.window_managers: Dict[int, WindowManager] = {}
         self._jigsaw_dialog: Optional[JigsawSolverDialog] = None
         self._grid_overlay: Optional[JigsawGridOverlay] = None
@@ -3437,11 +3626,15 @@ class FishbotWindow(QMainWindow):
         self.settings.open_timing.connect(self.open_timing_modal)
         self.settings.config_changed.connect(self._save_settings)
         self.settings.accent_changed.connect(self._on_accent_changed)
+        self.settings.forget_profile.connect(self._on_forget_profile)
+        self.settings.profile_load_requested.connect(self._load_profile_file)
+        self.settings.profile_save_requested.connect(self._save_profile_file)
 
         # Global F5 pause shortcut using pynput (works even when game window has focus)
         self._global_hotkey_listener = None
         self._f5_toggle.connect(self.toggle_pause_all)
         self._sig_bot_stopped.connect(self._on_bot_stopped_ui)
+        self._sig_profile_learned.connect(self._on_profile_learned_ui)
         self._sig_row_stats.connect(self._apply_row_stats)
         self._sig_status_log.connect(self._append_debug_status)
         self._start_global_hotkey_listener()
@@ -3482,6 +3675,16 @@ class FishbotWindow(QMainWindow):
                 "INTERCEPTION",
                 "Interception kernel driver active — input is indistinguishable from a real mouse.",
             )
+        elif name == "uinput":
+            self.header.setInputBackend(
+                "UINPUT",
+                "Virtual kernel mouse/keyboard (/dev/uinput) — input is indistinguishable from real devices.",
+            )
+        elif name == "xtest":
+            tip = "XTest fallback (X11 injection; may be limited on Wayland desktops)."
+            if err:
+                tip += f"\nuinput unavailable: {err}"
+            self.header.setInputBackend("XTEST", tip)
         else:
             tip = "PyAutoGUI fallback (SendInput-based)."
             if err:
@@ -3532,6 +3735,17 @@ class FishbotWindow(QMainWindow):
             "jigsaw_debug_screenshots": False,
             "jigsaw_dry_run": False,
             "auto_fish_handling": False,
+            # Minigame detection: None = stock (official client) colors. A
+            # profile learned by self-calibration is stored here automatically;
+            # set it back to null to forget it.
+            "adaptive_detection": True,
+            # Shorten timing_recast_wait automatically while casts keep succeeding.
+            "adaptive_recast_wait": True,
+            # "auto" = per-window capture once verified, "screen" = always copy
+            # the screen, "window" = always per-window (no verification).
+            "capture_backend": "auto",
+            "detection_profile": None,
+            "detection_debug_dump": False,
             "fish_actions": {},
             "drop_button_pos": None,
             "confirm_button_pos": None,
@@ -3606,6 +3820,7 @@ class FishbotWindow(QMainWindow):
             self.dashboard.setRunning(False)
             self.settings.setConfigEnabled(True)
             self.inventory.setDisabled(False)
+            self.header.setStatus("● IDLE", "idle")
 
     def _set_dashboard_window_selection_locked(self, locked: bool) -> None:
         for row in self.dashboard.window_rows:
@@ -3688,41 +3903,123 @@ class FishbotWindow(QMainWindow):
         if not os.path.exists(self.config_path):
             return
         try:
-            with open(self.config_path, "r") as f:
+            with open(self.config_path, "r", encoding="utf-8") as f:
                 saved = json.load(f)
+            if not isinstance(saved, dict):
+                raise ValueError("configuration is not a JSON object")
         except Exception as e:
+            # Keep the unreadable file instead of silently overwriting it with
+            # defaults on the next save.
+            try:
+                os.replace(self.config_path, self.config_path + ".corrupt")
+            except OSError:
+                pass
             if DEBUG_PRINTS:
                 print(f"Config load failed: {e}")
             return
-        # Tolerant load — copy known keys
+        self._merge_config(saved)
+
+    def _merge_config(self, saved: dict) -> None:
+        """Tolerant merge of saved values over the current configuration."""
         for k, v in saved.items():
             if k == "selected_windows" and isinstance(v, list):
                 # pad to MAX_WINDOWS
-                v = list(v)[:MAX_WINDOWS] + [""] * (MAX_WINDOWS - len(v))
+                v = [str(x or "") for x in v][:MAX_WINDOWS]
+                v += [""] * (MAX_WINDOWS - len(v))
             self.config[k] = v
         # Coerce to tuples for any *_pos that came back as lists
         for k in list(self.config.keys()):
             if k.endswith("_pos") and isinstance(self.config[k], list) and len(self.config[k]) == 2:
                 self.config[k] = tuple(self.config[k])
+        self._remembered_windows = list(self.config.get("selected_windows") or [""] * MAX_WINDOWS)
+
+    def _snapshot_config(self) -> dict:
+        cfg = dict(self.config)
+        cfg["version"] = APP_VERSION
+        cfg["selected_windows"] = list(self._remembered_windows)
+        # Remaining bait per slot. Slots whose window is not open right now
+        # keep the value they were saved with.
+        saved_bait = list(cfg.get("window_bait") or [])
+        saved_bait = (saved_bait + [None] * MAX_WINDOWS)[:MAX_WINDOWS]
+        for i, row in enumerate(self.dashboard.window_rows):
+            if row.selectedWindow():
+                saved_bait[i] = int(self.window_stats[i]["bait"])
+            elif not self._remembered_windows[i]:
+                saved_bait[i] = None
+        cfg["window_bait"] = saved_bait
+        self.settings.writeToConfig(cfg)
+        return cfg
+
+    @staticmethod
+    def _write_json_atomic(path: str, data: dict) -> None:
+        """Write to a temp file and swap it in, so a crash or power loss
+        mid-write cannot leave a truncated configuration behind."""
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
 
     def save_config(self) -> None:
+        if self._restoring_rows:
+            return
         try:
-            cfg = dict(self.config)
-            cfg["version"] = APP_VERSION
-            cfg["selected_windows"] = [row.selectedWindow() for row in self.dashboard.window_rows]
-            self.settings.writeToConfig(cfg)
-            with open(self.config_path, "w") as f:
-                json.dump(cfg, f, indent=2)
+            cfg = self._snapshot_config()
+            self._write_json_atomic(self.config_path, cfg)
             self.config = cfg
         except Exception as e:
             if DEBUG_PRINTS:
                 print(f"Config save failed: {e}")
 
+    # ---------------- Profiles ----------------
+    def _save_profile_file(self, path: str) -> None:
+        try:
+            self._write_json_atomic(path, self._snapshot_config())
+            QMessageBox.information(self, "Profile", f"Saved {os.path.basename(path)}")
+        except Exception as e:
+            QMessageBox.warning(self, "Profile", f"Save failed: {e}")
+
+    def _load_profile_file(self, path: str) -> None:
+        if self.bots:
+            QMessageBox.warning(self, "Profile", "Stop the bot before loading a profile.")
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            if not isinstance(saved, dict):
+                raise ValueError("not a profile file")
+        except Exception as e:
+            QMessageBox.warning(self, "Profile", f"Could not load {os.path.basename(path)}:\n{e}")
+            return
+        self.config = self._default_config()
+        self._merge_config(saved)
+        # Clear the current slot choices so the profile's own are applied
+        self._restoring_rows = True
+        try:
+            for row in self.dashboard.window_rows:
+                row.combo.setCurrentIndex(0)
+        finally:
+            self._restoring_rows = False
+        self._apply_state_to_ui()
+        self.refresh_window_list()
+        self.save_config()
+        self._update_kpis()
+        QMessageBox.information(self, "Profile", f"Loaded {os.path.basename(path)}")
+
+    def _on_forget_profile(self) -> None:
+        self.config["detection_profile"] = None
+        self.settings.setLearnedProfile(None)
+        self.save_config()
+
     def _save_settings(self) -> None:
         # Triggered from settings tab on user changes
         self.save_config()
-        # Recalculate bait for all selected windows when settings change
-        self._recalculate_window_bait()
+        # Refill the per-window bait only when the capacity itself changed
+        # (keys or quantity) — not on every unrelated checkbox.
+        cap = len(self.settings.selectedBaitKeys()) * self.config.get("bait_quantity", 200)
+        if self._last_bait_cap is not None and cap != self._last_bait_cap:
+            self._recalculate_window_bait()
+            self.save_config()
+        self._last_bait_cap = cap
         self._update_kpis()
 
     def _on_accent_changed(self, color: str) -> None:
@@ -3740,10 +4037,8 @@ class FishbotWindow(QMainWindow):
             self.inventory.setCoord(k, self.config.get(cfg_key))
         self.inventory.setAutoFish(self.config.get("auto_fish_handling", False))
         # Dashboard rows
-        sw = self.config.get("selected_windows", [""] * MAX_WINDOWS)
-        for i, row in enumerate(self.dashboard.window_rows):
-            if i < len(sw) and sw[i]:
-                row.setSelectedWindow(sw[i])
+        self._restore_window_rows()
+        self._last_bait_cap = len(self.settings.selectedBaitKeys()) * self.config.get("bait_quantity", 200)
         # Apply accent
         accent = self.config.get("accent_color", C["accent"])
         QApplication.instance().setStyleSheet(build_qss(accent))
@@ -3768,13 +4063,38 @@ class FishbotWindow(QMainWindow):
         except Exception:
             names = []
         self.dashboard.setWindowList(names)
-        # Restore selections from config
-        sw = self.config.get("selected_windows", [""] * MAX_WINDOWS)
-        for i, row in enumerate(self.dashboard.window_rows):
-            if i < len(sw) and sw[i]:
-                row.setSelectedWindow(sw[i])
+        self._restore_window_rows()
+
+    def _restore_window_rows(self) -> None:
+        """Re-selects each slot's remembered window where it is open, and gives
+        freshly restored slots the bait they were saved with."""
+        rows = self.dashboard.window_rows
+        saved_bait = self.config.get("window_bait") or []
+        cap = len(self.settings.selectedBaitKeys()) * self.config.get("bait_quantity", 200)
+        self._restoring_rows = True
+        try:
+            for i, row in enumerate(rows):
+                name = self._remembered_windows[i] if i < len(self._remembered_windows) else ""
+                was_selected = bool(row.selectedWindow())
+                if name and not was_selected:
+                    row.setSelectedWindow(name)   # fires _on_window_changed when found
+                if not was_selected and row.selectedWindow():
+                    bait = saved_bait[i] if i < len(saved_bait) else None
+                    if isinstance(bait, int) and not isinstance(bait, bool) and 0 <= bait <= cap:
+                        self.window_stats[i]["bait"] = bait
+                        row.setBait(bait)
+                elif not row.selectedWindow():
+                    # List was rebuilt and this slot's window is gone
+                    row.setStatus("idle", "EMPTY")
+                    row.setBait("---")
+        finally:
+            self._restoring_rows = False
+        self._update_kpis()
 
     def _on_window_changed(self, index: int, name: str) -> None:
+        if not self._restoring_rows:
+            # Explicit choice by the user (including clearing the slot)
+            self._remembered_windows[index] = name
         # Mark any selected slot as READY/EMPTY pill
         row = self.dashboard.window_rows[index]
         if name:
@@ -4026,6 +4346,17 @@ class FishbotWindow(QMainWindow):
         for _, asset, _ in FISH_DISPLAY + ITEM_DISPLAY:
             actions.setdefault(asset, "keep")
 
+        # Workers from the previous run must have exited, otherwise two bots
+        # would drive the same window (and fight over the cursor).
+        for thread in self._stopping_threads:
+            thread.join(timeout=1.5)
+        self._stopping_threads = [t for t in self._stopping_threads if t.is_alive()]
+        if self._stopping_threads:
+            QMessageBox.information(self, "Still stopping",
+                                    "The previous run is still finishing its last action. "
+                                    "Try again in a moment.")
+            return
+
         self._sound_alert_played = False
         self._session_started_bot_ids = set()
         self._session_bait_depleted_bot_ids = set()
@@ -4061,7 +4392,10 @@ class FishbotWindow(QMainWindow):
             bot.on_status_update = self._on_status
             bot.on_stats_update = self._on_bot_stats
             bot.on_bait_update = self._on_bot_bait
-            bot.on_bot_stop = self._on_bot_stopped
+            # Bind the instance: a late stop notification from a previous run
+            # of this slot must not be mistaken for the bot running there now.
+            bot.on_bot_stop = lambda bid, b=bot: self._sig_bot_stopped.emit(bid, b)
+            bot.on_profile_learned = self._sig_profile_learned.emit
             bot.running = True
             self.bots[i] = bot
             self._session_started_bot_ids.add(i)
@@ -4088,8 +4422,11 @@ class FishbotWindow(QMainWindow):
             except Exception:
                 pass
         self._destroy_all_fish_debug_windows()
+        self._stopping_threads = [t for t in self._stopping_threads if t.is_alive()]
+        self._stopping_threads += [t for t in self.bot_threads.values() if t.is_alive()]
         self.bots.clear()
         self.bot_threads.clear()
+        self.save_config()  # remember the bait that is left
         for row in self.dashboard.window_rows:
             row.setStatus("idle", "READY" if row.selectedWindow() else "EMPTY")
             row.setComboEnabled(True)
@@ -4183,11 +4520,19 @@ class FishbotWindow(QMainWindow):
         self._sound_alert_played = True
         threading.Thread(target=play_rickroll_beep, name="no-bait-alert", daemon=True).start()
 
-    def _on_bot_stopped(self, bot_id: int) -> None:
-        self._sig_bot_stopped.emit(bot_id)
+    def _on_profile_learned_ui(self, profile: object) -> None:
+        """A bot adapted to a re-skinned client — remember it for next time."""
+        if isinstance(profile, dict) or profile is None:
+            # None: the bot found the saved profile does not work and dropped it.
+            self.config["detection_profile"] = profile
+            self.settings.setLearnedProfile(profile)
+            self.save_config()
 
-    def _on_bot_stopped_ui(self, bot_id: int) -> None:
-        bot = self.bots.get(bot_id)
+    def _on_bot_stopped_ui(self, bot_id: int, bot: object = None) -> None:
+        if self.bots.get(bot_id) is not bot:
+            # Stale notification: that bot was already stopped (and possibly
+            # replaced by a new one in the same slot). Nothing to update.
+            return
         reason = getattr(bot, "stop_reason", None)
         if FishingBot is not None and reason == FishingBot.STOP_BAIT_DEPLETED:
             self._session_bait_depleted_bot_ids.add(bot_id)
@@ -4195,8 +4540,11 @@ class FishbotWindow(QMainWindow):
             self._session_non_bait_stop_reasons[bot_id] = reason
 
         self.bots.pop(bot_id, None)
-        self.bot_threads.pop(bot_id, None)
+        thread = self.bot_threads.pop(bot_id, None)
+        if thread is not None and thread.is_alive():
+            self._stopping_threads.append(thread)
         self._destroy_fish_debug_windows(bot_id)
+        self.save_config()  # remember the bait that is left
         if bot_id < len(self.dashboard.window_rows):
             row = self.dashboard.window_rows[bot_id]
             row.setStatus("error", "STOPPED")

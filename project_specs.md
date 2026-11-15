@@ -4,8 +4,8 @@
 
 An automated fishing bot for Metin2 that uses computer vision (no memory reading) to detect fishing minigame state and perform all required actions. Supports up to 8 simultaneous game windows, two fishing modes, automatic inventory handling, multi-page inventory switching, an integrated jigsaw puzzle solver, and fully configurable timing.
 
-**Current version:** 1.2  
-**Platform:** Windows only  
+**Current version:** 2.0.0  
+**Platform:** Windows; Linux with the game under Wine (see `docs/LINUX.md`)  
 **Stack:** Python 3.14.2, OpenCV, Tkinter, mss, pynput, PyAutoGUI, PyInstaller
 
 ---
@@ -24,6 +24,9 @@ Mt2-Fishbot/
 │   ├── jigsaw_bot.py        # Jigsaw puzzle automation (~1241 lines)
 │   ├── jigsaw_detector.py   # Jigsaw piece recognition (~725 lines)
 │   ├── qt_gui.py            # Qt-based GUI alternative (~4280 lines, unused in build)
+│   ├── screen_capture.py    # WindowCapture: screen copy / per-window render policy
+│   ├── input_backend.py     # Mouse/keyboard backends (Interception, PyAutoGUI, uinput, XTest)
+│   ├── platforms/           # OS layer: win32.py (Windows), x11.py + uinput.py (Linux)
 │   └── __init__.py
 ├── src/jigsaw_solver/       # Fishing jigsaw puzzle solver package
 │   ├── fishing_jigsaw_solver.py   # Core solver (~1099 lines)
@@ -47,8 +50,9 @@ Mt2-Fishbot/
 
 ### Multi-Window Fishing
 - Up to **8 simultaneous** Metin2 game windows, each on its own thread
-- A single global `input_lock` (threading.Lock) serialises all mouse/keyboard input
-- Lock fairness: a thread yields after 3 consecutive acquisitions so others get a turn
+- A single global `input_lock` (FIFO-fair `PriorityInputLock`) serialises all mouse/keyboard input
+- Every input sequence first brings its own window to the front and sends nothing if the OS
+  did not do so (see Input Arbitration)
 
 ### Fishing Modes
 | Mode | How it works |
@@ -68,11 +72,14 @@ Mt2-Fishbot/
 - At startup, scans all configured pages to process any existing items
 - Detects empty slot count via `empty_slot.jpg` template; auto-switches page when current page is full
 - `_startup_scan_and_process_all_pages()`, `_switch_inventory_page()`, `_scan_empty_slots()`
+- The empty slots are read from the picture after every handled catch (`_page_has_space`), not
+  kept by bookkeeping; a page counts as full only when two looks 0.15 s apart agree
+- An item that is still in its slot after an open / drop is left alone from then on
 
 ### Integrated Jigsaw Puzzle Solver
 - Detects and solves the in-game fishing jigsaw minigame automatically
 - Toggle via GUI; dry-run mode for simulation without clicks
-- Configurable: detection threshold, action delay, crate priority (`normal_first` / `empty_first`)
+- Configurable: detection threshold, action delay, crate priority (`normal_first` / `special_first` / `special_when_better`: a special crate, which always gives the 3x2 piece, only where it saves rounds)
 - Debug: optional screenshot dumps, live `JigsawSolverDebugWindow` overlay
 - Board: 4×6 grid (24 cells); 6 piece types; DP-based optimal solver in ≤10 rounds
 
@@ -129,7 +136,10 @@ All settings persist across sessions:
 One instance per game window. Main entry point is `play_game()`.
 
 Key methods:
-- `play_game()` — outer loop: bait → cast → wait for minigame → detect & click fish → handle catch → quick skip → repeat
+- `play_game()` — outer loop: bait → cast → wait for minigame → `_play_minigame()` → handle catch → quick skip / recast wait → repeat
+- `_play_minigame()` — one open minigame until its panel closes; returns (stuck, hits)
+- `_handle_item()` — open / drop one inventory item under one lock hold (used at startup and after a catch)
+- `_page_has_space()` / `_goto_page()` — re-read the empty slots of the visible page; click a page tab
 - `atomic_capture_and_click()` — captures screen and clicks fish while holding `input_lock` (two-phase: detect then click atomically)
 - `wait_for_minigame_window()` — polls until cyan window appears (timeout: 6 s)
 - `wait_for_classic_fish()` — multi-scale template match loop
@@ -148,7 +158,6 @@ Performance details:
 - Half-dimensions pre-computed; bitwise `>> 1` used instead of `/ 2`
 - Single HSV conversion per frame covers both window and fish detection
 - Local variable aliases for frequently called functions avoid attribute lookups
-- Lock fairness: `_consecutive_lock_acquisitions` yields thread after 3 acquisitions
 
 ### `fish_detector.py` — FishDetector class
 Single-pass HSV detection, no template matching for the minigame itself.
@@ -230,27 +239,195 @@ python tools/build.py --verify             # Check dependency versions only
 python tools/build.py --setup              # Install all required dependencies
 ```
 
-Pinned dependency versions:
-| Package | Version |
-|---------|---------|
-| Python | 3.14.2 |
-| PyInstaller | 6.17.0 |
-| opencv-python-headless | 4.12.0 |
-| numpy | 2.2.6 |
-| Pillow | 12.1.0 |
-| pynput | 1.8.1 |
-| psutil | 7.2.1 |
-| pyautogui | 0.9.54 |
-| mss | 10.1.0 |
-| pygetwindow | 0.0.9 |
+Pinned dependency versions live in `tools/build.py` (`required_versions`) — that block is the
+source of truth and is rewritten by `--update-versions`.
 
 The `.spec` bundles the `assets/` folder and sets windowed mode (no console).
 
 ---
 
+## Minigame Detection Profiles (cross-client support)
+
+Detection is driven by a `DetectionProfile` (`fish_detector.py`): HSV range of the panel, HSV range
+of the fish, click-circle radius and pixel thresholds. The default profile holds the official
+client's values.
+
+| Config key | Default | Meaning |
+|------------|---------|---------|
+| `adaptive_detection` | `true` | Self-calibrate when the active profile finds no panel |
+| `detection_profile` | `null` | Profile to use instead of the stock one; a learned profile is saved here automatically. Set back to `null` to forget it |
+| `detection_debug_dump` | `false` | Save before-cast / current frames to `debug_frames/` when calibration fails or adapts (max 6 per session) |
+| `timing_minigame_timeout` | 6 s | Base wait for a bite; grows after misses and tracks the longest bite seen |
+| `timing_recast_wait` | 4 s | Wait before the next cast when quick skip is off |
+
+Self-calibration, when the stock colors find nothing for 1.2 s after a cast:
+1. `WindowLearner` diffs the window against a frame taken just before the cast and looks for a
+   large, dense, rectangular change with one dominant color — that color becomes the panel range.
+2. `FishLearner` follows the moving non-background blob (used as the fish position immediately),
+   collects its colors into a fish range, and records static decorations (circle outline, labels)
+   so they are never mistaken for the fish.
+3. While it watches, the learner samples the panel into a `BackgroundModel`: per pixel, the band of
+   values it normally takes (15th–85th percentile of 25 samples, so the passing fish does not count).
+   A static pixel has a one-value band, a pixel of an animated background (moving water) a wider
+   one. For learned profiles the fish must match the fish range *and* lie outside that band, so
+   textured or animated panels, a filled disc and fish-colored icons are not mistaken for it.
+   The fish itself is tracked as the solid non-background body with the most motion on it (thin
+   structures such as outlines, foam lines and timer bars are ignored), and its color is the
+   dominant color cluster of what was sampled.
+4. `find_click_circle` locates the click circle (outline or disc) in that model; its center and
+   92 % of its radius are stored in the profile (`circle_center`, `circle_radius`). Without a
+   detectable circle the middle of the panel and the configured radius are used, as before.
+5. The finished profile is shared with the other bots and written to `detection_profile`.
+   A learned profile that produces no hit in 2 consecutive games is discarded and also removed
+   from the saved configuration.
+
+Standard panel, different fish: if the stock profile finds the panel but has not seen a single fish
+2 s into a game (and never has this session), the panel colors are kept and only the fish is
+learned by motion. A client on which the stock colors work never takes this path.
+
+A "minigame" that stays open for more than 90 s is treated as a false detection: no bait is
+charged, the calibration (and a learned profile) is dropped and the panel is searched again.
+
+Other robustness rules: the panel must be seen at the same place in two consecutive frames before
+calibrating; a calibrated panel that moved is re-found by a full-window scan; "panel open" is judged
+relative to the calibrated pixel count; the game only counts as finished after 3 consecutive frames
+without the panel and one look at the whole window that does not find it elsewhere.
+
+After the first calibration (the panel's size is then known):
+
+| Situation | How it is noticed | What happens |
+|-----------|-------------------|--------------|
+| Panel opens in another place | not in the region; or only part of it is (`FishDetector.partly_visible`: under 80 % of the calibrated pixels) | full-window scan, re-calibrate. Once this has happened (`_panel_moves`), the whole window is scanned every 0.15 s from the start of the wait instead of every 0.5 s after 2 s |
+| Panel dragged during a game | `partly_visible`, or gone from the region | `_panel_elsewhere()` re-calibrates; the game goes on |
+| Panel looks different this time | the region changed against the frame taken before the cast (`_region_changed`, > 50 % of its pixels, for 0.25 s) while the active profile sees no panel | other known looks (`_known_profiles`, the shared profile, the stock one) are tried, then `WindowLearner`. A candidate is only accepted at the known panel size (±15 %) and, for a known look, when its color fills at least half of what it outlines |
+| Same panel, different fish | no fish for 4 s in a game although the profile has found fish before (2 s if it never has) | the fish is re-learned from its movement |
+| Misses in a row | 2 casts without a minigame | calibration is dropped; the panel is searched from scratch |
+
+A reference frame is taken before every cast (one full-window grab) so a changed look can be
+learned in the cast in which it first appears. Other looks are tried at most every 1.5 s while
+nothing points to one.
+
+## Adaptive Timing
+
+| What | How |
+|------|-----|
+| Bite timeout | ×1.5 per consecutive miss, up to 30 s by the 5th cast (after which the bait key is taken to be empty); remembers the longest bite seen (`_bite_timeout`). A pause during the wait ends it without counting a miss |
+| Catch wait | Inventory is watched for the new item instead of sleeping a fixed time |
+| Click lead | `_click_point`: fish speed from the last 150 ms of positions; the click is aimed where the fish will be when the button goes down (cursor settle + 4 ms) and skipped when that point is outside the circle |
+| Wait before next cast (quick skip off) | `RecastWaitTuner` (config `adaptive_recast_wait`, default on): starts at `timing_recast_wait`, shortens by 20 % after every 2 successful casts, floor 0.5 s. The first shortened wait followed by a missed bite is too short: it returns to the last working wait and stays. Two misses in a row at a proven wait give one step back. A settled wait is shared with the other windows (`_shared_recast_wait`) so each server costs one missed cast, not one per window. The adaptive wait is counted from the end of the game (`_wait_before_recast`): item handling and waiting for the mouse happen inside it. A cast that went out more than 0.5 s later than planned, or after a pause, is not fed back to the tuner. With `adaptive_recast_wait` off the configured wait is slept in full after item handling |
+
+## Screen Capture (`screen_capture.py`)
+
+Both bots capture through `WindowCapture`; config key `capture_backend`:
+
+| Value | Behavior |
+|-------|----------|
+| `auto` (default) | Per-window render (`PrintWindow` + `PW_RENDERFULLCONTENT`) for windows that are not in front, plain screen copy for the focused one. The render is only trusted after it matched the screen copy while the window was in front (checked at start and on each cast, up to 12 times); otherwise screen copy only |
+| `screen` | Always copy the screen (windows must not overlap) |
+| `window` | Always per-window render, no verification |
+
+Clicks still need the window in front; every input sequence activates it under `input_lock` first.
+A minimized window cannot be captured by either method.
+
+## Input Arbitration
+
+`utils.input_lock` is a `PriorityInputLock`: FIFO-fair, with an urgent class used only by the
+minigame fish click (`with input_lock.urgent():`), so a fish inside the circle goes ahead of queued
+casts and inventory sequences from other windows.
+
+Both bots send input only through `_focus()`: with the lock held it activates the bot's own window
+and returns False when the OS did not put it in front (or the bot was stopped). The caller then
+sends nothing — a key would go to whatever client is in front, a click to whatever is under the
+cursor. A cast that could not be sent is retried after 0.5 s and is not counted as a missed bite;
+a page tab that could not be clicked leaves the page state untouched. Nothing is sent after Stop
+(or after the bot stopped itself: inventory full, bait used up) — including the quick skip and
+the startup inventory scan. `WindowManager.activate_window()` returns
+immediately when the window is already in front and otherwise polls for confirmation (with an
+`AttachThreadInput` fallback) instead of sleeping a fixed 30 ms.
+
+## Jigsaw Bot (`jigsaw_bot.py`)
+
+One worker per window, started from the Jigsaw Solver dialog (fishing is locked while the dialog
+is open; both use the same selected windows, `input_lock`, capture and F5). A round:
+
+1. Read the board (`detect_grid`), check the crate slots. Only crate kinds the priority setting
+   opens are refilled from the inventory, and each kind is searched for once per run.
+2. Click the crate, wait until the confirm dialog is actually on screen (`_wait_for_dialog` watches
+   the confirm-button area, up to `jigsaw_dialog_wait_timeout`), click confirm, park the cursor.
+3. Identify the piece on the cursor. If none shows up, confirm once more (late dialog) and look
+   again; still none → discard, and after 3 such rounds pause with a reason.
+4. Solver decides; place (click, then park the cursor again in the same lock hold — a piece that
+   is still on the cursor must not stay over the grid, where it looks like placed cells) or discard.
+5. `_confirm_placement`: the board must show the piece (`jigsaw_place_verify_timeout`). Unchanged
+   board → click again → still unchanged and a piece is on the cursor → discard it. After any round
+   that ended uncertain, the next one first looks for a held piece and plays it instead of opening
+   a crate on top of it.
+
+Multi-window rules: every input sequence holds `input_lock` and activates its own window; the
+cursor is brought back to the window's parked point before the piece is looked at; after a real
+focus switch a click waits 40 ms so the game has tracked the cursor. `get_solver()` is locked so
+all workers share one copy of the tables. Throughput is bounded by the single shared cursor: rounds
+of different windows interleave, so time per crate grows roughly linearly with the window count.
+
+Also: a discarded piece that is still on the cursor after the confirm click (dialog came up late)
+is confirmed again and looked for before the next crate; a crate moved from the inventory is
+checked to have arrived in its slot (cursor parked off the slot first) and the slot is clicked
+again if not — a crate left on the cursor would otherwise read as "none left".
+
+`tests/test_jigsaw_sim.py` runs the bots against simulated event windows (1 and 3 windows sharing
+one cursor/focus) including lost clicks, late dialogs, refill, board completion and missing pieces;
+`JigsawHardTests` adds 5 windows in two rows with slow focus switches and jittered dialog / piece
+delays, an OS that refuses 30 % of focus requests, lost confirm clicks, a lost crate-to-slot click,
+a window away from the desktop origin, and Stop in the middle of a round.
+
+## Cross-Platform Layer (`src/platforms/`)
+
+Everything OS-specific sits behind one small contract (documented in
+`platforms/__init__.py`); `platforms.native` is the module for the running OS.
+WindowManager (activation retries, rect cache, window ordering), WindowCapture
+(capture mode policy) and the bots are shared code on top of it.
+
+| Module | OS | Provides |
+|--------|----|----------|
+| `win32.py` | Windows | window list (pygetwindow), focus with AttachThreadInput fallback, GetWindowRect, PrintWindow render |
+| `x11.py` | Linux | window list (`_NET_CLIENT_LIST`), focus (`_NET_ACTIVE_WINDOW`), client-area rect, window image (X11 GetImage), keymap lookup. Wine draws through X11/XWayland |
+| `uinput.py` | Linux | virtual absolute mouse + keyboard via /dev/uinput (raw ioctl, no compiled deps) |
+
+Linux specifics: the rect is the client area (no title bar), so positions saved on Windows must be
+recaptured; under XWayland the desktop can't be copied, so capture always reads the window itself
+(`auto`/`screen` become `window`); input backend `auto` = uinput, fallback XTest (pynput).
+The Qt GUI runs on X11 (`QT_QPA_PLATFORM=xcb;wayland`) so the pynput F5/click listeners see it.
+
+`platforms.native = None` means "no desktop": unit tests set it (tests/_stubs.py), so they never
+touch windows or create input devices.
+
+## Tests
+
+`python tools/run_tests.py` — unit tests, any OS, never touch the desktop. `tests/_stubs.py` stubs the
+OS modules and provides a simulated game screen (stock and re-skinned minigame, inventory strip).
+
+| Command | Adds |
+|---------|------|
+| `--os` | `tests/os_layer/`: the platform contract against the real OS (test window: list, rect, focus, minimize/restore, capture colors). Same tests on Windows and Linux |
+| `--os --xvfb` | Linux: same, on a private Xvfb + openbox display |
+| `--live` | real mouse/keyboard tests; on Linux also the Wine end-to-end test (`tools/wine_probe/d3dprobe.c`, a D3D9 stand-in for the client) |
+
+Markers (`tests/conftest.py`): `windows`, `linux` (auto-skip on the other OS), `live` (opt-in).
+CI (`.github/workflows/tests.yml`) runs `--os` on Windows and Linux for every push and PR.
+`tests/test_window_manager.py` pins the shared window/capture policy against a fake OS layer.
+`tests/test_hard_sim.py` runs whole fishing sessions in hard conditions (`docs/SIMULATOR.md`, "Hard
+mode"): panel in a new place every game or dragged mid-game, a different look every game, bites
+far beyond the timeout, black captures, late items, pop-up windows, an inventory filling up page
+by page, and 3–5 clients on one desktop with slow or refused focus switches (no key or click may
+reach another client).
+`tests/test_adaptive_skins.py` covers the re-skin variants: off-center / smaller circle, filled
+disc, textured panel with timer bar and fish-colored icon, standard panel with a different fish,
+a panel that never closes, and a bad saved profile.
+
 ## Known Limitations
 
-- Windows only (uses `win32api`, `winsound`, `ctypes.windll`)
+- Linux: game must run under Wine's X11 driver (not winewayland); multi-monitor and fractional
+  scaling untested; F5 works only while an X11 window (game or bot) has focus
 - Game window display scale should be 100%; other scales need DPI config
 - Auto fish handling requires inventory to be open and mostly empty
 - Armor quick skip requires coordinates calibrated per screen resolution

@@ -5,10 +5,91 @@ Utility functions and constants for the Fishing Bot
 import os
 import sys
 import threading
-import winsound
+from contextlib import contextmanager
+
+try:
+    import winsound
+except ImportError:  # non-Windows (tests / tooling)
+    winsound = None
+
+
+class PriorityInputLock:
+    """Mutex for the single shared mouse/keyboard, with two priority classes.
+
+    All bots share one cursor and one foreground window, so every input
+    sequence must be serialized. A plain ``threading.Lock`` hands the lock to
+    an arbitrary waiter, which lets a slow inventory/cast sequence jump ahead
+    of a bot whose fish is inside the circle *right now*.
+
+    Waiters are served strictly by (priority, arrival order):
+
+    - ``with input_lock:``            normal priority (casts, inventory, keys)
+    - ``with input_lock.urgent():``   time-critical (minigame fish click)
+
+    Arrival order inside a class makes the lock fair, so no bot can starve
+    another by re-acquiring in a tight loop.
+    """
+
+    URGENT = 0
+    NORMAL = 1
+
+    def __init__(self):
+        self._cond = threading.Condition(threading.Lock())
+        self._held = False
+        self._seq = 0
+        self._waiters = []  # sorted list of (priority, seq)
+
+    def acquire(self, priority: int = NORMAL) -> bool:
+        with self._cond:
+            if not self._held and not self._waiters:
+                self._held = True
+                return True
+            self._seq += 1
+            ticket = (priority, self._seq)
+            self._waiters.append(ticket)
+            self._waiters.sort()
+            try:
+                while self._held or self._waiters[0] != ticket:
+                    self._cond.wait()
+            except BaseException:
+                self._waiters.remove(ticket)
+                self._cond.notify_all()
+                raise
+            self._waiters.pop(0)
+            self._held = True
+            return True
+
+    def release(self) -> None:
+        with self._cond:
+            self._held = False
+            self._cond.notify_all()
+
+    def locked(self) -> bool:
+        return self._held
+
+    def contended(self) -> bool:
+        """True when at least one other thread is waiting for the lock."""
+        return bool(self._waiters)
+
+    def __enter__(self):
+        self.acquire(self.NORMAL)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.release()
+        return False
+
+    @contextmanager
+    def urgent(self):
+        self.acquire(self.URGENT)
+        try:
+            yield self
+        finally:
+            self.release()
+
 
 # Thread synchronization for mouse/keyboard - prevents race conditions
-input_lock = threading.Lock()
+input_lock = PriorityInputLock()
 
 # Max simultaneous game windows
 MAX_WINDOWS = 8
@@ -103,6 +184,24 @@ def load_window_icon(window) -> None:
     set_window_icon(window, get_resource_path("monkey.ico"))
 
 
+def _play_wav_file(path: str) -> bool:
+    """Linux: plays a WAV file with the first player found (PipeWire,
+    PulseAudio, ALSA) and waits for it. False when none could play it."""
+    import shutil
+    import subprocess
+    for player in (["pw-play"], ["paplay"], ["aplay", "-q"]):
+        exe = shutil.which(player[0])
+        if not exe:
+            continue
+        try:
+            if subprocess.run([exe] + player[1:] + [path], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=30).returncode == 0:
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def play_rickroll_beep():
     """Plays a Rick Roll-themed beep sequence with smooth ADSR envelopes.
     Uses numpy to generate WAV audio with professional envelope curves."""
@@ -184,13 +283,18 @@ def play_rickroll_beep():
             tmp_path = tmp.name
         
         try:
-            winsound.PlaySound(tmp_path, winsound.SND_FILENAME | winsound.SND_NODEFAULT)
+            if winsound is not None:
+                winsound.PlaySound(tmp_path, winsound.SND_FILENAME | winsound.SND_NODEFAULT)
+            else:
+                _play_wav_file(tmp_path)
         finally:
             time.sleep(0.1)  # Small delay before cleanup
             os.remove(tmp_path)
     
     except (ImportError, Exception):
         # Fallback to original winsound beeps if numpy not available
+        if winsound is None:
+            return
         import time
         melody = [
             (554, 600), (622, 1000), (622, 600), (698, 600),

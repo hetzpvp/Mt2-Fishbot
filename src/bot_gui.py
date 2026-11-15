@@ -12,7 +12,10 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 from typing import Optional, Dict
 
-import pyautogui
+try:
+    import pyautogui
+except Exception:  # not used (or installed) on Linux
+    pyautogui = None
 from PIL import Image, ImageTk
 
 try:
@@ -596,7 +599,7 @@ class TimingSettingsWindow:
 class BotGUI:
     """GUI for the fishing bot - supports up to 8 simultaneous windows"""
     
-    BOT_VERSION = "1.2"  # Version for config validation and GUI display
+    BOT_VERSION = "2.0.0"  # Version for config validation and GUI display
     ACCENT_COLOR = "#FFBB00"  # Gold color used throughout the GUI
     
     def __init__(self):
@@ -3377,7 +3380,8 @@ class BotGUI:
     def run(self):
         """Starts the GUI application."""
         # FAILSAFE already disabled at module level for multi-window support
-        pyautogui.PAUSE = 0.01
+        if pyautogui is not None:
+            pyautogui.PAUSE = 0.01
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.mainloop()
     

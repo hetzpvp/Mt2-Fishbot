@@ -5,6 +5,7 @@ Computes optimal actions for all possible game states.
 Optimized with NumPy and Numba for fast computation.
 """
 import os
+import threading
 import sys
 import numpy as np
 from dataclasses import dataclass
@@ -619,12 +620,20 @@ class Deterministic(Solver):
 
 # Singleton instance for caching the computed strategy
 _cached_solver: Deterministic = None
+_solver_lock = threading.Lock()
 
 
 def get_solver() -> Deterministic:
-    """Get or create the cached deterministic solver."""
+    """Get or create the cached deterministic solver.
+
+    Guarded by a lock: every window's worker asks for the solver when it
+    starts, and without it each of them would build its own copy of the
+    (hundreds of MB) tables at the same time."""
     global _cached_solver
     if _cached_solver is None:
-        _cached_solver = Deterministic()
-        _cached_solver.run()
+        with _solver_lock:
+            if _cached_solver is None:
+                solver = Deterministic()
+                solver.run()
+                _cached_solver = solver
     return _cached_solver

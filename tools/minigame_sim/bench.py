@@ -1,0 +1,260 @@
+"""Headless benchmark: the real FishingBot loop against the simulated fishing
+window, one run per skin. No window, no real mouse or keyboard — safe to run
+while playing.
+
+    python tools/minigame_sim/bench.py                 all skins, 6 games each
+    python tools/minigame_sim/bench.py --skin water --games 20
+    python tools/minigame_sim/bench.py --handling open   also test auto fish handling
+    python tools/minigame_sim/bench.py --hard            every difficulty at once (see below)
+    python tools/minigame_sim/bench.py --windows 4       four clients on one desktop
+
+Difficulty: --wander (the panel opens somewhere else every game), --change-look
+(another look every game), --lag (items land late), --hiccups (some captures
+come back black), --popups (other game windows open while the line is out),
+--bite-delay MIN MAX. --hard turns all of them on. With --windows the clients
+share one cursor, one keyboard and one focus; the last line reports input that
+reached the wrong client (must be 0).
+
+Prints, per skin: games played, catches, hits, misses, clicks sent too early
+(inside the game's click cooldown, so they did nothing), timeouts and whether
+the look had to be learned.
+"""
+
+import argparse
+import os
+import sys
+import threading
+import time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+for p in (os.path.join(ROOT, "tests"), os.path.join(ROOT, "tools"), os.path.join(ROOT, "src")):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+from _stubs import install  # noqa: E402
+
+install()
+
+from minigame_sim.fishing_game import FishingGame, SKINS  # noqa: E402
+
+
+from minigame_sim.desktop import FishingDesktop, FAST  # noqa: E402,F401
+from fishing_bot import FishingBot  # noqa: E402
+
+
+class GameWM:
+    """Window manager of a window that is always there and always in front."""
+
+    def __init__(self, game):
+        self.game = game
+        self.selected_window = object()
+        self.last_switch_time = 0.0
+
+    def is_window_available(self):
+        return True
+
+    def is_foreground(self):
+        return True
+
+    def activate_window(self, force_activate=False):
+        return True
+
+    def get_window_rect(self):
+        return (0, 0, self.game.W, self.game.H)
+
+    def invalidate_rect_cache(self):
+        pass
+
+
+class GameMouse:
+    name = "sim"
+
+    def __init__(self, game):
+        self.game = game
+        self.pos = (0, 0)
+
+    def move_to(self, x, y):
+        self.pos = (int(x), int(y))
+        self.game.move(*self.pos)
+
+    def position(self):
+        return self.pos
+
+    def mouse_down(self, button="left"):
+        self.game.click(self.pos[0], self.pos[1], button)
+
+    def mouse_up(self, button="left"):
+        pass
+
+    def click(self, button="left"):
+        self.game.click(self.pos[0], self.pos[1], button)
+
+    def close(self):
+        pass
+
+
+class GameKeyboard:
+    def __init__(self, game):
+        self.game = game
+
+    def press(self, key):
+        self.game.key(str(key))
+
+    def release(self, key):
+        pass
+
+
+def make_bot(game, config=None):
+    """A FishingBot whose eyes and hands are connected to ``game``."""
+    FishingBot._shared_learned_profile = None
+    FishingBot._shared_recast_wait = None
+    FishingBot._known_profiles = []
+    logs = []
+    bot = FishingBot(None, dict(FAST, **(config or {})), GameWM(game), bait_counter=10 ** 6, bot_id=0)
+    mouse, keyboard = GameMouse(game), GameKeyboard(game)
+    bot.mouse_backend = mouse
+    bot.human.mouse = mouse
+    bot.keyboard_controller = keyboard
+    bot.human.keyboard_controller = keyboard
+    bot._grab = game.grab
+    bot.on_status_update = logs.append
+    return bot, logs
+
+
+def run(game, config=None, games=6, timeout=120.0, until=None):
+    """Plays until ``games`` minigames are over (or ``until()`` is true)."""
+    bot, logs = make_bot(game, config)
+    done = until or (lambda: game.stats["caught"] + game.stats["timeouts"] >= games)
+    bot.running = True
+    thread = threading.Thread(target=bot.play_game, daemon=True)
+    thread.start()
+    deadline = time.time() + timeout
+    while time.time() < deadline and thread.is_alive() and not done():
+        time.sleep(0.02)
+    bot.stop()
+    thread.join(timeout=15)
+    assert not thread.is_alive(), "the bot did not stop"
+    return bot, logs
+
+
+def quick_game(skin, **kw):
+    """A game with short waits, for tests and benchmarks."""
+    opts = dict(bite_delay=(0.3, 0.8), recast_cooldown=0.2)
+    opts.update(kw)
+    return FishingGame(skin=skin, **opts)
+
+
+CHANGING_LOOKS = ["official", "emerald", "crimson", "official-redfish", "water", "sand-textured"]
+
+
+def hard_options(args, skin):
+    """FishingGame options for the difficulty flags."""
+    opts = {}
+    if args.wander or args.hard:
+        opts["wander"] = True
+    if args.change_look or args.hard:
+        opts["skins"] = [skin] + [s for s in CHANGING_LOOKS if s != skin]
+    if args.lag or args.hard:
+        opts["catch_delay"] = (0.3, 0.8)
+    if args.hiccups or args.hard:
+        opts["blank_chance"] = 0.05
+    if args.popups or args.hard:
+        opts["popup_chance"] = 0.5
+    if args.bite_delay:
+        opts["bite_delay"] = tuple(args.bite_delay)
+    return opts
+
+
+def bot_config(args, game):
+    config = {"adaptive_detection": not args.no_adaptive, "human_like_clicking": args.human}
+    if args.handling:
+        config.update(auto_fish_handling=True,
+                      fish_actions={n: args.handling for n in game._item_names},
+                      drop_button_pos=list(game.drop_button),
+                      confirm_button_pos=list(game.confirm_button))
+    if args.bite_delay:
+        config["timing_minigame_timeout"] = max(3.0, args.bite_delay[1] + 1.0)
+    return config
+
+
+def report(name, game, bot, seconds, handling, logs=None):
+    s = game.stats
+    notes = []
+    if bot.detector.profile.learned:
+        notes.append("learned")
+    if bot._panel_moves:
+        notes.append(f"panel moved {bot._panel_moves}x")
+    if handling:
+        left = sum(len(p) for p in game.pages)
+        notes.append(f"opened {s['opened']} dropped {s['dropped']} left {left}")
+    for key, label in (("stray_clicks", "stray clicks"), ("casts_cancelled", "casts reeled in"),
+                       ("casts_ignored", "casts ignored")):
+        if s[key]:
+            notes.append(f"{s[key]} {label}")
+    print(f"{name:18} {s['games']:5} {s['caught']:6} {s['hits']:5} {s['misses']:5} "
+          f"{s['clicks_ignored']:5} {s['timeouts']:5} {seconds / max(1, s['games']):6.1f}  {', '.join(notes)}")
+    if logs:
+        for line in logs:
+            print("    ", line)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--skin", action="append", choices=sorted(SKINS), help="default: all")
+    ap.add_argument("--games", type=int, default=6)
+    ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--no-adaptive", action="store_true", help="turn self-calibration off")
+    ap.add_argument("--human", action="store_true", help="human-like clicking")
+    ap.add_argument("--handling", choices=("keep", "open", "drop"),
+                    help="auto fish handling with this action for every item")
+    ap.add_argument("--windows", type=int, default=1, help="clients sharing one desktop")
+    ap.add_argument("--switch-delay", type=float, default=0.01, help="seconds a focus switch takes (--windows)")
+    ap.add_argument("--refuse-focus", type=float, default=0.0, help="share of focus requests the OS ignores")
+    ap.add_argument("--wander", action="store_true")
+    ap.add_argument("--change-look", action="store_true")
+    ap.add_argument("--lag", action="store_true")
+    ap.add_argument("--hiccups", action="store_true")
+    ap.add_argument("--popups", action="store_true")
+    ap.add_argument("--bite-delay", type=float, nargs=2, metavar=("MIN", "MAX"))
+    ap.add_argument("--hard", action="store_true", help="all difficulty flags")
+    ap.add_argument("-v", "--verbose", action="store_true", help="print the bot's log")
+    args = ap.parse_args()
+
+    print(f"{'skin':18} {'games':>5} {'caught':>6} {'hits':>5} {'miss':>5} {'early':>5} {'t/out':>5} "
+          f"{'s/game':>6}  notes")
+    worst = 0
+    skins = args.skin or (["official"] if args.windows > 1 or args.hard or args.change_look else list(SKINS))
+
+    if args.windows > 1:
+        desktop = FishingDesktop(switch_delay=args.switch_delay, refuse_focus=args.refuse_focus, seed=args.seed)
+        games = []
+        for i in range(args.windows):
+            skin = skins[i % len(skins)]
+            game = quick_game(skin, seed=args.seed + i, **hard_options(args, skin))
+            games.append(game)
+            desktop.add(game, bot_config(args, game))
+        t0 = time.time()
+        desktop.run(lambda: all(g.stats["caught"] + g.stats["timeouts"] >= args.games for g in games),
+                    timeout=60.0 * args.games)
+        for i, (game, bot) in enumerate(zip(games, desktop.bots)):
+            report(f"W{i + 1} {game.skin.name}"[:18], game, bot, time.time() - t0, args.handling)
+            worst = max(worst, game.stats["games"] - game.stats["caught"])
+        wrong = desktop.misdirected_keys + desktop.misdirected_clicks
+        print(f"focus switches {desktop.switches}, refused {desktop.refused}, "
+              f"input that reached the wrong client: {wrong}")
+        if args.verbose:
+            for line in desktop.logs:
+                print("    ", line)
+        return 1 if worst or wrong else 0
+
+    for name in skins:
+        game = quick_game(name, seed=args.seed, **hard_options(args, name))
+        t0 = time.time()
+        bot, logs = run(game, bot_config(args, game), games=args.games, timeout=40.0 * args.games)
+        report(name, game, bot, time.time() - t0, args.handling, logs if args.verbose else None)
+        worst = max(worst, game.stats["games"] - game.stats["caught"])
+    return 1 if worst else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

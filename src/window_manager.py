@@ -1,26 +1,34 @@
 """
 Window Manager and Game Region classes for the Fishing Bot
+
+The policy here (retries, confirmation, caching, ordering) is shared by all
+operating systems; the OS calls themselves live in platforms/ (win32.py on
+Windows, x11.py on Linux).
 """
 
-import ctypes
 import time
 from dataclasses import dataclass
 from typing import List, Tuple
 
-import pygetwindow as gw
+import platforms
 from utils import DEBUG_PRINTS
 
-_user32 = ctypes.windll.user32
-_SW_RESTORE = 9
+# How long to wait for the OS to confirm a foreground switch (per attempt),
+# and how long to let the game process WM_ACTIVATE after a real switch.
+_ACTIVATE_CONFIRM_TIMEOUT = 0.030
+_ACTIVATE_SETTLE = 0.012
 
 
 class WindowManager:
     """Manages window detection and focus for the bot"""
-    
+
     def __init__(self):
         self.selected_window = None
         self._rect_cache = None
         self._rect_cache_time = 0.0
+        # perf_counter time of the last real focus switch to this window
+        # (used by screen_capture to know when the desktop shows it again).
+        self.last_switch_time = 0.0
 
     def is_window_available(self) -> bool:
         """Returns False when the selected window handle no longer exists."""
@@ -28,58 +36,75 @@ class WindowManager:
             return False
 
         try:
-            hwnd = getattr(self.selected_window, "_hWnd", None)
-            if not hwnd or not _user32.IsWindow(hwnd):
+            hwnd = self._hwnd()
+            if not hwnd or not platforms.native.is_window(hwnd):
                 self.invalidate_rect_cache()
                 return False
             return True
         except Exception:
             self.invalidate_rect_cache()
             return False
-    
+
     @staticmethod
-    def get_all_windows() -> List[Tuple[str, gw.Win32Window]]:
-        """Gets all visible windows on Windows 10+. Returns list of (display_name, window)"""
-        windows = []
-        priority_windows = []  # Windows with 'mt2', 'metin2', 'metin 2', or words with '2'
-        
+    def get_all_windows() -> List[Tuple[str, object]]:
+        """Gets all visible windows. Returns list of (display_name, window)"""
+        return WindowManager._order_windows(WindowManager._raw_windows())
+
+    @staticmethod
+    def _raw_windows() -> list:
         try:
-            # Use getAllWindows() directly - more reliable on Windows 10 than iterating processes
-            all_wins = gw.getAllWindows()
-            
-            for win in all_wins:
-                try:
-                    # Skip empty titles
-                    if not win.title or not win.title.strip():
-                        continue
-                    
-                    # Check if window is visible (use 'visible' property, not 'isVisible')
-                    if not getattr(win, 'visible', True):
-                        continue
-                    
-                    display_name = win.title
-                    
-                    # Check if window matches Metin2 patterns (prioritize these)
-                    title_lower = win.title.lower()
-                    if any(pattern in title_lower for pattern in ['mt2', 'metin2', 'metin 2']) or \
-                       any(word.endswith('2') for word in title_lower.split()):
-                        priority_windows.append((display_name, win))
-                    else:
-                        windows.append((display_name, win))
-                except Exception:
-                    pass
+            return list(platforms.native.list_windows()) if platforms.native else []
         except Exception as e:
             if DEBUG_PRINTS:
                 print(f"Error getting windows: {e}")
-        
+            return []
+
+    @staticmethod
+    def _order_windows(all_wins) -> List[Tuple[str, object]]:
+        """Filters, orders and names the windows (pure, OS independent)."""
+        windows = []
+        priority_windows = []  # Windows with 'mt2', 'metin2', 'metin 2', or words with '2'
+
+        for win in all_wins:
+            try:
+                # Skip empty titles
+                if not win.title or not win.title.strip():
+                    continue
+
+                # Check if window is visible (use 'visible' property, not 'isVisible')
+                if not getattr(win, 'visible', True):
+                    continue
+
+                display_name = win.title
+
+                # Check if window matches Metin2 patterns (prioritize these)
+                title_lower = win.title.lower()
+                if any(pattern in title_lower for pattern in ['mt2', 'metin2', 'metin 2']) or \
+                   any(word.endswith('2') for word in title_lower.split()):
+                    priority_windows.append((display_name, win))
+                else:
+                    windows.append((display_name, win))
+            except Exception:
+                pass
+
+        # The OS lists windows in z-order, which changes every time a window is
+        # activated. Sort by (title, handle) so that "Metin2 (1)", "Metin2 (2)"
+        # keep pointing at the same clients between refreshes — otherwise the
+        # window picked in the GUI and the one the bot attaches to can differ.
+        def _stable_key(item):
+            return (item[0].lower(), platforms.window_handle(item[1]) or 0)
+
+        priority_windows.sort(key=_stable_key)
+        windows.sort(key=_stable_key)
+
         # Combine all windows (prioritize Metin2 windows)
         all_windows = priority_windows + windows
-        
+
         # Count occurrences of each display name
         name_counts = {}
         for display_name, win in all_windows:
             name_counts[display_name] = name_counts.get(display_name, 0) + 1
-        
+
         # Add suffixes to duplicate names
         name_indices = {}
         result = []
@@ -92,65 +117,96 @@ class WindowManager:
             else:
                 final_name = display_name
             result.append((final_name, win))
-        
-        return result
-    
-    def activate_window(self, force_activate: bool = False):
-        """Activates and brings the selected window to focus.
-        Retries until GetForegroundWindow confirms our HWND is active, so that
-        callers holding input_lock can be sure the click lands on the right window.
-        Uses ctypes directly instead of pygetwindow.activate() to avoid a GIL
-        corruption bug in pygetwindow 0.0.9 on Python 3.13+."""
-        if not self.selected_window:
-            return
-        try:
-            target_hwnd = self.selected_window._hWnd
-            if not target_hwnd or not _user32.IsWindow(target_hwnd):
-                self.invalidate_rect_cache()
-                return
 
-            # Fast path: already active — skip everything.
-            if not force_activate:
-                if _user32.GetForegroundWindow() == target_hwnd:
-                    return
+        return result
+
+    def _hwnd(self):
+        return platforms.window_handle(self.selected_window)
+
+    def is_foreground(self) -> bool:
+        hwnd = self._hwnd()
+        if not hwnd or platforms.native is None:
+            return False
+        try:
+            return platforms.native.get_foreground() == hwnd
+        except Exception:
+            return False
+
+    def _wait_foreground(self, hwnd, timeout: float) -> bool:
+        """Polls the foreground window until it is ``hwnd`` or ``timeout`` elapses."""
+        deadline = time.perf_counter() + timeout
+        while True:
+            if platforms.native.get_foreground() == hwnd:
+                return True
+            if time.perf_counter() >= deadline:
+                return False
+            time.sleep(0.001)
+
+    def activate_window(self, force_activate: bool = False) -> bool:
+        """Brings the selected window to the foreground and confirms it.
+
+        Returns True when the OS reports our window in front, so callers
+        holding input_lock know the next click/key lands on the right window.
+
+        If the window is already in front this returns immediately — no
+        activation request and no sleep. ``force_activate`` is kept for
+        API compatibility; the foreground check is authoritative either way
+        (it queries the OS, it is not a cached guess).
+
+        On Windows this uses ctypes directly instead of pygetwindow.activate()
+        to avoid a GIL corruption bug in pygetwindow 0.0.9 on Python 3.13+."""
+        target_hwnd = self._hwnd()
+        if not target_hwnd or platforms.native is None:
+            return False
+        native = platforms.native
+        try:
+            if not native.is_window(target_hwnd):
+                self.invalidate_rect_cache()
+                return False
+
+            if native.get_foreground() == target_hwnd:
+                return True
 
             # Restore if minimized before trying to activate.
             try:
-                if _user32.IsIconic(target_hwnd):
-                    _user32.ShowWindow(target_hwnd, _SW_RESTORE)
+                if native.is_minimized(target_hwnd):
+                    native.restore(target_hwnd)
+                    self.invalidate_rect_cache()
                     time.sleep(0.05)
             except Exception:
                 pass
 
-            # Retry loop: call SetForegroundWindow and verify via GetForegroundWindow.
-            # Windows can silently ignore SetForegroundWindow when the calling
-            # thread doesn't own the foreground, causing the click to land on
-            # whatever window is currently in front (typically the other bot's
-            # window). Three attempts with 30 ms gaps covers all real-world cases.
+            # The OS can silently ignore a plain activation request (Windows
+            # when the calling thread doesn't own the foreground). First
+            # attempt is the plain call; retries use the stronger variant.
             for attempt in range(3):
                 try:
-                    _user32.SetForegroundWindow(target_hwnd)
+                    if attempt == 0:
+                        native.set_foreground(target_hwnd)
+                    else:
+                        native.force_foreground(target_hwnd)
                 except Exception:
                     pass
 
-                time.sleep(0.030)  # Let OS process the activation request
+                if self._wait_foreground(target_hwnd, _ACTIVATE_CONFIRM_TIMEOUT):
+                    # Real switch happened: give the game a moment to process
+                    # the activation before input arrives.
+                    time.sleep(_ACTIVATE_SETTLE)
+                    self.last_switch_time = time.perf_counter()
+                    return True
 
-                if _user32.GetForegroundWindow() == target_hwnd:
-                    return  # Confirmed active — safe to click
-
-            # Fell through all attempts — log once and continue (best effort).
             if DEBUG_PRINTS:
-                print(f"Warning: could not confirm window activation after 3 attempts")
+                print("Warning: could not confirm window activation after 3 attempts")
+            return False
 
         except Exception as e:
             if DEBUG_PRINTS:
                 print(f"Error activating window: {e}")
-    
+            return False
+
     def get_window_rect(self) -> Tuple[int, int, int, int]:
         """Gets the selected window's position and size (left, top, width, height).
-        Cached for 50ms — pygetwindow does a Win32 GetWindowRect on every attribute
-        access, so without caching this costs 4 syscalls per invocation and is
-        hit on every detection cycle."""
+        Cached for 50ms — this is hit on every detection cycle."""
         if not self.selected_window:
             return (0, 0, 0, 0)
 
@@ -159,11 +215,7 @@ class WindowManager:
             return self._rect_cache
 
         try:
-            left = self.selected_window.left
-            top = self.selected_window.top
-            width = self.selected_window.width
-            height = self.selected_window.height
-            rect = (left, top, width, height)
+            rect = self._query_rect()
             self._rect_cache = rect
             self._rect_cache_time = now
             return rect
@@ -171,6 +223,16 @@ class WindowManager:
             if DEBUG_PRINTS:
                 print(f"Error getting window rect: {e}")
             return self._rect_cache if self._rect_cache is not None else (0, 0, 0, 0)
+
+    def _query_rect(self) -> Tuple[int, int, int, int]:
+        """One OS call for the whole rectangle (pygetwindow issues one per attribute)."""
+        hwnd = self._hwnd()
+        if hwnd and platforms.native is not None:
+            rect = platforms.native.get_window_rect(hwnd)
+            if rect is not None:
+                return rect
+        win = self.selected_window
+        return (win.left, win.top, win.width, win.height)
 
     def invalidate_rect_cache(self):
         """Forces the next get_window_rect() to refetch (e.g. after move/resize)."""
