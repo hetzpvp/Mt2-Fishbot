@@ -24,7 +24,6 @@ env/
 .idea/
 *.swp
 *.swo
-CLAUDE.md
 
 # Config files with user data
 bot_config.json
