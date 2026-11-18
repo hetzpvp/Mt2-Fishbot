@@ -35,5 +35,7 @@ Thumbs.db
 Minigame.code-workspace
 
 .claude/
-packaging/
-CLAUDE.md
+
+# Release builds: 150+ MB each, over GitHub's 100 MB file limit. Publish them
+# as GitHub Releases (or the MediaFire link in the README), not in the tree.
+releases/**/*.exe

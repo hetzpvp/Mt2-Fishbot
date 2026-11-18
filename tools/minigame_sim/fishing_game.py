@@ -29,6 +29,10 @@ awkward clients and connections the bot has to cope with:
 - ``popup_chance``  chance per cast that some other game window (not the
                     minigame) pops up while the line is out
 - ``move_panel()``  the player drags the panel during a game
+- ``blocked_ground_clicks``  this many clicks into the world with an item on
+                    the cursor hit some UI instead: no drop dialog, the item
+                    stays on the cursor
+- ``lost_drop_buttons``  this many clicks on DROP are lost (no confirm dialog)
 
 The game is pure logic + numpy: ``key`` / ``click`` / ``move`` in, ``render``
 out. It is driven headless by the tests and live by the simulator window.
@@ -105,7 +109,8 @@ SKINS = {s.name: s for s in (
 # how a fix shows up); tests/test_minigame_sim.py expects the others to pass.
 HARD_SKINS = ("low-contrast",)
 
-# Inventory strip. The bot reads the right-hand 200 px from y=200 down.
+# Inventory strip. The bot reads the grid below the page tabs (without tabs
+# configured: the right-hand 200 px from y=200 down).
 INV_COLS, INV_ROWS, SLOT = 5, 9, 32
 INV_PAGES = 4
 
@@ -118,7 +123,7 @@ class FishingGame:
                  click_cooldown=0.5, recast_cooldown=1.5, catch_chance=1.0, dead_fish_chance=0.0, require_bait=True,
                  inventory=True, feedback_text=True, clock=time.perf_counter,
                  space_cancels=True, wander=False, skins=None, catch_delay=(0.0, 0.0),
-                 blank_chance=0.0, popup_chance=0.0):
+                 blank_chance=0.0, popup_chance=0.0, blocked_ground_clicks=0, lost_drop_buttons=0):
         self.W, self.H = size
         self.rng = random.Random(seed)
         self.clock = clock
@@ -143,6 +148,8 @@ class FishingGame:
         self.catch_delay = catch_delay
         self._pending_catch = None         # time at which the caught item lands
         self.blank_chance = blank_chance
+        self.blocked_ground_clicks = blocked_ground_clicks
+        self.lost_drop_buttons = lost_drop_buttons
         self._grab_rng = random.Random(seed + 1000)   # capture noise: not part of the game's dice
         self.popup_chance = popup_chance
         self._popup = None                 # (x, y, w, h, bgr, from, until)
@@ -170,7 +177,7 @@ class FishingGame:
         self.stats = dict(casts=0, casts_ignored=0, casts_without_bait=0, games=0, hits=0,
                           misses=0, clicks_ignored=0, caught=0, timeouts=0, opened=0, dropped=0,
                           drop_cancelled=0, inventory_full=0, stray_clicks=0, casts_cancelled=0,
-                          popups=0)
+                          popups=0, blocked_ground_clicks=0, lost_drop_buttons=0)
 
         # inventory
         self.inventory_enabled = inventory
@@ -433,6 +440,10 @@ class FishingGame:
 
             if self.dialog is not None:
                 if button == "left" and self.dialog == "drop" and self._near(x, y, self.drop_button, 32, 12):
+                    if self.lost_drop_buttons > 0:
+                        self.lost_drop_buttons -= 1
+                        self.stats["lost_drop_buttons"] += 1
+                        return
                     self.dialog = "confirm"
                 elif button == "left" and self.dialog == "confirm" and self._near(x, y, self.confirm_button, 32, 12):
                     self.dialog = None
@@ -477,6 +488,10 @@ class FishingGame:
                 return
 
             if self.carrying is not None and button == "left":
+                if self.blocked_ground_clicks > 0:
+                    self.blocked_ground_clicks -= 1
+                    self.stats["blocked_ground_clicks"] += 1
+                    return
                 self.dialog = "drop"
 
     # ----------------------------------------------------------------- render

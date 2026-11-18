@@ -1,0 +1,201 @@
+{
+ "source": "71 s screen recording of a player fishing on an official-style client, 1280x720 game at 1:1, H.264",
+ "window": {
+  "231": {
+   "panel_bounds": [
+    46,
+    84,
+    247,
+    190
+   ]
+  },
+  "1050": {
+   "panel_bounds": [
+    188,
+    66,
+    246,
+    190
+   ]
+  },
+  "1260": {
+   "panel_bounds": [
+    188,
+    66,
+    246,
+    172
+   ]
+  }
+ },
+ "panel": {
+  "358": {
+   "fish": [
+    133,
+    83
+   ]
+  },
+  "390": {
+   "fish": [
+    35,
+    34
+   ]
+  },
+  "434": {
+   "fish": [
+    153,
+    140
+   ]
+  },
+  "867": {
+   "fish": [
+    52,
+    71
+   ]
+  },
+  "1314": {
+   "fish": [
+    123,
+    54
+   ]
+  },
+  "1413": {
+   "fish": [
+    177,
+    96
+   ]
+  },
+  "1557": {
+   "fish": [
+    165,
+    61
+   ]
+  },
+  "2054": {
+   "fish": [
+    198,
+    127
+   ]
+  },
+  "231": {
+   "fish": [
+    143,
+    21
+   ]
+  },
+  "336": {
+   "fish": null
+  },
+  "479": {
+   "fish": null
+  },
+  "1111": {
+   "fish": null
+  }
+ },
+ "ring": {
+  "center_from_top_left": [
+   123.0,
+   96.5
+  ],
+  "radius": 63.2,
+  "full_panel_size": [
+   247,
+   190
+  ]
+ },
+ "inventory": {
+  "frame": 360,
+  "size": [
+   220,
+   350
+  ],
+  "tabs": {
+   "1": [
+    63,
+    15
+   ],
+   "2": [
+    95,
+    15
+   ],
+   "3": [
+    127,
+    15
+   ],
+   "4": [
+    159,
+    15
+   ],
+   "5": [
+    191,
+    15
+   ]
+  },
+  "active_tab": 1,
+  "grid_top_left": [
+   48,
+   26
+  ],
+  "slot": 32,
+  "cols": 5,
+  "rows": 9,
+  "empty": [
+   [
+    8,
+    3
+   ],
+   [
+    8,
+    4
+   ],
+   [
+    8,
+    5
+   ]
+  ],
+  "fish": [
+   [
+    2,
+    2
+   ],
+   [
+    2,
+    5
+   ],
+   [
+    3,
+    1
+   ],
+   [
+    4,
+    1
+   ],
+   [
+    4,
+    2
+   ],
+   [
+    5,
+    5
+   ],
+   [
+    6,
+    2
+   ],
+   [
+    7,
+    5
+   ],
+   [
+    8,
+    2
+   ]
+  ],
+  "gold": [
+   [
+    2,
+    4
+   ]
+  ],
+  "note": "row/col from 1. The fish are brownish (possibly dead) fish of the same shapes as the living-fish templates; their exact item names are not known (no tooltip in the recording)."
+ }
+}

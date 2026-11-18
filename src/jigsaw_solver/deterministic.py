@@ -24,12 +24,14 @@ try:
         TERMINAL_STATE, TOTAL_CELLS, TOTAL_FIGURES
     )
     from .solver import Solver
+    from . import cache_location as _cache_location
 except ImportError:  # Allows running this module directly from src/jigsaw_solver.
     from jigsaw import (  # type: ignore
         Jigsaw, FIGURES, N, M, SKIP_ACTION,
         TERMINAL_STATE, TOTAL_CELLS, TOTAL_FIGURES
     )
     from solver import Solver  # type: ignore
+    import cache_location as _cache_location  # type: ignore
 
 # Pre-compute figure data as numpy arrays
 _FIG_VALUES = np.array([f.value for f in FIGURES], dtype=np.uint32)
@@ -66,18 +68,10 @@ class ActionScore:
     is_skip: bool = False
 
 
-def _default_cache_path() -> str:
-    cache_file = Deterministic.CACHE_FILE
-    if _PRECISION == "64":
-        root, ext = os.path.splitext(cache_file)
-        cache_file = f"{root}_f64{ext}"
-    cache_dir = os.environ.get("JIGSAW_SOLVER_CACHE_DIR")
-    if cache_dir:
-        return os.path.join(cache_dir, cache_file)
-    if getattr(sys, "frozen", False):
-        return os.path.join(os.path.dirname(sys.executable), "data", "cache", "jigsaw", cache_file)
-    project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-    return os.path.join(project_root, "data", "cache", "jigsaw", cache_file)
+def _default_cache_path(create: bool = False) -> str:
+    """See cache_location.py: next to the program, or a per-user folder
+    when that cannot be written to."""
+    return _cache_location.cache_path(create)
 
 
 def _cache_metadata() -> dict:
@@ -270,23 +264,52 @@ class Deterministic(Solver):
     CACHE_FILE = "solver_cache.npz"
 
     def __init__(self):
+        # The tables (~880 MB) are allocated only when they are computed:
+        # loading the cache brings its own arrays, and allocating here first
+        # made a load peak at twice the memory it needs.
+        self.dsts: Optional[np.ndarray] = None
+        self.actions: Optional[np.ndarray] = None
+        self.in_stack: Optional[np.ndarray] = None
+
+    def _allocate(self) -> None:
+        """Empty tables for a computation from scratch."""
         total_states = 1 << TOTAL_CELLS
         self.dsts = np.full(total_states * TOTAL_FIGURES, INF, dtype=_DST_DTYPE)
         self.actions = np.full(total_states * TOTAL_FIGURES, SKIP_ACTION, dtype=np.uint8)
         self.in_stack = np.zeros(total_states, dtype=np.bool_)
 
-    def save_cache(self, filepath: str = None):
-        """Save computed data to cache file."""
+    def save_cache(self, filepath: str = None) -> bool:
+        """Save computed data to cache file. A failure is reported, not
+        raised: the computed table stays usable for this session (only the
+        next start has to compute it again). Written to a temporary file and
+        swapped in, so an interrupted save leaves no half-written cache."""
         if filepath is None:
-            filepath = _default_cache_path()
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        np.savez_compressed(
-            filepath,
-            dsts=self.dsts,
-            actions=self.actions,
-            **_cache_metadata(),
-        )
+            filepath = _default_cache_path(create=True)
+        tmp = f"{filepath}.{os.getpid()}.part"
+        try:
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            with open(tmp, "wb") as f:
+                np.savez_compressed(
+                    f,
+                    dsts=self.dsts,
+                    actions=self.actions,
+                    **_cache_metadata(),
+                )
+            os.replace(tmp, filepath)
+        except Exception as e:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+            print(f"Could not save cache to {filepath}: {e}")
+            if _diag is not None:
+                _diag.exc(f"jigsaw solver cache could not be saved to {filepath}")
+            return False
         print(f"Saved cache to {filepath}")
+        if _diag is not None:
+            _diag.log("ANALYSIS", f"jigsaw solver cache saved to {filepath}")
+        return True
 
     def load_cache(self, filepath: str = None) -> bool:
         """Load computed data from cache file."""
@@ -303,8 +326,21 @@ class Deterministic(Solver):
                 self.actions = np.ascontiguousarray(actions, dtype=np.uint8)
                 data.close()
                 print(f"Loaded cache from {filepath}")
+                if _diag is not None:
+                    _diag.log("ANALYSIS", f"jigsaw solver cache loaded from {filepath} "
+                                          f"({os.path.getsize(filepath)} bytes)")
                 return True
+            except MemoryError:
+                # The file is fine, this machine is short of memory right now:
+                # deleting it would only force a computation that needs more.
+                if data is not None:
+                    data.close()
+                if _diag is not None:
+                    _diag.exc(f"jigsaw solver cache {filepath}: not enough memory to load it (file kept)")
+                raise
             except Exception as e:
+                if _diag is not None:
+                    _diag.exc(f"jigsaw solver cache {filepath} unusable: regenerating")
                 if data is not None:
                     data.close()
                 print(f"Failed to load cache: {e}, regenerating...")
@@ -365,6 +401,7 @@ class Deterministic(Solver):
         t_total = time.perf_counter()
         print("Computing optimal strategy with Numba acceleration...")
         print("First run compiles JIT - subsequent runs will be faster.")
+        self._allocate()
 
         total_states = 1 << TOTAL_CELLS
 
@@ -413,6 +450,7 @@ class Deterministic(Solver):
 
         print(f"Strategy computation complete in {time.perf_counter()-t_total:.2f}s")
         self.save_cache()
+        self.in_stack = None   # only needed while computing
 
     def _run_pure_python(self):
         """Pure Python fallback (slower)."""
@@ -427,6 +465,7 @@ class Deterministic(Solver):
         from itertools import combinations
 
         subsets = [list(c) for r in range(1, 7) for c in combinations(range(6), r)]
+        self._allocate()
         stacks = [[] for _ in range(25)]
         stacks[0].append(TERMINAL_STATE)
 
@@ -620,6 +659,7 @@ class Deterministic(Solver):
 
 # Singleton instance for caching the computed strategy
 _cached_solver: Deterministic = None
+_diag = None
 _solver_lock = threading.Lock()
 
 
@@ -637,3 +677,13 @@ def get_solver() -> Deterministic:
                 solver.run()
                 _cached_solver = solver
     return _cached_solver
+
+
+# Diagnostic log (when running inside the bot; the solver also runs alone).
+try:
+    import diag as _diag_mod
+    _diag = _diag_mod
+    _diag.trace_class(Deterministic, exclude=("distances", "_validate_cache", "score_action"))
+    _diag.trace_module(sys.modules[__name__], ("get_solver",))
+except ImportError:
+    pass

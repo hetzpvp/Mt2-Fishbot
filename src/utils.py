@@ -5,6 +5,7 @@ Utility functions and constants for the Fishing Bot
 import os
 import sys
 import threading
+import time
 from contextlib import contextmanager
 
 try:
@@ -28,21 +29,36 @@ class PriorityInputLock:
 
     Arrival order inside a class makes the lock fair, so no bot can starve
     another by re-acquiring in a tight loop.
+
+    It is not re-entrant: a thread that asks for it while holding it would
+    wait for itself — and every other bot with it, silently. That raises
+    instead. Holds longer than ``LONG_HOLD`` seconds (other windows' fish
+    clicks wait that long) go to the diagnostic log.
     """
 
     URGENT = 0
     NORMAL = 1
+    LONG_HOLD = 0.5
 
     def __init__(self):
         self._cond = threading.Condition(threading.Lock())
         self._held = False
+        self._owner = None          # thread ident of the holder
+        self._since = 0.0           # perf_counter() when it was taken
         self._seq = 0
         self._waiters = []  # sorted list of (priority, seq)
 
+    def _take(self) -> None:
+        self._held = True
+        self._owner = threading.get_ident()
+        self._since = time.perf_counter()
+
     def acquire(self, priority: int = NORMAL) -> bool:
         with self._cond:
+            if self._held and self._owner == threading.get_ident():
+                raise RuntimeError("input_lock is not re-entrant: this thread already holds it")
             if not self._held and not self._waiters:
-                self._held = True
+                self._take()
                 return True
             self._seq += 1
             ticket = (priority, self._seq)
@@ -56,13 +72,27 @@ class PriorityInputLock:
                 self._cond.notify_all()
                 raise
             self._waiters.pop(0)
-            self._held = True
+            self._take()
             return True
 
     def release(self) -> None:
         with self._cond:
+            held_for = time.perf_counter() - self._since
             self._held = False
+            self._owner = None
             self._cond.notify_all()
+        if held_for > self.LONG_HOLD:
+            try:
+                import diag
+                if diag.ENABLED:
+                    diag.log("LOCK", f"input_lock held for {held_for:.2f}s (> {self.LONG_HOLD}s): other "
+                                     f"windows waited that long", depth=1)
+            except Exception:
+                pass
+
+    def held_by_me(self) -> bool:
+        """True when the calling thread holds the lock."""
+        return self._held and self._owner == threading.get_ident()
 
     def locked(self) -> bool:
         return self._held

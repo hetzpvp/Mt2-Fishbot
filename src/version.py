@@ -1,7 +1,7 @@
 # Version configuration for MT2 Fishing Bot
 # Update this version number before each release
 
-VERSION = "2.0.1"
+VERSION = "2.0.2"
 
 # Version history:
 # 1.0.0 - Initial release with classic fishing support
@@ -15,3 +15,5 @@ VERSION = "2.0.1"
 # 1.2.0 - Integrated jigsaw puzzle solver, jigsaw debug window and new GUI.
 # 2.0.0 - Linux port (X11/Wine) and OS abstraction layer.
 # 2.0.1 - Clickable "Discord Server Support" button linking to the support server.
+# 2.0.2 - Lighter multi-client runs (OpenCV single-threaded per bot, X11 area capture, 8 ms minigame poll),
+#         audit fixes for the fishing and jigsaw loops, diagnostic log, setup wizards and help pages.

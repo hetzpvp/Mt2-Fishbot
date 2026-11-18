@@ -25,6 +25,11 @@ window id on Linux):
     restore(handle) -> None
     get_window_rect(handle) -> (left, top, width, height) or None
     render_window(handle, width, height) -> (h, w, 4) BGRA array or None
+    render_window_area(handle, x, y, w, h)  OPTIONAL (x11 only): just that
+                                            rectangle, outside part black;
+                                            None when it misses the window.
+                                            Win32 has none: PrintWindow can
+                                            only render the whole window
     screen_capture_reliable() -> bool       whether a desktop copy (mss) shows
                                             the game; False under XWayland
     available() -> bool                     the OS API can be reached

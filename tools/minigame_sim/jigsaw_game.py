@@ -61,7 +61,8 @@ def figure_cells(index):
 class JigsawGame:
     def __init__(self, left=0, seed=1, normal=10 ** 6, special=0, inventory=None,
                  lose_clicks=0.0, dialog_delay=0.0, piece_delay=0.02, pieces=None,
-                 gives_pieces=True, top=0, lose_confirms=0.0, lose_slot_clicks=0):
+                 gives_pieces=True, top=0, lose_confirms=0.0, lose_slot_clicks=0, shows_result=True,
+                 dialog_shade=190):
         self.left, self.top = left, top
         self.rng = random.Random(seed)
         self.board = set()                 # (col, row)
@@ -87,6 +88,11 @@ class JigsawGame:
         self.lost_slot_clicks = 0
         self.pieces = list(pieces or [])
         self.gives_pieces = gives_pieces
+        self.shows_result = shows_result   # False: a full board brings up no result dialog
+        # Gray of the dialog's Confirm button. The default stands out far more than
+        # a real client's (whose button changes the watched patch by 29-47 levels):
+        # about 75 on this ~32 background is the real contrast.
+        self.dialog_shade = dialog_shade
         # outcome counters
         self.opened = 0
         self.opened_by = {"normal": 0, "special": 0}
@@ -94,6 +100,7 @@ class JigsawGame:
         self.special_opened_on = []        # filled cells when each special crate was opened
         self.special_placed = 0
         self.refills = 0                   # stacks taken out of the inventory
+        self.put_back = 0                  # stacks put back into the inventory
         self.placed = 0
         self.discarded = 0
         self.completed = 0
@@ -177,6 +184,15 @@ class JigsawGame:
                 self.page_clicks += 1
                 return
 
+        if self.carrying is not None and x >= INV_ORIGIN[0] and y >= INV_ORIGIN[1]:
+            # Put a carried stack back into the inventory where it was clicked
+            section, stack = self.carrying
+            self.inventory.setdefault(self.page, []).append(
+                (section, (x - INV_ORIGIN[0], y - INV_ORIGIN[1]), stack))
+            self.carrying = None
+            self.put_back += 1
+            return
+
         if self.carrying is None:
             items = self.inventory.get(self.page, [])
             for item in items:
@@ -234,8 +250,9 @@ class JigsawGame:
             self.placed += 1
             if len(self.board) == 24:
                 self.completed += 1
-                self.dialog = "result"
-                self.dialog_at = time.perf_counter() + 0.05
+                if self.shows_result:
+                    self.dialog = "result"
+                    self.dialog_at = time.perf_counter() + 0.05
 
     # ----------------------------------------------------------------- render
 
@@ -278,7 +295,7 @@ class JigsawGame:
         if self._dialog_up():
             cv2.rectangle(frame, (300, 320), (500, 400), (70, 70, 70), -1)
             cv2.rectangle(frame, (CONFIRM[0] - 30, CONFIRM[1] - 12), (CONFIRM[0] + 30, CONFIRM[1] + 12),
-                          (190, 190, 190), -1)
+                          (self.dialog_shade,) * 3, -1)
         if self._holding():
             self._paste(frame, self.piece_img[self.held], self.cursor)
         return frame

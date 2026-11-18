@@ -31,12 +31,11 @@ $ErrorActionPreference = "Stop"
 
 $ReleaseUrl = "https://github.com/oblitum/Interception/releases/download/v1.0.1/Interception.zip"
 
-# SHA256 of Interception.zip (v1.0.1). Set this to the hash of the file at
-# $ReleaseUrl the first time you verify it locally:
-#     (Get-FileHash -Algorithm SHA256 .\Interception.zip).Hash
-# Then commit the value. Empty = skip verification (NOT recommended; only
-# use for the very first run on a trusted network).
-$ExpectedSha256 = ""
+# SHA256 of Interception.zip (v1.0.1) at $ReleaseUrl. Pinned 2026-11-17: the
+# zip's contents are identical to the copy committed under tools\interception.
+# A download that does not match is refused (the script installs a kernel
+# driver as administrator). Empty = skip verification (NOT recommended).
+$ExpectedSha256 = "AD038963D6413055765128B0B931F6E765147C9916DBA79E65D872B261F9AF10"
 $RepoRoot       = Split-Path -Parent $PSScriptRoot
 $ToolsDir       = Join-Path $RepoRoot "tools\interception"
 $ZipPath        = Join-Path $env:TEMP "Interception.zip"

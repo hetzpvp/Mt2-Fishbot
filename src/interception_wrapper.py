@@ -230,10 +230,23 @@ class InterceptionDriver:
             self._mouse_device = preferred_device
             return preferred_device
 
-        for dev in range(1 + INTERCEPTION_MAX_KEYBOARD, INTERCEPTION_MAX_DEVICE + 1):
-            if self.is_mouse(dev):
+        # interception_is_mouse() only checks that the id lies in the mouse
+        # range (11-20), so every id passes. A device that is really there
+        # reports a hardware id: prefer the first one that does. When none
+        # can be read, fall back to the first id of the range (as before).
+        mice = [dev for dev in range(1 + INTERCEPTION_MAX_KEYBOARD, INTERCEPTION_MAX_DEVICE + 1)
+                if self.is_mouse(dev)]
+        for dev in mice:
+            try:
+                present = bool(self.hardware_id(dev))
+            except Exception:
+                present = False
+            if present:
                 self._mouse_device = dev
                 return dev
+        if mice:
+            self._mouse_device = mice[0]
+            return mice[0]
         return None
 
     @property

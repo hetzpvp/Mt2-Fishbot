@@ -26,6 +26,8 @@ import threading
 import time
 from typing import Dict, Optional, Tuple
 
+import diag
+
 UINPUT_PATH = "/dev/uinput"
 
 # linux/input-event-codes.h
@@ -64,6 +66,12 @@ _DEVICE_SETTLE = 0.5
 
 
 def check_access() -> Optional[str]:
+    reason = _check_access()
+    diag.log("ACTION", f"uinput access check: {reason or 'ok'}")
+    return reason
+
+
+def _check_access() -> Optional[str]:
     """None when /dev/uinput can be used, otherwise a readable reason."""
     if not os.path.exists(UINPUT_PATH):
         return f"{UINPUT_PATH} does not exist (load the module: sudo modprobe uinput)"
@@ -94,10 +102,12 @@ class _Device:
                                     name.encode()[:79], 0))
             fcntl.ioctl(self._fd, UI_DEV_CREATE)
         except Exception:
+            diag.exc(f"creating uinput device '{name}'")
             os.close(self._fd)
             self._fd = None
             raise
         self._created = time.monotonic()
+        diag.log("ACTION", f"uinput device '{name}' created (fd={self._fd})")
 
     def wait_ready(self) -> None:
         left = _DEVICE_SETTLE - (time.monotonic() - self._created)
@@ -141,12 +151,16 @@ class UInputMouse:
                             relbits=(REL_WHEEL,),
                             abs_axes=((ABS_X, 0, ABS_MAX), (ABS_Y, 0, ABS_MAX)))
         self._size = desktop_size or (1920, 1080)
+        diag.log("ACTION", f"uinput mouse maps 0..{ABS_MAX} onto desktop {self._size} "
+                           f"(given {desktop_size})")
         self._cursor_query = cursor_query
         self._last = (0, 0)
         self._dev.wait_ready()
 
     def set_desktop_size(self, size: Tuple[int, int]) -> None:
         if size and size[0] > 0 and size[1] > 0:
+            if diag.ENABLED and tuple(size) != tuple(self._size):
+                diag.log("ACTION", f"uinput desktop size {self._size} -> {tuple(size)}")
             self._size = (int(size[0]), int(size[1]))
 
     def to_abs(self, x: float, y: float) -> Tuple[int, int]:

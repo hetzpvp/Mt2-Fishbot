@@ -6,11 +6,12 @@ import unittest
 import cv2
 import numpy as np
 
-from _stubs import install, hsv_to_bgr, SimScreen, FakeWindowManager, FakeMouse, ROOT
+from _stubs import install, hsv_to_bgr, SimScreen, InventoryScreen, FakeWindowManager, FakeMouse, ROOT
 
 install()
 
 from fishing_bot import FishingBot  # noqa: E402
+import inventory_layout  # noqa: E402
 from utils import PriorityInputLock  # noqa: E402
 
 OFFICIAL_PANEL = hsv_to_bgr(102, 200, 220)
@@ -96,7 +97,10 @@ class OfficialClientTests(unittest.TestCase):
         bot.consecutive_failures = 2
         self.assertEqual(bot._bite_timeout(), 13.5)
         bot.consecutive_failures = 4
-        self.assertEqual(bot._bite_timeout(), 30.0)   # growth is capped
+        self.assertEqual(bot._bite_timeout(), 30.375)  # past the old 30 s cap: slow servers
+        bot._longest_bite = 100.0
+        self.assertEqual(bot._bite_timeout(), 60.0)    # growth is capped (timing_minigame_timeout_cap)
+        bot._longest_bite = 0.0
         bot.consecutive_failures = 0
         bot._longest_bite = 10.0                      # slow-bite server seen once
         self.assertEqual(bot._bite_timeout(), 16.0)
@@ -151,6 +155,225 @@ class ReskinnedClientTests(unittest.TestCase):
         self.assertFalse(bot.region_auto_calibrated)
 
 
+def make_inventory_bot(screen, config=None, tabs=True):
+    """A bot in front of an InventoryScreen; its clicks reach the screen."""
+    cfg = dict(screen.config() if tabs else {})
+    cfg.update(config or {})
+    bot, mouse, logs = make_bot(screen, cfg)
+    bot.window_manager.rect = (0, 0, screen.W, screen.H)
+
+    def down(button="left"):
+        mouse.clicks.append((mouse.pos, button))
+        screen.click(mouse.pos, button)
+
+    mouse.mouse_down = down
+    mouse.click = down
+    return bot, mouse, logs
+
+
+class InventoryStripTests(unittest.TestCase):
+    """The inventory strip is the grid below the configured page tabs."""
+
+    def test_strip_starts_below_the_tabs(self):
+        screen = InventoryScreen()
+        bot, _mouse, _logs = make_inventory_bot(screen)
+        x, y, w, h = bot._inventory_rect()
+        lowest_tab = max(p[1] for p in screen.TABS.values())
+        self.assertGreater(y, lowest_tab)
+        self.assertLessEqual(y, screen.GRID[1])                       # no grid row is cut off
+        self.assertLessEqual(x, screen.GRID[0])
+        self.assertGreaterEqual(x + w, screen.GRID[0] + screen.COLS * screen.SLOT)
+        grid_bottom = screen.GRID[1] + screen.ROWS * screen.SLOT
+        self.assertTrue(grid_bottom <= y + h <= grid_bottom + 16)     # ends with the grid
+        self.assertEqual(bot.capture_inventory_area().shape[:2], (h, w))
+
+    def test_equipment_slots_are_not_counted(self):
+        screen = InventoryScreen()
+        bot, _mouse, _logs = make_inventory_bot(screen)
+        slots = bot._scan_empty_slots(bot.capture_inventory_area())
+        self.assertEqual(len(slots), screen.COLS * screen.ROWS)
+        # ... while the fixed strip (no tabs configured) does see them
+        old, _m, _l = make_inventory_bot(screen, tabs=False)
+        self.assertEqual(old._inventory_rect(), (600, 200, 200, 470))
+        self.assertEqual(len(old._scan_empty_slots(old.capture_inventory_area())),
+                         screen.COLS * screen.ROWS + len(screen.EQUIPMENT))
+
+    def test_a_full_page_reads_as_full(self):
+        screen = InventoryScreen()
+        item = cv2.imread(os.path.join(ROOT, "assets", "fishing", "Carp_living.jpg"))
+        screen.fill(0, screen.COLS * screen.ROWS, item)
+        bot, _mouse, _logs = make_inventory_bot(screen)
+        self.assertEqual(bot._scan_empty_slots(bot.capture_inventory_area()), [])
+
+    def test_the_clock_is_not_an_inventory_change(self):
+        screen = InventoryScreen()
+        bot, _mouse, _logs = make_inventory_bot(screen)
+        base = cv2.cvtColor(bot.capture_inventory_area(), cv2.COLOR_BGR2GRAY)
+        self.assertIsNone(bot._changed_box(base, bot.capture_inventory_area()))
+        old, _m, _l = make_inventory_bot(screen, tabs=False)
+        base = cv2.cvtColor(old.capture_inventory_area(), cv2.COLOR_BGR2GRAY)
+        for _ in range(9):
+            screen.render()                                           # seconds pass
+        self.assertIsNotNone(old._changed_box(base, old.capture_inventory_area()))
+
+    def test_strip_positions_are_clicked_where_they_are_on_screen(self):
+        screen = InventoryScreen()
+        item = cv2.imread(os.path.join(ROOT, "assets", "fishing", "Carp_living.jpg"))
+        screen.pages[0][7] = item
+        bot, mouse, _logs = make_inventory_bot(screen)
+        bot.window_manager.rect = (300, 40, screen.W, screen.H)       # the window is not at the corner
+        match = bot.identify_item_in_inventory(bot.capture_inventory_area())
+        self.assertIsNotNone(match)
+        name, (inv_x, inv_y) = match
+        self.assertEqual(name, "Carp_living.jpg")
+        bot._handle_item(name, inv_x, inv_y, "open")
+        (cx, cy), button = mouse.clicks[0]
+        want = screen.slot_center(7)
+        self.assertEqual(button, "right")
+        self.assertLessEqual(max(abs(cx - 300 - want[0]), abs(cy - 40 - want[1])), 2)
+
+    def test_kept_positions_are_dropped_when_the_strip_moves(self):
+        screen = InventoryScreen()
+        bot, _mouse, _logs = make_inventory_bot(screen)
+        bot._empty_slot_positions = bot._scan_empty_slots(bot.capture_inventory_area())
+        bot._ignored_positions.add((40, 40))
+        self.assertTrue(bot._empty_slot_positions)
+        before = bot._inventory_rect()
+        for page in range(1, 5):                                      # the tabs are set again, lower
+            x, y = bot.config[f"inv_page_{page}_pos"]
+            bot.config[f"inv_page_{page}_pos"] = [x, y + 3]
+        after = bot._inventory_rect()
+        self.assertEqual(after[1], before[1] + 3)
+        self.assertEqual((bot._empty_slot_positions, bot._ignored_positions), ([], set()))
+
+    def test_layout_of_the_reported_session(self):
+        """Window and tabs of the diagnostic session the change was made for."""
+        config = {"inv_page_1_pos": [1118, 641], "inv_page_2_pos": [1210, 634],
+                  "inv_page_3_pos": [1129, 661], "inv_page_4_pos": [1191, 659]}
+        (x, y, w, h), source = inventory_layout.strip_rect(config, 1251, 1039)
+        self.assertEqual(source, "tabs")
+        self.assertTrue(661 < y <= 673)                               # grid starts at y=673
+        self.assertTrue(x <= 1075 and x + w >= 1235)                  # grid is x=1075..1235
+        self.assertTrue(961 <= y + h <= 985)                          # grid ends at y=673+9*32=961
+        self.assertLess(h, 809 // 2)                                  # the old strip was 200x809
+
+    def test_unusable_tabs_fall_back_to_the_fixed_strip(self):
+        fixed = (600, 200, 200, 370)
+        self.assertEqual(inventory_layout.strip_rect({}, 800, 600), (fixed, "fixed"))
+        outside = {"inv_page_1_pos": [1388, 445]}                     # captured in another window
+        self.assertEqual(inventory_layout.strip_rect(outside, 800, 600), (fixed, "fixed"))
+        too_low = {"inv_page_1_pos": [700, 560]}
+        self.assertEqual(inventory_layout.strip_rect(too_low, 800, 600), (fixed, "fixed"))
+        garbage = {"inv_page_1_pos": "x", "inv_page_2_pos": [1], "inv_page_3_pos": None}
+        self.assertEqual(inventory_layout.strip_rect(garbage, 800, 600), (fixed, "fixed"))
+
+
+class PageSwitchTests(unittest.TestCase):
+    """After a tab click the bot waits until the game shows that page."""
+
+    def test_active_tab_is_read_wherever_the_tabs_were_clicked(self):
+        screen = InventoryScreen()
+        frame = screen.render()
+        rng = np.random.default_rng(5)
+        for page in range(4):
+            screen.page = page
+            frame = screen.render()
+            for _ in range(40):
+                points = {p: (int(rng.integers(x1 + 5, x2 - 4)), int(rng.integers(y1 + 5, y2 - 4)))
+                          for p, (x1, y1, x2, y2) in screen.TAB_BOXES.items()}
+                active, detail = inventory_layout.active_tab(frame, (0, 0), points)
+                self.assertIn(active, (page + 1, None), detail)       # never a wrong tab
+            self.assertEqual(inventory_layout.active_tab(frame, (0, 0), screen.TABS)[0], page + 1)
+
+    def test_two_lit_tabs_or_none_are_not_a_reading(self):
+        screen = InventoryScreen()
+        frame = screen.render()
+        x1, y1, x2, y2 = screen.TAB_BOXES[3]                          # a hovered tab is lit as well
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (134, 122, 112), -1)
+        self.assertIsNone(inventory_layout.active_tab(frame, (0, 0), screen.TABS)[0])
+        screen.highlight = False
+        self.assertIsNone(inventory_layout.active_tab(screen.render(), (0, 0), screen.TABS)[0])
+        self.assertIsNone(inventory_layout.active_tab(np.zeros((700, 800, 3), np.uint8), (0, 0), screen.TABS)[0])
+
+    def test_waits_for_a_page_that_shows_up_late(self):
+        screen = InventoryScreen(page_delay=0.7)                      # far longer than the old 0.3 s
+        item = cv2.imread(os.path.join(ROOT, "assets", "fishing", "Carp_living.jpg"))
+        screen.fill(0, screen.COLS * screen.ROWS, item)               # page 1 full, page 2 empty
+        bot, _mouse, _logs = make_inventory_bot(screen)
+        t0 = time.perf_counter()
+        self.assertTrue(bot._goto_page(screen.TABS[2]))
+        waited = time.perf_counter() - t0
+        self.assertEqual(screen.page, 1)
+        self.assertGreaterEqual(waited, 0.7)
+        self.assertLess(waited, 1.6)
+        self.assertEqual(screen.tab_clicks, [2])                      # no second click was needed
+        self.assertEqual(len(bot._scan_empty_slots(bot.capture_inventory_area())), screen.COLS * screen.ROWS)
+
+    def test_does_not_wait_longer_than_the_page_takes(self):
+        screen = InventoryScreen()
+        bot, _mouse, _logs = make_inventory_bot(screen)
+        t0 = time.perf_counter()
+        self.assertTrue(bot._goto_page(screen.TABS[3]))
+        self.assertLess(time.perf_counter() - t0, 0.5)
+        self.assertEqual(screen.page, 2)
+
+    def test_a_click_the_game_missed_is_repeated(self):
+        screen = InventoryScreen(lost_clicks=1)
+        bot, _mouse, _logs = make_inventory_bot(screen)
+        bot._PAGE_WAIT_TIMEOUT = 0.6
+        self.assertTrue(bot._goto_page(screen.TABS[4]))
+        self.assertEqual(screen.tab_clicks, [4, 4])
+        self.assertEqual(screen.page, 3)
+        self.assertEqual(bot._tab_check_misses, 0)
+
+    def test_timeout_goes_on_like_before(self):
+        screen = InventoryScreen(page_delay=30.0)                     # the page never shows
+        bot, _mouse, _logs = make_inventory_bot(screen)
+        bot._PAGE_WAIT_TIMEOUT = 0.4
+        t0 = time.perf_counter()
+        self.assertTrue(bot._goto_page(screen.TABS[2]))               # still "clicked", as before
+        self.assertLess(time.perf_counter() - t0, 1.5)
+        self.assertEqual(bot._tab_check_misses, 1)
+        self.assertFalse(bot._tab_check_off)
+
+    def test_tabs_that_cannot_be_read_cost_two_timeouts_at_most(self):
+        screen = InventoryScreen(highlight=False)                     # a client that does not light its tabs
+        bot, _mouse, _logs = make_inventory_bot(screen)
+        bot._PAGE_WAIT_TIMEOUT = 0.3
+        for page in (2, 3):
+            self.assertTrue(bot._goto_page(screen.TABS[page]))
+        self.assertTrue(bot._tab_check_off)
+        clicks = len(screen.tab_clicks)
+        t0 = time.perf_counter()
+        self.assertTrue(bot._goto_page(screen.TABS[4], settle=0.05))  # fixed wait from now on
+        self.assertLess(time.perf_counter() - t0, 0.25)
+        self.assertEqual(len(screen.tab_clicks), clicks + 1)
+        screen.render()
+        self.assertEqual(screen.page, 3)
+
+    def test_startup_scan_judges_each_page_by_its_own_content(self):
+        """On a slow machine every page used to be judged by the one before."""
+        screen = InventoryScreen(page_delay=0.5)
+        item = cv2.imread(os.path.join(ROOT, "assets", "fishing", "Carp_living.jpg"))
+        for page in (0, 1):
+            screen.fill(page, screen.COLS * screen.ROWS, item)        # pages 1 and 2 full, 3 has room
+        screen.fill(2, 40, item)
+        bot, _mouse, _logs = make_inventory_bot(screen, {"auto_fish_handling": False})
+        bot._startup_scan_and_process_all_pages()
+        self.assertEqual(bot._current_inv_page, 2)
+        self.assertEqual(screen.page, 2)
+        self.assertEqual(len(bot._empty_slot_positions), 5)
+        self.assertTrue(bot.running)
+
+    def test_stop_ends_the_wait(self):
+        screen = InventoryScreen(page_delay=30.0)
+        bot, _mouse, _logs = make_inventory_bot(screen)
+        threading.Timer(0.2, lambda: setattr(bot, "running", False)).start()
+        t0 = time.perf_counter()
+        bot._goto_page(screen.TABS[2])
+        self.assertLess(time.perf_counter() - t0, 1.0)
+
+
 class GameLoopTests(unittest.TestCase):
     def test_capture_hiccup_does_not_end_the_game(self):
         screen = SimScreen(OFFICIAL_PANEL, OFFICIAL_FISH)
@@ -186,6 +409,7 @@ class GameLoopTests(unittest.TestCase):
         bot._grab = grab
         bot.bait_and_cast = cast
         bot._startup_scan_and_process_all_pages = lambda: None
+        bot._resume_inventory_check = lambda: None
         bot.handle_caught_item = lambda may_have_catch=True: handled.append(may_have_catch)
 
         thread = threading.Thread(target=bot.play_game, daemon=True)
@@ -198,6 +422,97 @@ class GameLoopTests(unittest.TestCase):
         self.assertEqual(bot.total_games, 2)
         self.assertEqual(handled, [True, True])
         self.assertEqual(bot.stop_reason, FishingBot.STOP_BAIT_DEPLETED)
+
+
+class ArmorQuickSkipTests(unittest.TestCase):
+    """Armor quick skip right-clicks the spare armor only on the armor's own
+    page: a right-click on another page would use whatever item is there."""
+
+    ARMOR = (640, 330)                                   # a slot position on every page
+
+    def _bot(self, armor_page, current_page, **screen_args):
+        screen = InventoryScreen(**screen_args)
+        screen.page = current_page - 1
+        bot, mouse, logs = make_inventory_bot(screen, {
+            "quick_skip_mode": "armor", "armor_slot_pos": list(self.ARMOR), "armor_slot_page": armor_page,
+            "adaptive_recast_wait": False, "timing_recast_wait": 0.05})
+        bot._current_inv_page = current_page - 1
+        right = []                                       # page on screen at each right-click
+        click = screen.click
+
+        def recording_click(pos, button="left"):
+            screen.render()                              # a late page shows up first
+            if button == "right":
+                right.append((tuple(pos), screen.page + 1))
+            click(pos, button)
+        screen.click = recording_click
+        return bot, screen, right, logs
+
+    def test_armor_on_the_page_on_screen_is_clicked_without_tab_clicks(self):
+        bot, screen, right, _logs = self._bot(armor_page=1, current_page=1)
+        bot.quickskip()
+        self.assertEqual(right, [(self.ARMOR, 1)])
+        self.assertEqual(screen.tab_clicks, [])
+
+    def test_armor_on_another_page_is_clicked_on_its_page_then_the_page_comes_back(self):
+        bot, screen, right, _logs = self._bot(armor_page=1, current_page=3)
+        t0 = time.perf_counter()
+        bot.quickskip()
+        self.assertLess(time.perf_counter() - t0, 1.0)
+        self.assertEqual(right, [(self.ARMOR, 1)])
+        self.assertEqual(screen.tab_clicks, [1, 3])
+        bot._restore_fill_page()                         # before the next inventory read
+        screen.render()
+        self.assertEqual(screen.page + 1, 3)
+        self.assertEqual(screen.tab_clicks, [1, 3])      # the click back was enough
+
+    def test_a_late_armor_page_is_waited_for(self):
+        bot, screen, right, _logs = self._bot(armor_page=2, current_page=4, page_delay=0.25)
+        bot.quickskip()
+        self.assertEqual(right, [(self.ARMOR, 2)])
+
+    def test_armor_page_that_never_shows_is_not_clicked(self):
+        bot, screen, right, _logs = self._bot(armor_page=1, current_page=2, page_delay=30.0)
+        bot.quickskip()
+        self.assertEqual(right, [])
+        self.assertEqual(screen.page + 1, 2)
+
+    def test_restore_clicks_the_page_again_when_it_is_not_on_screen(self):
+        bot, screen, right, _logs = self._bot(armor_page=1, current_page=3)
+        bot.quickskip()
+        screen.page, screen._pending = 0, None           # the click back was lost
+        bot._restore_fill_page()
+        screen.render()
+        self.assertEqual(screen.page + 1, 3)
+        self.assertEqual(screen.tab_clicks, [1, 3, 3])
+
+    def test_unknown_armor_page_is_not_guessed(self):
+        bot, screen, right, logs = self._bot(armor_page=None, current_page=2)
+        bot.quickskip()
+        bot.quickskip()
+        self.assertEqual((right, screen.tab_clicks), ([], []))
+        self.assertEqual(sum("Armor quick skip skipped" in m for m in logs), 1)   # said once
+
+    def test_tabs_that_cannot_be_read_mean_no_switch(self):
+        bot, screen, right, _logs = self._bot(armor_page=1, current_page=2, highlight=False)
+        bot._PAGE_WAIT_TIMEOUT = 0.3
+        for _ in range(2):
+            bot.quickskip()
+        self.assertTrue(bot._tab_check_off)
+        clicks = len(screen.tab_clicks)
+        t0 = time.perf_counter()
+        bot.quickskip()
+        self.assertLess(time.perf_counter() - t0, 0.6)
+        self.assertEqual((right, len(screen.tab_clicks)), ([], clicks))
+        screen.render()
+        self.assertEqual(screen.page + 1, 2)             # left on the page being filled
+
+    def test_without_page_tabs_the_armor_is_clicked_where_it_is(self):
+        screen = InventoryScreen()
+        bot, mouse, _logs = make_inventory_bot(screen, {"quick_skip_mode": "armor",
+                                                        "armor_slot_pos": list(self.ARMOR)}, tabs=False)
+        bot.quickskip()
+        self.assertEqual(mouse.clicks, [(self.ARMOR, "right")])
 
 
 class InputSafetyTests(unittest.TestCase):
@@ -254,6 +569,8 @@ class InputSafetyTests(unittest.TestCase):
         bot, mouse, logs = make_bot(screen, {"quick_skip": True, "quick_skip_mode": "horse"})
         keys = bot.keyboard_controller.events
         bot._startup_scan_and_process_all_pages = lambda: None
+        bot._resume_inventory_check = lambda: None
+        bot._require_inventory_visible = lambda when: True   # this screen draws no inventory
         bot.bait_and_cast = lambda: setattr(screen, "panel_open", True) or True
 
         def full(may_have_catch=True):
@@ -274,6 +591,7 @@ class PauseTests(unittest.TestCase):
         screen = SimScreen(OFFICIAL_PANEL, OFFICIAL_FISH)
         bot, _mouse, logs = make_bot(screen, {"timing_minigame_timeout": 1.0, "timing_recast_wait": 0.0})
         bot._startup_scan_and_process_all_pages = lambda: None
+        bot._resume_inventory_check = lambda: None
         casts = []
 
         def cast():

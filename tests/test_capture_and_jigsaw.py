@@ -211,8 +211,13 @@ class JigsawMultiWindowTests(unittest.TestCase):
         a.paused = True                          # one bot paused itself
         jigsaw_module._listener_subscribers[:] = [a, b]
         try:
+            jigsaw_module._last_f5 = float("-inf")
             jigsaw_module._shared_on_press(jigsaw_module.Key.f5)
             self.assertEqual((a.paused, b.paused), (False, False))
+            # A held F5 repeats at once: the repeat must not toggle again
+            jigsaw_module._shared_on_press(jigsaw_module.Key.f5)
+            self.assertEqual((a.paused, b.paused), (False, False))
+            jigsaw_module._last_f5 = float("-inf")   # a separate press later
             jigsaw_module._shared_on_press(jigsaw_module.Key.f5)
             self.assertEqual((a.paused, b.paused), (True, True))
         finally:

@@ -29,7 +29,9 @@ class _FakeWin:
 
 
 @unittest.skipUnless(HAS_QT, "PySide6 is not installed")
-class GuiSmokeTests(unittest.TestCase):
+class GuiFixture(unittest.TestCase):
+    """The window and a temporary config folder; no tests of its own."""
+
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
@@ -52,6 +54,10 @@ class GuiSmokeTests(unittest.TestCase):
             w._stop_global_hotkey_listener()
             w._poll.stop()
             w.deleteLater()
+        # Really delete them now: windows left over from earlier tests are
+        # restyled by every new window's setStyleSheet (seconds per test).
+        from PySide6.QtCore import QCoreApplication, QEvent
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
         WindowManager.get_all_windows = self._orig
         os.chdir(self._cwd)
         self._tmp.cleanup()
@@ -64,6 +70,11 @@ class GuiSmokeTests(unittest.TestCase):
     def _saved(self):
         with open("bot_config.json") as f:
             return json.load(f)
+
+
+
+@unittest.skipUnless(HAS_QT, "PySide6 is not installed")
+class GuiSmokeTests(GuiFixture):
 
     def test_builds_and_round_trips_settings(self):
         w = self._window()
@@ -185,72 +196,150 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertFalse(self._saved()["adaptive_recast_wait"])
         self.assertFalse(self._window().settings.recast_tune_check.isChecked())
 
-    def _jigsaw_dialog(self, w):
+    def _jigsaw_mode(self, w):
         # Never build (or load) the real solver tables in a GUI test
         qt_gui.SolverCacheManager._cache_exists = classmethod(lambda cls: True)
         qt_gui.SolverCacheManager.ensure_build = lambda self: None
         w.dashboard.window_rows[0].setSelectedWindow("Metin2 (1)")
         w.dashboard.window_rows[1].setSelectedWindow("Metin2 (2)")
-        w.open_jigsaw_solver()
-        return w._jigsaw_dialog
+        w.mode_bar._on_click(qt_gui.MODE_JIGSAW)       # as a click on JIGSAW PUZZLE
+        return w.jigsaw
 
-    def test_jigsaw_dialog_rows_follow_the_workers(self):
+    def test_mode_switch_relabels_and_is_remembered(self):
         w = self._window()
-        dialog = self._jigsaw_dialog(w)
-        self.assertEqual(sorted(dialog._rows), [0, 1])
-        self.assertFalse(w.dashboard.start_btn.isEnabled())     # fishing is locked meanwhile
+        self.assertEqual(w.mode, qt_gui.MODE_FISHING)
+        self.assertIn("START FISHING", w.dashboard.start_btn.text())
+        self._jigsaw_mode(w)
+        self.assertEqual(w.mode, qt_gui.MODE_JIGSAW)
+        self.assertIn("START JIGSAW", w.dashboard.start_btn.text())
+        self.assertIn("Crates", w.dashboard.window_rows[0].bait_lbl.text())
+        self.assertTrue(w.inventory.coord_pills["drop"].isLocked())       # fishing-only: greyed, not hidden
+        self.assertTrue(w.inventory.coord_pills["drop"].isVisibleTo(w.inventory))
+        self.assertFalse(w.inventory.coord_pills["confirm"].isLocked())   # shared
+        self.assertFalse(w.inventory.coord_pills["confirm"].isOptional())  # the crate dialog needs it
+        w.tabs_bar.setActive("activity")
+        self.assertIs(w.stack.currentWidget().widget(), w.jigsaw_tab)
+        self.assertEqual(self._saved()["ui_mode"], "jigsaw")
+        self.assertEqual(self._window().mode, qt_gui.MODE_JIGSAW)     # restored on the next start
+        w.mode_bar._on_click(qt_gui.MODE_FISHING)
+        self.assertIs(w.stack.currentWidget().widget(), w.settings.fishing_page)
+        self.assertFalse(w.inventory.coord_pills["drop"].isLocked())
+        self.assertIn("Bait", w.dashboard.window_rows[0].bait_lbl.text())
+
+    def test_readiness_chips_follow_the_setup(self):
+        w = self._window()
+        self._jigsaw_mode(w)
+        chips = w.dashboard.ready_chips.chips
+        self.assertEqual(list(chips), ["windows", "grid", "confirm", "solver"])
+        self.assertEqual(chips["grid"].property("state"), "bad")
+        w._on_grid_confirmed([10, 20, 264, 176])
+        self.assertEqual(chips["grid"].property("state"), "ok")
+        self.assertIn("x=10", w.jigsaw_tab.grid_info_label.text())
+        chips["confirm"].click()                                  # opens the JIGSAW tab
+        self.assertEqual(w.tabs_bar.active(), "activity")
+
+    def test_jigsaw_rows_follow_the_workers(self):
+        w = self._window()
+        runner = self._jigsaw_mode(w)
+        rows = w.dashboard.window_rows
 
         class Worker:
             running, paused, boards_completed = True, False, 2
 
+            def _on_f5_pressed(self, paused):
+                self.paused = paused
+                runner.paused_changed.emit(0, paused)
+
+            def stop(self):
+                self.running = False
+
         a, b = Worker(), Worker()
-        dialog._bots = {0: a, 1: b}
-        dialog._set_setup_enabled(False)                        # as _start() does
-        dialog._append_status(0, "[W1] Place jigsaw piece (action=4) at (166, 216)")
-        self.assertEqual(dialog._rows[0]["row"].status_lbl.text(), "Place jigsaw piece (action=4) at (166, 216)")
-        dialog._set_progress(0, 7)
-        self.assertEqual(dialog._rows[0]["row"].crates_lbl.text(), "C 7")
-        self.assertEqual(dialog._rows[0]["row"].boards_lbl.text(), "B 2")
+        runner.bots = {0: a, 1: b}
+        w._on_activity_started(qt_gui.MODE_JIGSAW)                # as start() does
+        self.assertFalse(w.mode_bar._buttons[qt_gui.MODE_FISHING].isEnabled())   # can't switch now
+        self.assertFalse(w.jigsaw_tab.define_grid_btn.isEnabled())
+        self.assertFalse(rows[0].combo.isEnabled())
+        w.set_mode(qt_gui.MODE_FISHING)                           # refused while running
+        self.assertEqual(w.mode, qt_gui.MODE_JIGSAW)
 
-        b.paused = True                                         # one worker paused itself
-        dialog._on_paused_changed(1, True)
-        self.assertIn("PAUSED", dialog._rows[1]["row"].pill.text())
-        self.assertIn("RUNNING", dialog._rows[0]["row"].pill.text())
-        self.assertIn("Resume", dialog.start_btn.text())
-        dialog._toggle()                                        # Resume, not Stop
+        runner.status_line.emit(0, "[W1] Place jigsaw piece (action=4) at (166, 216)")
+        self.assertEqual(rows[0].msg_lbl.text(), "Place jigsaw piece (action=4) at (166, 216)")
+        runner.progress_line.emit(0, 7)
+        self.assertEqual(rows[0].bait_lbl.text(), "Crates 7")
+        self.assertEqual(rows[0].games_lbl.text(), "Boards 2")
+        self.assertEqual(w.dashboard.kpi_games._value.text(), "7")
+
+        b.paused = True                                           # one worker paused itself
+        runner.paused_changed.emit(1, True)
+        self.assertIn("PAUSED", rows[1].pill.text())
+        self.assertIn("RUNNING", rows[0].pill.text())
+        self.assertIn("RESUME", w.dashboard.start_btn.text())
+        w.dashboard.start_btn.click()                             # Resume, not Stop
         self.assertFalse(b.paused)
-        self.assertIn("Stop", dialog.start_btn.text())
+        self.assertIn("PAUSE", w.dashboard.start_btn.text())
 
-        dialog._on_stopped(0, a)
-        self.assertIn("STOPPED", dialog._rows[0]["row"].pill.text())
-        self.assertFalse(dialog.define_grid_btn.isEnabled())    # one is still running
-        dialog._on_stopped(1, b)
-        self.assertTrue(dialog.define_grid_btn.isEnabled())
-        self.assertIn("Start", dialog.start_btn.text())
+        w.dashboard.stop_btn.click()
+        self.assertFalse(a.running)
+        self.assertEqual(rows[0].msg_lbl.text(), "Stopped by user")
+        runner.stopped.emit(0, a)
+        self.assertIn("STOPPED", rows[0].pill.text())
+        self.assertFalse(w.jigsaw_tab.define_grid_btn.isEnabled())    # one is still running
+        runner.stopped.emit(1, b)
+        self.assertTrue(w.jigsaw_tab.define_grid_btn.isEnabled())
+        self.assertTrue(w.mode_bar._buttons[qt_gui.MODE_FISHING].isEnabled())
+        self.assertIn("START JIGSAW", w.dashboard.start_btn.text())
 
-        dialog.close()
-        self.assertTrue(w.dashboard.start_btn.isEnabled())
+    def test_fishing_cannot_start_while_jigsaw_runs(self):
+        w = self._window()
+        runner = self._jigsaw_mode(w)
+        runner.bots = {0: object()}
+        w.start_all_bots()
+        self.assertFalse(w.bots)
+        runner.bots = {}
+
+    def test_interface_size_fits_the_screen(self):
+        # Logical screen area (after OS scaling) -> scale chosen at startup
+        self.assertEqual(qt_gui.choose_ui_scale("auto", 2560, 1440), 1.25)    # 1440p at 100 %
+        self.assertEqual(qt_gui.choose_ui_scale("auto", 1920, 1032), 1.15)    # 1080p at 100 %
+        self.assertEqual(qt_gui.choose_ui_scale("auto", 1536, 824), 1.0)      # 1080p at 125 %
+        self.assertEqual(qt_gui.choose_ui_scale("auto", 2560, 1392), 1.25)    # 4K at 150 %
+        self.assertEqual(qt_gui.choose_ui_scale("1.75", 2560, 1440), 1.75)
+        self.assertEqual(qt_gui.choose_ui_scale("1.75", 1920, 1032), 1.35)    # never bigger than the screen
+        self.assertEqual(qt_gui.choose_ui_scale("1.0", 3840, 2160), 1.0)
+        # Screens too small for the window at 100 %: smaller, so START and the
+        # footer stay on screen (the window is frameless and fixed-size)
+        self.assertEqual(qt_gui.choose_ui_scale("junk", 1366, 728), 1.0)      # 1366x768 laptop: fits
+        self.assertEqual(qt_gui.choose_ui_scale("auto", 1280, 690), 1.0)      # 1080p at 150 %: fits
+        self.assertEqual(qt_gui.choose_ui_scale("1.5", 1280, 690), 1.0)
+        self.assertEqual(qt_gui.choose_ui_scale("auto", 1280, 600), 0.85)     # smaller still
+        self.assertEqual(qt_gui.choose_ui_scale("auto", 800, 500), qt_gui.MIN_UI_SCALE)
+        for w, h in ((1366, 728), (1280, 690), (1280, 600), (1536, 824), (1920, 1032)):
+            s = qt_gui.choose_ui_scale("auto", w, h)
+            self.assertLessEqual(qt_gui.WINDOW_H * s, h)
+            self.assertLessEqual(qt_gui.WINDOW_W * s, w)
+
+    def test_interface_size_setting_round_trips(self):
+        w = self._window()
+        self.assertEqual(w.settings.ui_scale_combo.currentData(), "auto")
+        w.settings.ui_scale_combo.setCurrentIndex(w.settings.ui_scale_combo.findData("1.5"))
+        self.assertEqual(self._saved()["ui_scale"], "1.5")
+        self.assertIn("restart", w.settings.ui_scale_note.text())
+        self.assertEqual(qt_gui._saved_ui_scale_setting(), "1.5")
+        self.assertEqual(self._window().settings.ui_scale_combo.currentData(), "1.5")
 
     def test_jigsaw_crate_priority_is_saved(self):
         w = self._window()
-        dialog = self._jigsaw_dialog(w)
-        self.assertFalse(dialog.special_first_check.isChecked())
-        dialog.special_first_check.setChecked(True)
+        self._jigsaw_mode(w)
+        radios = w.jigsaw_tab.priority_radios
+        self.assertTrue(radios["normal_first"].isChecked())
+        radios["special_first"].setChecked(True)
         self.assertEqual(self._saved()["jigsaw_crate_priority"], "special_first")
-        dialog.special_first_check.setChecked(False)
-        self.assertEqual(self._saved()["jigsaw_crate_priority"], "normal_first")
-        # "Only where it saves rounds" and "first" exclude each other
-        dialog.special_smart_check.setChecked(True)
+        radios["special_when_better"].setChecked(True)
+        self.assertFalse(radios["special_first"].isChecked())     # one choice only
         self.assertEqual(self._saved()["jigsaw_crate_priority"], "special_when_better")
-        dialog.special_first_check.setChecked(True)
-        self.assertFalse(dialog.special_smart_check.isChecked())
-        self.assertEqual(self._saved()["jigsaw_crate_priority"], "special_first")
-        dialog.special_smart_check.setChecked(True)
-        self.assertFalse(dialog.special_first_check.isChecked())
-        self.assertEqual(self._saved()["jigsaw_crate_priority"], "special_when_better")
-        dialog.special_smart_check.setChecked(False)
+        radios["normal_first"].setChecked(True)
         self.assertEqual(self._saved()["jigsaw_crate_priority"], "normal_first")
-        dialog.close()
+        self.assertTrue(self._window().jigsaw_tab.priority_radios["normal_first"].isChecked())
 
     def test_stale_stop_notification_is_ignored(self):
         w = self._window()
@@ -268,3 +357,63 @@ class GuiSmokeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(HAS_QT, "PySide6 is not installed")
+class SetupCheckGuiTests(GuiFixture):
+    """Setting a position runs its check and remembers the window size."""
+
+    def setUp(self):
+        super().setUp()
+        from _stubs import InventoryScreen
+        self.screen = InventoryScreen(highlight=False)
+        self._rect = WindowManager.get_window_rect
+        WindowManager.get_window_rect = lambda _self: (0, 0, self.screen.W, self.screen.H)
+        self.shown = []
+        for name in ("information", "warning"):
+            setattr(QMessageBox, name, staticmethod(
+                lambda _parent, title, *a, **k: self.shown.append(title) or QMessageBox.Ok))
+
+    def tearDown(self):
+        WindowManager.get_window_rect = self._rect
+        for name in ("information", "warning"):
+            setattr(QMessageBox, name, staticmethod(lambda *a, **k: QMessageBox.Ok))
+        super().tearDown()
+
+    def _capture(self, w, key, pos):
+        w._capture_window_name = "Metin2 (1)"
+        w._on_captured(pos[0], pos[1], key)
+
+    def test_sizes_are_remembered_and_a_resize_is_asked_about(self):
+        w = self._window()
+        w._grab_with = lambda _wm: (self.screen.grab, lambda: None)
+        self._capture(w, "page1", self.screen.TABS[1])
+        self.assertEqual(self._saved()[qt_gui.setup_checks.SIZES_KEY]["inv_page_1_pos"], [800, 700])
+        asked = []
+        QMessageBox.question = staticmethod(lambda *a, **k: asked.append(a[1]) or QMessageBox.No)
+        names = {n: win for n, win in WindowManager.get_all_windows()}
+        self.assertTrue(w.windows_have_same_size(["Metin2 (1)"], names,
+                                                 positions=qt_gui.setup_checks.FISHING_POSITIONS))
+        WindowManager.get_window_rect = lambda _self: (0, 0, 1024, 768)
+        self.assertFalse(w.windows_have_same_size(["Metin2 (1)"], names,
+                                                  positions=qt_gui.setup_checks.FISHING_POSITIONS))
+        self.assertEqual(asked, ["Window size changed"])
+
+    def test_same_tab_twice_and_worn_armor_are_caught(self):
+        w = self._window()
+        w._grab_with = lambda _wm: (self.screen.grab, lambda: None)
+        for page in (1, 2, 3):
+            self._capture(w, f"page{page}", self.screen.TABS[page])
+        self._capture(w, "page4", (self.screen.TABS[1][0] + 2, self.screen.TABS[1][1]))
+        self.assertIn("Same tab twice", self.shown)
+        x, y = self.screen.EQUIPMENT[0]
+        self._capture(w, "armor", (x + 16, y + 16))
+        self.assertIn("Not a spare armor in the inventory?", self.shown)
+
+    def test_unreadable_tabs_are_said_once(self):
+        w = self._window()
+        w._grab_with = lambda _wm: (self.screen.grab, lambda: None)
+        for page in (1, 2, 3, 4):
+            self._capture(w, f"page{page}", self.screen.TABS[page])
+            w._check_tab_after_click(page, WindowManager())
+        self.assertEqual(self.shown.count("Open tab not recognized"), 1)

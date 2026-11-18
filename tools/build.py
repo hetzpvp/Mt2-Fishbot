@@ -329,42 +329,6 @@ def update_version_file(new_version):
         return False
 
 
-def update_bot_version_in_gui():
-    """Updates BOT_VERSION in bot_gui.py to match version.py."""
-    print_info(f"Updating BOT_VERSION in bot_gui.py...")
-    
-    bot_gui_path = os.path.join(SRC_DIR, "bot_gui.py")
-    
-    if not os.path.exists(bot_gui_path):
-        print_error(f"{bot_gui_path} not found")
-        return False
-    
-    try:
-        with open(bot_gui_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        
-        # Pattern to match: BOT_VERSION = "X.X.X"  # Version for config validation
-        # Captures the version number and optional comment
-        pattern = r'BOT_VERSION\s*=\s*"[\d.]+"(\s*#[^\n]*)?'
-        replacement = f'BOT_VERSION = "{VERSION}"  # Version for config validation and GUI display'
-        
-        new_content = re.sub(pattern, replacement, content)
-        
-        if new_content == content:
-            print_success("BOT_VERSION already up to date")
-            return True
-        
-        with open(bot_gui_path, 'w', encoding='utf-8') as f:
-            f.write(new_content)
-        
-        print_success(f"Updated BOT_VERSION to: {VERSION}")
-        return True
-    except Exception as e:
-        print_error(f"Failed to update bot_gui.py: {e}")
-        return False
-
-
-
 def update_version_in_spec():
     """Updates version in build.spec to match version.py."""
     print_info(f"Updating version in build.spec...")
@@ -382,15 +346,25 @@ def update_version_in_spec():
         replacement = f"name='Fishing Puzzle Player v{VERSION}'"
         
         new_content = re.sub(pattern, replacement, content)
-        
+
         if new_content == content:
             print_success("build.spec already up to date")
-            return True
-        
-        with open(SPEC_FILE, 'w', encoding='utf-8') as f:
-            f.write(new_content)
-        
-        print_success(f"Updated build.spec version to: {VERSION}")
+        else:
+            with open(SPEC_FILE, 'w', encoding='utf-8') as f:
+                f.write(new_content)
+            print_success(f"Updated build.spec version to: {VERSION}")
+
+        # The Linux spec names its binary 'Fishing Puzzle Player vX.X.X (linux)'.
+        linux_spec = os.path.join(SCRIPT_DIR, "packaging", "build_linux.spec")
+        if os.path.exists(linux_spec):
+            with open(linux_spec, 'r', encoding='utf-8') as f:
+                content = f.read()
+            new_content = re.sub(r"name='Fishing Puzzle Player v[\d.]+ \(linux\)'",
+                                 f"name='Fishing Puzzle Player v{VERSION} (linux)'", content)
+            if new_content != content:
+                with open(linux_spec, 'w', encoding='utf-8') as f:
+                    f.write(new_content)
+                print_success(f"Updated build_linux.spec version to: {VERSION}")
         return True
     except Exception as e:
         print_error(f"Failed to update build.spec: {e}")
@@ -817,7 +791,6 @@ def main():
     print_section("Updating Version Information")
     
     success = True
-    success = update_bot_version_in_gui() and success
     success = update_version_in_spec() and success
     
     if not success:

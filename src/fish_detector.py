@@ -28,6 +28,8 @@ from typing import Deque, List, Optional, Tuple
 import cv2
 import numpy as np
 
+import diag
+
 Bounds = Tuple[int, int, int, int]
 HSV = Tuple[int, int, int]
 
@@ -418,6 +420,13 @@ class FishDetector:
 
     # ---------------------------------------------------------------- detection
 
+    def panel_pixels(self, frame: np.ndarray) -> int:
+        """Pixels of the active profile's panel color in ``frame``."""
+        if frame is None or frame.size == 0 or self.window_color_lower is None:
+            return 0
+        hsv = FishDetector._cvtColor(frame, FishDetector._COLOR_BGR2HSV)
+        return int(FishDetector._countNonZero(_hsv_mask(hsv, self.window_color_lower, self.window_color_upper)))
+
     def find_fishing_window_bounds(self, frame: np.ndarray, observe_only: bool = False) -> Optional[Bounds]:
         """Finds the bounding box of the fishing panel. Returns (x, y, w, h) or None.
         ``observe_only`` leaves the detector's state untouched (debug views)."""
@@ -510,6 +519,9 @@ class FishDetector:
 
     def _finish_learning(self, learner: "FishLearner") -> None:
         """Adopts what the learner found and stops feeding it."""
+        diag.log("ANALYSIS", f"fish learner finished: circle={learner.circle} fish HSV range={learner.fish_range} "
+                             f"(profile before: circle {self.profile.circle_center} r={self.profile.circle_radius}, "
+                             f"fish {self.profile.fish_lower}-{self.profile.fish_upper})")
         self._background = learner.background
         if learner.circle is not None:
             cx, cy, r = learner.circle
@@ -820,3 +832,11 @@ class FishLearner:
         self._samples = []
         self._history.clear()
         self.done = True
+
+
+# Diagnostic log: entry/exit of the detector's methods (per-frame calls only
+# with "Verbose"; no-op wrappers while diagnostics is off).
+diag.trace_class(FishDetector)
+diag.trace_class(WindowLearner)
+diag.trace_class(FishLearner, exclude=("_track",))
+diag.trace_class(BackgroundModel, exclude=("add", "changed"))

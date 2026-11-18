@@ -66,7 +66,9 @@ class JigsawBotMathTests(unittest.TestCase):
         self.assertTrue(detector._cell_is_filled(frame, 0, 0, 120 / 6, 80 / 4, 0, 0))
 
     def test_detector_uses_configured_grid_bounds_for_cell_centers(self):
-        detector = JigsawDetector({"jigsaw_grid_bounds": [10, 20, 120, 80]})
+        # Cell-center math only: the check that the rectangle really shows
+        # the grid is off here (a blank frame shows none; see test_reliability).
+        detector = JigsawDetector({"jigsaw_grid_bounds": [10, 20, 120, 80], "jigsaw_grid_check": False})
         frame = np.zeros((160, 220, 3), dtype=np.uint8)
 
         grid = detector.detect_grid(frame)

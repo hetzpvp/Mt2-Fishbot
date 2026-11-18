@@ -166,3 +166,86 @@ class SimScreen:
     def grab(self, left, top, width, height):
         frame = self.render()
         return np.ascontiguousarray(frame[top:top + height, left:left + width])
+
+
+class InventoryScreen:
+    """A game window with an inventory laid out like a real client's: a
+    clock that changes, empty equipment slots, two rows of page tabs (the
+    active one lighter) and the 5x9 item grid right below them.
+
+    A tab click shows its page ``page_delay`` seconds later (a slow machine);
+    the first ``lost_clicks`` tab clicks are not noticed by the game at all."""
+
+    W, H = 800, 700
+    SLOT, COLS, ROWS, PAGES = 32, 5, 9, 4
+    GRID = (620, 361)                                       # top-left corner of the grid
+    TAB_BOXES = {1: (623, 320, 699, 337), 2: (702, 320, 778, 337),
+                 3: (623, 341, 699, 358), 4: (702, 341, 778, 358)}
+    # Where the user clicked when setting the tabs up: nowhere near the centers
+    TABS = {1: (660, 329), 2: (752, 323), 3: (671, 350), 4: (733, 348)}
+    EQUIPMENT = [(740, 230), (740, 270), (640, 250)]        # empty equipment slots (top-left)
+
+    def __init__(self, page_delay=0.0, lost_clicks=0, highlight=True):
+        rng = np.random.default_rng(3)
+        base = rng.integers(40, 90, size=(self.H, self.W, 3), dtype=np.uint8)
+        self.background = cv2.GaussianBlur(base, (9, 9), 0)
+        self.slot_img = cv2.imread(os.path.join(ROOT, "assets", "fishing", "empty_slot.jpg"))
+        self.pages = [dict() for _ in range(self.PAGES)]    # slot index -> item image
+        self.page = 0
+        self.page_delay = page_delay
+        self.lost_clicks = lost_clicks
+        self.highlight = highlight
+        self.tab_clicks = []
+        self.clicks = []
+        self._pending = None                                # (page, time it shows)
+        self.clock = 0
+
+    def config(self):
+        return {f"inv_page_{page}_pos": list(point) for page, point in self.TABS.items()}
+
+    def slot_center(self, slot):
+        return (self.GRID[0] + (slot % self.COLS) * self.SLOT + self.SLOT // 2,
+                self.GRID[1] + (slot // self.COLS) * self.SLOT + self.SLOT // 2)
+
+    def fill(self, page, count, item):
+        for slot in range(count):
+            self.pages[page][slot] = item
+
+    def click(self, pos, button="left"):
+        import time
+        self.clicks.append((tuple(pos), button))
+        for page, (x1, y1, x2, y2) in self.TAB_BOXES.items():
+            if x1 <= pos[0] <= x2 and y1 <= pos[1] <= y2 and button == "left":
+                self.tab_clicks.append(page)
+                if self.lost_clicks > 0:
+                    self.lost_clicks -= 1
+                    return
+                self._pending = (page - 1, time.perf_counter() + self.page_delay)
+
+    def render(self):
+        import time
+        if self._pending and time.perf_counter() >= self._pending[1]:
+            self.page, self._pending = self._pending[0], None
+        frame = self.background.copy()
+        self.clock += 1                                     # the clock never stands still
+        cv2.putText(frame, f"17:02:{self.clock % 60:02d}", (630, 216), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    (255, 255, 255), 1)
+        cv2.rectangle(frame, (614, 224), (786, self.GRID[1] + self.ROWS * self.SLOT + 6), (38, 34, 30), -1)
+        for x, y in self.EQUIPMENT:
+            frame[y:y + self.SLOT, x:x + self.SLOT] = self.slot_img
+        for page, (x1, y1, x2, y2) in self.TAB_BOXES.items():
+            lit = self.highlight and page - 1 == self.page
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (134, 122, 112) if lit else (84, 72, 62), -1)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (10, 10, 10), 1)
+            cv2.putText(frame, "I" * page if page < 4 else "IV", ((x1 + x2) // 2 - 8, y2 - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (217, 217, 217), 1)
+        items = self.pages[self.page]
+        for slot in range(self.COLS * self.ROWS):
+            x = self.GRID[0] + (slot % self.COLS) * self.SLOT
+            y = self.GRID[1] + (slot // self.COLS) * self.SLOT
+            frame[y:y + self.SLOT, x:x + self.SLOT] = items.get(slot, self.slot_img)
+        return frame
+
+    def grab(self, left, top, width, height):
+        frame = self.render()
+        return np.ascontiguousarray(frame[top:top + height, left:left + width])

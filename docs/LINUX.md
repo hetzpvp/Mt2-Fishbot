@@ -81,7 +81,8 @@ Tested on Fedora 44, KDE Plasma 6.8 (Wayland), Wine 11.20.
 ## Tests
 
 ```bash
-python tools/run_tests.py              # unit tests; never touch the desktop
+python tools/run_tests.py              # unit tests in parallel (~2.5 min); never touch the desktop
+python tools/run_tests.py --serial     # same, one process (slow, ~11 min)
 python tools/run_tests.py --os --xvfb  # + OS-layer tests on a private virtual display
                                        #   (needs: sudo dnf install xorg-x11-server-Xvfb openbox)
 python tools/run_tests.py --os         # + OS-layer tests on your desktop (they take focus briefly)
@@ -98,6 +99,29 @@ The Wine end-to-end test (`tests/os_layer/test_live_wine.py`) uses
 game. It needs `mingw64-gcc` (Fedora) or `gcc-mingw-w64-x86-64` (Debian/Ubuntu)
 to build. `FISHBOT_WINE` / `FISHBOT_WINEPREFIX` select another wine binary or
 prefix.
+
+## Building the Windows .exe on Linux
+
+PyInstaller cannot cross-compile, so the Windows exe is built by a Windows
+Python running under Wine. One command:
+
+```bash
+tools/build_windows_exe.sh                          # -> dist/Fishing Puzzle Player vX.Y.Z.exe
+tools/build_windows_exe.sh --distpath dist/test     # elsewhere, e.g. not to overwrite a release
+```
+
+- Build environment: `~/.local/share/fishbot-winbuild` (own Wine prefix +
+  Windows Python 3.14 from the NuGet package `python` + `requirements.txt` +
+  PyInstaller). Created automatically on the first run, reused afterwards.
+- It is headless: no window opens and nothing takes the focus, so it is safe
+  to run while playing.
+- Name and version of the exe come from `packaging/build.spec`
+  (`python tools/build.py --version X.Y.Z --no-build` updates them).
+- A build takes a few minutes; the exe is ~150 MB.
+- The native Linux binary is built from `packaging/build_linux.spec`:
+  `.venv/bin/pyinstaller --clean --noconfirm packaging/build_linux.spec`.
+- A full release (version bump, both binaries, GitHub release) is
+  `tools/release.py` — see its docstring for the steps.
 
 ## Troubleshooting
 

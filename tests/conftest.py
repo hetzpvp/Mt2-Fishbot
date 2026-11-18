@@ -34,6 +34,11 @@ for p in (TESTS, os.path.join(ROOT, "src")):
     if p not in sys.path:
         sys.path.insert(0, p)
 
+# bot_config.json in the working directory: the GUI tests chdir into a
+# temporary folder, so they never read or overwrite the real configuration
+# (which lives next to the program, see qt_gui.config_file_path).
+os.environ["FISHBOT_CONFIG_DIR"] = "."
+
 
 def pytest_addoption(parser):
     parser.addoption("--os", action="store_true", default=False,

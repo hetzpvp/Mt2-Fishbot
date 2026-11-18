@@ -16,14 +16,13 @@ An automated fishing bot for Metin2 that uses computer vision (no memory reading
 Mt2-Fishbot/
 ├── src/
 │   ├── fishing_bot.py       # Core bot logic (~2098 lines)
-│   ├── bot_gui.py           # Tkinter GUI (~3412 lines)
 │   ├── fish_detector.py     # Computer vision detection (~106 lines)
 │   ├── window_manager.py    # Window discovery & focus (~169 lines)
 │   ├── utils.py             # Shared constants, helpers (~202 lines)
 │   ├── debug_ui.py          # Live debug visualizers (~1291 lines)
 │   ├── jigsaw_bot.py        # Jigsaw puzzle automation (~1241 lines)
 │   ├── jigsaw_detector.py   # Jigsaw piece recognition (~725 lines)
-│   ├── qt_gui.py            # Qt-based GUI alternative (~4280 lines, unused in build)
+│   ├── qt_gui.py            # PySide6 GUI (Fishing + Jigsaw, setup wizards)
 │   ├── screen_capture.py    # WindowCapture: screen copy / per-window render policy
 │   ├── input_backend.py     # Mouse/keyboard backends (Interception, PyAutoGUI, uinput, XTest)
 │   ├── platforms/           # OS layer: win32.py (Windows), x11.py + uinput.py (Linux)
@@ -68,7 +67,7 @@ Mt2-Fishbot/
 
 ### Multi-Page Inventory Management
 - Up to **8 inventory page tabs** configurable (`inv_page_1_pos` … `inv_page_8_pos`)
-- Pages 1–4 mandatory; pages 5–8 optional
+- Page 1 mandatory; pages 2–8 optional, set in order (the bot stops at the first unset page)
 - At startup, scans all configured pages to process any existing items
 - Detects empty slot count via `empty_slot.jpg` template; auto-switches page when current page is full
 - `_startup_scan_and_process_all_pages()`, `_switch_inventory_page()`, `_scan_empty_slots()`
@@ -111,6 +110,7 @@ All click/key delays are individually tunable via **Timing Settings** modal (`Ti
 | `timing_open_wait` | 100 ms | Wait for item open animation |
 | `timing_dead_fish_check` | 100 ms | Wait before checking for dead fish |
 | `timing_drop_settle` | 120 ms | Delay after drop confirmation |
+| `timing_drop_dialog_timeout` | 1.0 s | Longest wait for the drop / confirm dialog before the drop is undone |
 | `timing_quickskip_between` | 100 ms | Delay between quick skip presses |
 | `timing_quickskip_after` | 100 ms | Delay after quick skip completes |
 
@@ -176,14 +176,6 @@ Methods:
 - `find_fishing_window_bounds()` — contour detection on cyan mask
 - `detect_window_and_fish()` — combined detection in one HSV call; returns window rect + fish position
 
-### `bot_gui.py` — BotGUI + FishSelectionWindow + TimingSettingsWindow
-Full Tkinter UI.
-
-- `BotGUI`: main window with window-selection panel (8 slots), settings toggles, real-time stats (games played, hits, bait remaining), status log, debug window launchers, accent color picker with RGB wave animation, jigsaw solver toggle
-- `FishSelectionWindow`: modal dialog listing all fish/item assets with Keep/Open/Drop radio buttons per item (color-coded: green/red/blue/gray)
-- `TimingSettingsWindow`: modal with labeled sliders for all 14 timing parameters; includes reset-to-defaults button
-- DPI-aware: queries `shcore.SetProcessDpiAwareness(1)` and scales layout accordingly
-
 ### `window_manager.py` — WindowManager + GameRegion
 - `get_all_windows()` — enumerates visible top-level windows, prioritises those with "Metin2" in title
 - `activate_window()` — brings window to foreground with retry loop (3 attempts, 30 ms gaps); caches last-active handle to skip redundant calls
@@ -196,8 +188,33 @@ Full Tkinter UI.
 - `play_rickroll_beep()` — PC speaker Rick Roll melody with ADSR envelope via `winsound`
 - Constants: `input_lock`, `MAX_WINDOWS = 8`, `DEBUG_MODE_EN`, `DEBUG_PRINTS`
 
+### `qt_gui.py` — the GUI (PySide6)
+Frameless fixed-size window (920×664 logical px; `ui_scale` / Auto scales it, down to 70 % on
+screens too small for 100 %). Top to bottom: header (title, Discord, status, min/close), mode bar
+(Fishing | Jigsaw Puzzle + that activity's setup wizard button), tabs (Dashboard, Positions,
+Fishing/Jigsaw, Settings), a notice bar (config unreadable / invalid values, save failures,
+native Wayland, first start), the tab, footer (Guide, Report a problem, donations).
+
+- Dashboard: action strip (START/PAUSE, STOP, status line, "ready to start" chips that open the
+  place that fixes them), live numbers, game window rows (always all `MAX_WINDOWS` = 8 slots; a
+  window can be in one slot only).
+- Positions: inventory page tabs and action points. Clicking a set pill re-captures it, its ✕
+  clears it. A capture ends with a left click in the game; Esc (global), a right click, Cancel or
+  60 s without a click cancel it. Fishing-only points are greyed out (not hidden) in Jigsaw mode.
+- `SetupWizard`: one per activity, not modal, drives the real state (rows, capture, settings);
+  the button pulses until `wizard_done_fishing` / `wizard_done_jigsaw` is set by opening it.
+  Configurations from before the wizards count as done when page 1 / the grid is set.
+- Config loading coerces every value to its default's type (bad values → default + notice);
+  an unreadable file is moved to `.corrupt` (notice).
+- Accent: `set_accent()` derives hover, border and on-accent text colors.
+
+### `debug_host.py` — Tk debug windows next to Qt
+With `DEBUG_MODE_EN` the GUI opens the `debug_ui` windows per running bot. Tk runs on its own
+thread (`TkDebugHost`); the Qt side only queues requests (pumping Tk from the Qt thread crashed
+Python 3.13+).
+
 ### `debug_ui.py`
-Five independent debug Tkinter windows (shown/hidden from main GUI):
+Five independent debug Tkinter windows (opened per bot with `DEBUG_MODE_EN`):
 - `StatusLogWindow` — scrollable text log of bot events (900×500)
 - `IgnoredPositionsWindow` — grid overlay showing which inventory slots are being ignored
 - `FishDetectorDebugWindow` — live capture with colour overlays for cyan window, blue fish dot, and classic fish template match; uses its own `mss` instance per thread
@@ -256,7 +273,8 @@ client's values.
 |------------|---------|---------|
 | `adaptive_detection` | `true` | Self-calibrate when the active profile finds no panel |
 | `detection_profile` | `null` | Profile to use instead of the stock one; a learned profile is saved here automatically. Set back to `null` to forget it |
-| `detection_debug_dump` | `false` | Save before-cast / current frames to `debug_frames/` when calibration fails or adapts (max 6 per session) |
+| `diagnostics_enabled` | `false` | Diagnostic log (Settings tab): every action, capture, analysis and decision of a run, plus PNGs of the frames that came out negative, packed into `diagnostics/<YYYYMMDD_HHMMSS>.zip` next to the program (`src/diag.py`). Replaces the old `detection_debug_dump` |
+| `diagnostics_verbose` | `false` | Also log every frame of per-frame loops (minigame, waits) |
 | `timing_minigame_timeout` | 6 s | Base wait for a bite; grows after misses and tracks the longest bite seen |
 | `timing_recast_wait` | 4 s | Wait before the next cast when quick skip is off |
 
@@ -311,7 +329,7 @@ nothing points to one.
 
 | What | How |
 |------|-----|
-| Bite timeout | ×1.5 per consecutive miss, up to 30 s by the 5th cast (after which the bait key is taken to be empty); remembers the longest bite seen (`_bite_timeout`). A pause during the wait ends it without counting a miss |
+| Bite timeout | ×1.5 per consecutive miss, capped at `timing_minigame_timeout_cap` (60 s by default) (after which the bait key is taken to be empty); remembers the longest bite seen (`_bite_timeout`). A pause during the wait ends it without counting a miss, in classic mode too |
 | Catch wait | Inventory is watched for the new item instead of sleeping a fixed time |
 | Click lead | `_click_point`: fish speed from the last 150 ms of positions; the click is aimed where the fish will be when the button goes down (cursor settle + 4 ms) and skipped when that point is outside the circle |
 | Wait before next cast (quick skip off) | `RecastWaitTuner` (config `adaptive_recast_wait`, default on): starts at `timing_recast_wait`, shortens by 20 % after every 2 successful casts, floor 0.5 s. The first shortened wait followed by a missed bite is too short: it returns to the last working wait and stays. Two misses in a row at a proven wait give one step back. A settled wait is shared with the other windows (`_shared_recast_wait`) so each server costs one missed cast, not one per window. The adaptive wait is counted from the end of the game (`_wait_before_recast`): item handling and waiting for the mouse happen inside it. A cast that went out more than 0.5 s later than planned, or after a pause, is not fed back to the tuner. With `adaptive_recast_wait` off the configured wait is slept in full after item handling |
@@ -347,8 +365,12 @@ immediately when the window is already in front and otherwise polls for confirma
 
 ## Jigsaw Bot (`jigsaw_bot.py`)
 
-One worker per window, started from the Jigsaw Solver dialog (fishing is locked while the dialog
-is open; both use the same selected windows, `input_lock`, capture and F5). A round:
+One worker per window, started from the Dashboard when the activity switch (mode bar under the
+header, `ModeBar`) is on **Jigsaw Puzzle**. Fishing and Jigsaw share the main window: the same
+window rows (columns become Crates / Boards, row index = W number), inventory pages, Confirm point,
+`input_lock`, capture and F5. Only the selected activity can be started; the switch is locked while
+it runs. Jigsaw-only setup (grid, crate priority, solver move table) is on the JIGSAW tab
+(`JigsawTab`); `JigsawRunner` owns the workers. A round:
 
 1. Read the board (`detect_grid`), check the crate slots. Only crate kinds the priority setting
    opens are refilled from the inventory, and each kind is searched for once per run.
@@ -423,6 +445,42 @@ reach another client).
 `tests/test_adaptive_skins.py` covers the re-skin variants: off-center / smaller circle, filled
 disc, textured panel with timer bar and fish-colored icon, standard panel with a different fish,
 a panel that never closes, and a bad saved profile.
+
+## Safety Checks and Stop Reasons
+
+The bots never treat "could not see" as game state, and never click a saved
+point without first checking that the expected UI is under it. Every stop has
+its own reason (shown in the dashboard row):
+
+| Reason | When |
+|--------|------|
+| `capture_unavailable` | No usable frame (black, flat, failed) for 30 s. Casting is held after 5 s; blank frames never count as a missed bite or as the end of a game, and never cost bait |
+| `capture_overlap` | The window render is not trusted (screen capture) and this window overlaps another running bot's window |
+| (blank frame) | Windows, screen copy: another program's window is in front and overlaps the game. The screen is not read (the frame counts as blank, so no miss and no bait); 30 s of that ends in `capture_unavailable` |
+| `inventory_not_visible` | No readable page tab, empty slot or known item where the inventory is configured (checked before the first tab click, after a resume, before a page is called full) |
+| `false_detection` | Two "games" in a row whose panel never closed |
+| `fish_not_detected` | Three games in a row without a fish seen, with adaptive detection off |
+| `no_bite` | The miss limit was reached and no minigame (classic: no bite) was seen in the session: no bait tier is written off on that |
+| `window_unavailable` | Window closed, or it could not be brought to the front for 60 s |
+| `game_screen_lost` | From the 2nd miss in a row on, the inventory is looked for; gone twice (disconnect, death, login screen) stops the bot without writing off bait |
+| `keyboard_error` | The cast keys could not be sent 3 casts in a row (or there is no keyboard); a failed cast is never counted as a missed bite |
+| `repeated_error` | 10 exceptions in the main loop within 60 s |
+| `inventory_full`, `bait_depleted`, `manual`, `error` | As before |
+
+Fishing:
+- First calibration with the stock colors accepts a panel only between 120x100 px and 70 % of the window, and only if it was not there before the cast.
+- Drops are closed-loop (`_drop_sequence`): picked up → drop dialog seen → confirm dialog seen → dialog gone, slot empty. A missing dialog (or Stop pressed meanwhile) puts the item back in its slot; no confirm is clicked without its dialog. "Dialog seen" (`dialog_watch`) means the button patch changed and then held still for 3 reads; after a complete drop its look is learned, and later drops need that look. The ground point is `drop_ground_pos` (window center when unset). In the jigsaw bot, too, Confirm is clicked only after its dialog was seen (with a longer second look for a late one). Only a sure match is dropped (gray ≥ 0.90, or a color match ≥ 0.85). The foreground window is re-checked before every click.
+- The inventory strip ends with the item grid (`inventory_rows`, default 9 rows of 32 px). Slots marked occupied are released when they read empty again.
+- `classic_miss_limit` (default 3) misses in a row before the classic bait tier changes.
+
+Jigsaw:
+- `detect_grid` checks the configured rectangle: the frame and the cell dividers must be where a 6x4 grid puts them (`jigsaw_grid_check`, `jigsaw_grid_min_confidence` 0.6). Not found `jigsaw_grid_misses_before_pause` (4) times in a row: pause, no click.
+- Refused placements: the target cells are treated as filled from then on; `jigsaw_max_refused_placements` (2) in a row pause. `jigsaw_max_consecutive_discards` (12) discards in a row pause (endgame skips with ≤ 4 empty cells do not count). A board that reads full opens no crate.
+- The result dialog is clicked only when seen: by `jigsaw_confirm.png` if shipped, otherwise by a change at the result point (`jigsaw_result_button_pos`, default half width + 15 px, 63 % height) against a baseline taken before the crate.
+- Refill: the hand is checked before any refill click; a crate that does not arrive is put back into the inventory and the bot pauses; a page tab that could not be clicked does not write a crate kind off.
+- At start, a Confirm coordinate (or the parked point beside it) on the grid, a crate slot or the inventory refuses to start (`bad_layout`).
+
+Input lock: not re-entrant — a nested acquire raises instead of hanging every bot; holds over 0.5 s go to the diagnostic log.
 
 ## Known Limitations
 

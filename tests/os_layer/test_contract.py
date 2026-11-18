@@ -179,6 +179,34 @@ def test_render_window_returns_the_window_pixels(target, wm):
     _check_picture(frame, cx - left, cy - top, "render_window")
 
 
+def test_render_window_area_matches_the_full_render(target, wm):
+    area = getattr(platforms.native, "render_window_area", None)
+    if area is None:
+        pytest.skip("this OS renders only whole windows")
+    assert wm.activate_window()
+    _pump(target.root, 0.3)
+    left, top, width, height = wm.get_window_rect()
+    hwnd = wm._hwnd()
+    full = platforms.native.render_window(hwnd, width, height)
+    assert full is not None
+    fh, fw = full.shape[:2]
+    # Inside: the same pixels as the full render's crop.
+    part = area(hwnd, 100, 80, 120, 80)
+    assert part is not None and part.shape == (80, 120, 4)
+    assert np.array_equal(part[:, :, :3], full[80:160, 100:220, :3])
+    # Hanging over the right/bottom edge: the outside part is black.
+    part = area(hwnd, fw - 5, fh - 5, 20, 20)
+    assert part is not None and part.shape == (20, 20, 4)
+    assert np.array_equal(part[:5, :5, :3], full[fh - 5:, fw - 5:, :3])
+    assert not part[5:, :, :3].any() and not part[:, 5:, :3].any()
+    # Hanging over the left/top edge.
+    part = area(hwnd, -3, -2, 10, 10)
+    assert np.array_equal(part[2:, 3:, :3], full[:8, :7, :3])
+    assert not part[:2, :, :3].any() and not part[:, :3, :3].any()
+    # Entirely outside.
+    assert area(hwnd, fw + 10, 0, 10, 10) is None
+
+
 def test_window_capture_auto_mode_reads_the_game(target, wm):
     assert wm.activate_window()
     _pump(target.root, 0.3)

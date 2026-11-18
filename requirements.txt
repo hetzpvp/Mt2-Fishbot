@@ -24,3 +24,4 @@ python-xlib>=0.33; sys_platform == "linux"
 
 # Tests
 pytest>=8
+pytest-xdist>=3.8   # parallel unit tests (tools/run_tests.py)

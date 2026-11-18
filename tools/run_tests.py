@@ -14,6 +14,14 @@ Runs the test suites, the same way on Windows, Linux and in CI.
                                            keyboard input (and the Wine end-
                                            to-end test on Linux). Don't use
                                            the PC while they run.
+    python tools/run_tests.py --serial     unit tests in one process (default:
+                                           in parallel, see below).
+
+The unit tests run in parallel (pytest-xdist, one worker per physical CPU
+core): most of their time is the simulations waiting in real time, not CPU
+(about 2.5 min instead of 11.5 on 6 cores). ``-n N`` sets the number of workers. Without pytest-xdist
+installed they run serially. The OS-layer tests always run serially: they
+share one desktop and its focus.
 
 CI runs ``--os`` on Windows and on Linux (Xvfb).
 
@@ -30,7 +38,23 @@ import sys
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_FLAGS = ("--os", "--live", "--xvfb")
+_FLAGS = ("--os", "--live", "--xvfb", "--serial")
+
+
+def _parallel_args(argv) -> list:
+    """pytest-xdist options for the unit tests ([] = serial)."""
+    if "--serial" in argv or any(a == "-n" or a.startswith(("-n", "--numprocesses")) for a in argv):
+        return []           # serial asked for, or the worker count is given explicitly
+    try:
+        import xdist  # noqa: F401
+    except ImportError:
+        print("(pytest-xdist not installed: unit tests run serially — pip install pytest-xdist)")
+        return []
+    # One worker per physical core; tests handed out one by one (a single
+    # file of slow simulations would otherwise hold up the whole run). Each
+    # worker is its own process, so the stubbed OS modules stay isolated.
+    # More workers than cores made the real-time simulations flaky.
+    return ["-n", "auto", "--dist", "worksteal"]
 
 
 class VirtualDisplay:
@@ -73,10 +97,23 @@ def main(argv) -> int:
     if xvfb and not sys.platform.startswith("linux"):
         sys.exit("--xvfb is Linux only")
 
-    runs = [("unit tests", ["tests", "--ignore=tests/os_layer"], None)]
+    # Worker-count options only go to the unit tests: the OS-layer tests share
+    # one desktop (focus, cursor) and must run one at a time.
+    serial_extra, i = [], 0
+    while i < len(extra):
+        a = extra[i]
+        if a in ("-n", "--numprocesses", "--dist"):
+            i += 2
+            continue
+        if not a.startswith(("-n", "--numprocesses=", "--dist=")):
+            serial_extra.append(a)
+        i += 1
+
+    runs = [("unit tests", ["tests", "--ignore=tests/os_layer", *_parallel_args(argv), *extra], None)]
     if os_tests:
         flags = ["--live"] if live else ["--os"]
-        runs.append(("OS-layer tests" + (" (live input)" if live else ""), ["tests/os_layer", *flags], "xvfb" if xvfb else None))
+        runs.append(("OS-layer tests" + (" (live input)" if live else ""),
+                     ["tests/os_layer", *flags, *serial_extra], "xvfb" if xvfb else None))
 
     failed = []
     for label, args, display in runs:
@@ -84,7 +121,7 @@ def main(argv) -> int:
         where = f" on virtual display {vd.display}" if vd else ""
         print(f"\n===== {label}{where} =====", flush=True)
         try:
-            code = subprocess.call([sys.executable, "-m", "pytest", "-rs", *args, *extra], cwd=ROOT,
+            code = subprocess.call([sys.executable, "-m", "pytest", "-rs", *args], cwd=ROOT,
                                    env=vd.env if vd else None)
         finally:
             if vd:

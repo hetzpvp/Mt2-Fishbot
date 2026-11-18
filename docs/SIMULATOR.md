@@ -94,7 +94,7 @@ wrong on real clients. All are off by default.
 | `wander=True` | `--wander` | the panel opens somewhere else for every game | re-finds it; after the first move it scans the whole window from the start of the wait instead of after 2 s |
 | `move_panel(dx, dy)` | | the player drags the open panel | notices that only part of the panel is left in the region and follows it; the game is not taken to be over |
 | `skins=[...]` | `--change-look` | every game uses the next look | recognizes a look it has seen, learns a new one in the same cast (the place where the panel opens changed but the active colors do not match) |
-| `bite_delay=(a, b)` | `--bite-delay A B` | bites far beyond the configured timeout | the timeout grows with every miss (up to 30 s) and then follows the longest bite seen |
+| `bite_delay=(a, b)` | `--bite-delay A B` | bites far beyond the configured timeout | the timeout grows with every miss (up to `timing_minigame_timeout_cap`, 60 s) and then follows the longest bite seen |
 | `catch_delay=(a, b)` | `--lag` | the item lands that long after the panel closed | watches the inventory instead of sleeping a fixed time |
 | `blank_chance` | `--hiccups` | that share of captures comes back black | a game ends only after 3 frames without the panel and a look at the whole window |
 | `popup_chance` | `--popups` | another game window (whisper, shop...) opens while the line is out | a new look is only accepted at the size of the known panel |
@@ -136,7 +136,7 @@ The bot's crate choice is `jigsaw_crate_priority`:
 | Value | Behaviour |
 |---|---|
 | `normal_first` | only normal crates |
-| `special_first` | special crates while there are any, then normal |
+| `special_first` | special crates while there are any, then normal; a normal crate where the 3x2 piece has no room |
 | `special_when_better` | a special crate only on a board where its 3x2 piece is expected to save at least `jigsaw_special_min_gain` rounds (default 1.0) compared with normal crates, or when no normal crate is left |
 
 ### Watching the bot play

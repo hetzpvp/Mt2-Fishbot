@@ -31,6 +31,7 @@ returns an object with pynput's ``press(key)`` / ``release(key)`` interface.
 from __future__ import annotations
 
 import ctypes
+import sys
 import threading
 from ctypes import wintypes
 from typing import Optional, Tuple
@@ -40,6 +41,7 @@ try:
 except Exception:  # not installed on Linux, where it is not used
     pyautogui = None
 
+import diag
 import platforms
 
 from interception_wrapper import (
@@ -266,6 +268,7 @@ def _create_linux_mouse(requested: str, status_callback, bot_id: int):
         try:
             return _get_uinput_mouse()
         except Exception as e:
+            diag.exc("uinput mouse unavailable, using XTest", tag=f"W{bot_id + 1}")
             if status_callback:
                 try:
                     status_callback(f"[W{bot_id+1}] uinput unavailable ({e}); using XTest")
@@ -285,6 +288,7 @@ def create_keyboard_controller(config: Optional[dict] = None, status_callback=No
         try:
             return _get_uinput_keyboard()
         except Exception as e:
+            diag.exc("uinput keyboard unavailable, using XTest", tag=f"W{bot_id + 1}")
             if status_callback:
                 try:
                     status_callback(f"[W{bot_id+1}] uinput keyboard unavailable ({e}); using XTest")
@@ -294,6 +298,7 @@ def create_keyboard_controller(config: Optional[dict] = None, status_callback=No
         from pynput.keyboard import Controller
         return Controller()
     except Exception:
+        diag.exc("no keyboard injection available (pynput Controller failed)", tag=f"W{bot_id + 1}")
         return None
 
 
@@ -410,6 +415,8 @@ def create_mouse_backend(config: Optional[dict] = None, status_callback=None,
     # Failure path: in "auto" we silently fall back; in explicit
     # "interception" we still fall back so the bot can run, but log to the
     # status callback if available.
+    diag.log("ACTION", f"mouse backend: requested={requested!r} -> PyAutoGUI fallback "
+                       f"(interception error: {last_load_error()})", tag=f"W{bot_id + 1}")
     if requested == "interception" and status_callback:
         try:
             err = last_load_error() or "interception unavailable"
@@ -417,6 +424,10 @@ def create_mouse_backend(config: Optional[dict] = None, status_callback=None,
         except Exception:
             pass
     return PyAutoGuiMouseBackend()
+
+
+diag.trace_module(sys.modules[__name__], ("probe_backend", "create_mouse_backend",
+                                          "create_keyboard_controller", "_probe_linux"))
 
 
 if __name__ == "__main__":

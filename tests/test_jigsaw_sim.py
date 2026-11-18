@@ -269,8 +269,10 @@ class JigsawSimTests(unittest.TestCase):
         game = JigsawGame(seed=6, dialog_delay=0.3)
         rig = Rig([game], {"jigsaw_dialog_wait_timeout": 0.1})
         self.assertTrue(rig.run(lambda: game.placed >= 4, timeout=90), rig.logs[-12:])
-        self.assertGreater(game.early_confirms, 0)     # the first confirm was lost ...
-        self.assert_in_step(rig)                       # ... and the bot still got the piece
+        # A dialog later than the wait is waited for a little longer rather
+        # than confirmed blindly (a confirm with no dialog hits the world).
+        self.assertEqual(game.early_confirms, 0)
+        self.assert_in_step(rig)
 
     def test_board_completion(self):
         game = JigsawGame(pieces=[0] * 40)             # single cells only
@@ -420,7 +422,8 @@ class JigsawHardTests(unittest.TestCase):
         rig = Rig([game], {"jigsaw_dialog_wait_timeout": 0.1})
         self.assertTrue(rig.run(lambda: game.discarded >= 3, timeout=120), rig.logs[-12:])
         self.assert_in_step(rig)
-        self.assertTrue(any("still on the cursor after the discard" in m for m in rig.logs), rig.logs[-12:])
+        # The confirm waits for the late dialog instead of going out early.
+        self.assertEqual(game.early_confirms, 0, rig.logs[-12:])
 
     def test_stop_in_the_middle_of_a_round_sends_nothing_more(self):
         games = [JigsawGame(left=i * W, seed=70 + i, dialog_delay=(0.0, 0.1)) for i in range(3)]

@@ -21,6 +21,7 @@ a = Analysis(
     hiddenimports=[
         # Only explicitly list what's actually imported
         'version',
+        'diag',
         'PIL.Image',
         'PIL.ImageTk',
         'PIL.GifImagePlugin',  # For monkey-eating.gif
@@ -47,12 +48,13 @@ a = Analysis(
         'jigsaw_bot',
         'jigsaw_detector',
         'jigsaw_solver',
+        'debug_host',          # Tk debug windows (DEBUG_MODE_EN), imported lazily
         'jigsaw_solver.deterministic',
         'jigsaw_solver.jigsaw',
         'jigsaw_solver.solver',
-        'jigsaw_solver.app',
-        'jigsaw_solver.main',
-        'jigsaw_solver.fishing_jigsaw_solver',
+        'jigsaw_solver.cache_location',
+        # Not bundled: jigsaw_solver.app / .main / .fishing_jigsaw_solver are
+        # the old stand-alone Tk solver, which the bot does not use.
     ],
     hookspath=[os.path.join(PROJECT_ROOT, 'packaging', 'hooks')],
     hooksconfig={},
@@ -73,7 +75,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='Fishing Puzzle Player v2.0.1',
+    name='Fishing Puzzle Player v2.0.2',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,  # strip is Linux-only, doesn't work on Windows

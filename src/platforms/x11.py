@@ -27,6 +27,7 @@ module.
 """
 
 import os
+import sys
 import threading
 from typing import List, Optional, Tuple
 
@@ -266,6 +267,38 @@ def render_window(handle, width: int, height: int) -> Optional[np.ndarray]:
     return np.frombuffer(data, dtype=np.uint8).reshape(height, width, 4)
 
 
+def render_window_area(handle, x: int, y: int, width: int, height: int) -> Optional[np.ndarray]:
+    """Only the rectangle (x, y, width, height) of the window's own pixels,
+    as a (height, width, 4) BGRA array; the part outside the window is black.
+    None when none of it lies inside the window, or on failure.
+
+    The X server sends just that rectangle: a 260x200 panel is 0.4 ms where
+    the whole 1280x720 window is 7 ms (python-xlib reads the reply in Python,
+    so the cost grows with the bytes sent)."""
+    if not handle or width <= 0 or height <= 0:
+        return None
+    try:
+        w = _win(handle)
+        g = w.get_geometry()
+        x1, y1 = max(0, int(x)), max(0, int(y))
+        x2, y2 = min(int(g.width), int(x) + width), min(int(g.height), int(y) + height)
+        if x2 <= x1 or y2 <= y1:
+            return None
+        img = w.get_image(x1, y1, x2 - x1, y2 - y1, X.ZPixmap, 0xFFFFFFFF)
+    except Exception:
+        return None
+    cw, ch = x2 - x1, y2 - y1
+    data = img.data
+    if len(data) != cw * ch * 4:  # only 24/32-bit visuals (4 bytes per pixel)
+        return None
+    part = np.frombuffer(data, dtype=np.uint8).reshape(ch, cw, 4)
+    if (cw, ch) == (width, height):
+        return part
+    out = np.zeros((height, width, 4), dtype=np.uint8)
+    out[y1 - y:y2 - y, x1 - x:x2 - x] = part
+    return out
+
+
 def screen_capture_reliable() -> bool:
     """Whether copying the desktop (mss) shows the game. XWayland cannot
     read the root window, so only a real Xorg session (or Xvfb) can.
@@ -306,3 +339,10 @@ def evdev_code_for_char(ch: str) -> Optional[int]:
     except Exception:
         return None
     return keycode - 8 if keycode and keycode > 8 else None
+
+
+# Diagnostic log: the requests that change the desktop are traced.
+import diag  # noqa: E402
+
+diag.trace_module(sys.modules[__name__], ("list_windows", "set_foreground", "force_foreground", "restore",
+                                          "screen_capture_reliable", "desktop_size"))

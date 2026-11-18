@@ -17,7 +17,7 @@ install()
 import platforms  # noqa: E402
 import screen_capture  # noqa: E402
 from screen_capture import WindowCapture  # noqa: E402
-from window_manager import WindowManager  # noqa: E402
+from window_manager import WindowManager, window_size_mismatch  # noqa: E402
 
 
 class FakeWin:
@@ -225,6 +225,23 @@ class CaptureModeTests(NativeSwap):
         platforms.native = None
         self.assertIsNone(screen_capture.print_window(1, 2, 2))
 
+
+class WindowSizeCheckTests(unittest.TestCase):
+    """Start check: every selected client must have the same size."""
+
+    def test_same_size_passes(self):
+        self.assertIsNone(window_size_mismatch([("Metin2 (1)", (1024, 768)), ("Metin2 (2)", (1024, 768))]))
+
+    def test_single_or_no_window_passes(self):
+        self.assertIsNone(window_size_mismatch([]))
+        self.assertIsNone(window_size_mismatch([("Metin2", (800, 600))]))
+
+    def test_different_size_lists_every_window(self):
+        msg = window_size_mismatch([("Metin2 (1)", (1024, 768)), ("Metin2 (2)", (800, 600)),
+                                    ("Metin2 (3)", (1024, 768))])
+        self.assertIsNotNone(msg)
+        for line in ("Metin2 (1): 1024 x 768", "Metin2 (2): 800 x 600", "Metin2 (3): 1024 x 768"):
+            self.assertIn(line, msg)
 
 if __name__ == "__main__":
     unittest.main()

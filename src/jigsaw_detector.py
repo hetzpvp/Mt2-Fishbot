@@ -1,8 +1,10 @@
 """
 Computer-vision helpers for the Fishing Jigsaw event window.
 
-The grid location is user-defined. The detector only evaluates occupancy inside
-that configured rectangle; it does not image-match or infer the grid position.
+The grid location is user-defined. The detector does not search for the grid;
+it checks that the configured rectangle really shows it (the frame and the
+cell dividers sit where a 6 x 4 grid puts them, see ``grid_structure``) and
+only then reads the occupancy of its cells.
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ from typing import Dict, List, Optional, Set, Tuple
 import cv2
 import numpy as np
 
+import diag
 from utils import get_resource_path
 
 
@@ -39,6 +42,7 @@ class JigsawPieceResult:
     source_section: str
     confidence: float
     figure_index: Optional[int] = None
+    colored_pixels: int = -1    # piece-colored pixels at the cursor (0: nothing held; -1: not measured)
 
 
 @dataclass
@@ -117,11 +121,120 @@ class JigsawDetector:
         self._piece_color_refs: Dict[str, Tuple[np.ndarray, Optional[int]]] = {}
         self._piece_color_models: Dict[str, PieceColorModel] = {}
 
+    # Grid check (grid_structure): a line counts as seen when its edge is this
+    # many times stronger than the inside of the cells next to it, and at
+    # least this strong in absolute terms (Sobel units: a step of ~6 levels).
+    _LINE_RATIO = 2.0
+    _LINE_FLOOR = 24.0
+
+    def grid_structure(self, frame: np.ndarray, bounds: Rect) -> Tuple[float, str]:
+        """How well the rectangle ``bounds`` shows a 6 x 4 grid: (score 0..1,
+        detail). Looks for an edge where each of the 7 + 5 frame and divider
+        lines must lie, segment by segment (one segment per cell along the
+        line), compared with the edges inside the neighbouring cells. Placed
+        pieces leave the lines in place; the game world, a closed puzzle or
+        a rectangle shifted by about a cell does not line up with them.
+
+        The four frame sides decide: each must be seen on at least half of
+        its segments (a rectangle shifted by about a cell puts one side over
+        plain background, a closed or covered puzzle shows none). Then the
+        score is 0.6 plus up to 0.4 for the dividers seen (pieces drawn over
+        them may hide some); otherwise it is at most 0.25."""
+        x, y, w, h = bounds
+        frame_h, frame_w = frame.shape[:2]
+        cols, rows = self.COLS, self.ROWS
+        cw, ch = w / cols, h / rows
+        tol = max(3, int(round(min(cw, ch) * 0.09)))
+        margin = tol + 2
+        x0, y0 = max(0, x - margin), max(0, y - margin)
+        x1, y1 = min(frame_w, x + w + margin), min(frame_h, y + h + margin)
+        roi = frame[y0:y1, x0:x1]
+        if roi.size == 0 or cw < 6 or ch < 6:
+            return 0.0, "grid area empty or too small"
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        ex = np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))   # vertical lines
+        ey = np.abs(cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3))   # horizontal lines
+        ox, oy = x - x0, y - y0
+        rh, rw = gray.shape
+
+        def seen(energy, line_pos, span, cell, across_len, vertical):
+            """One segment: line at ``line_pos`` (roi coords, across the
+            line), along-line pixel range ``span``."""
+            a, b = span
+            if b - a < 3:
+                return None
+            if vertical:
+                profile = energy[a:b, :].mean(axis=0)
+            else:
+                profile = energy[:, a:b].mean(axis=1)
+            lo, hi = int(round(line_pos)) - tol, int(round(line_pos)) + tol + 1
+            lo, hi = max(0, lo), min(across_len, hi)
+            if hi <= lo:
+                return False
+            line = float(profile[lo:hi].max())
+            refs = []
+            for side in (-1, 1):
+                c0 = int(round(line_pos + side * 0.25 * cell))
+                c1 = int(round(line_pos + side * 0.75 * cell))
+                c0, c1 = sorted((c0, c1))
+                c0, c1 = max(0, c0), min(across_len, c1)
+                if c1 - c0 >= 2:
+                    refs.append(float(profile[c0:c1].mean()))
+            inside = max(refs) if refs else 0.0
+            return line >= max(self._LINE_FLOOR, self._LINE_RATIO * inside)
+
+        sides = {"left": [], "right": [], "top": [], "bottom": []}
+        inner = []
+        for k in range(cols + 1):                     # vertical lines, one segment per row
+            pos = ox + k * cw
+            for r in range(rows):
+                span = (max(0, int(oy + (r + 0.2) * ch)), min(rh, int(oy + (r + 0.8) * ch)))
+                hit = seen(ex, pos, span, cw, rw, True)
+                if hit is None:
+                    continue
+                (sides["left"] if k == 0 else sides["right"] if k == cols else inner).append(hit)
+        for k in range(rows + 1):                     # horizontal lines, one segment per column
+            pos = oy + k * ch
+            for c in range(cols):
+                span = (max(0, int(ox + (c + 0.2) * cw)), min(rw, int(ox + (c + 0.8) * cw)))
+                hit = seen(ey, pos, span, ch, rh, False)
+                if hit is None:
+                    continue
+                (sides["top"] if k == 0 else sides["bottom"] if k == rows else inner).append(hit)
+
+        every = inner + [h_ for v in sides.values() for h_ in v]
+        share = sum(every) / len(every) if every else 0.0
+        side_share = {n: (sum(v) / len(v) if v else 0.0) for n, v in sides.items()}
+        frame_ok = all(v >= 0.5 for v in side_share.values())
+        inner_share = sum(inner) / len(inner) if inner else 0.0
+        score = 0.6 + 0.4 * inner_share if frame_ok else min(share, 0.25)
+        detail = (f"lines seen {sum(every)}/{len(every)}, frame sides "
+                  + " ".join(f"{n}={v:.2f}" for n, v in side_share.items()) + f" (tol {tol}px)")
+        return score, detail
+
     def detect_grid(self, frame: np.ndarray) -> JigsawGridResult:
-        """Read the configured 6x4 grid and return board occupancy as a 24-bit mask."""
+        """Read the configured 6x4 grid and return board occupancy as a 24-bit mask.
+
+        ``grid_found`` is False when the configured rectangle does not show
+        the puzzle grid (window closed, moved or covered): its cells must
+        not be read, and nothing must be clicked there."""
         bounds = self._configured_grid_bounds(frame)
         if bounds is None:
+            diag.log("ANALYSIS", f"grid NOT found: configured jigsaw_grid_bounds="
+                                 f"{self.config.get('jigsaw_grid_bounds')} vs frame {frame.shape[1]}x{frame.shape[0]} "
+                                 f"({diag.array_summary(frame)})")
             return JigsawGridResult(False, None, [], 0, 0.0)
+
+        confidence = 1.0
+        if self.config.get("jigsaw_grid_check", True):
+            confidence, detail = self.grid_structure(frame, bounds)
+            min_conf = float(self.config.get("jigsaw_grid_min_confidence", 0.6))
+            if confidence < min_conf:
+                diag.log("ANALYSIS", f"grid NOT found at the configured bounds {bounds}: structure score "
+                                     f"{confidence:.2f} < {min_conf} ({detail})")
+                return JigsawGridResult(False, bounds, [], 0, confidence)
+            if diag.ENABLED:
+                diag.trace("ANALYSIS", f"grid structure at {bounds}: {confidence:.2f} ({detail})")
 
         x, y, w, h = bounds
         cell_w = w / self.COLS
@@ -167,7 +280,11 @@ class JigsawDetector:
                     board_mask |= (1 << (self.ROWS * self.COLS - 1)) >> action
                     filled_cells.add(row * self.COLS + col)
 
-        return JigsawGridResult(True, bounds, centers, board_mask, 1.0, filled_cells)
+        if diag.ENABLED:
+            diag.trace("ANALYSIS", f"grid {bounds}: filled cells {sorted(filled_cells)} "
+                                   f"board_mask={board_mask:024b} ({len(filled_cells)}/24), grid area "
+                                   f"{diag.array_summary(grid_roi)}")
+        return JigsawGridResult(True, bounds, centers, board_mask, confidence, filled_cells)
 
     def _configured_grid_bounds(self, frame: np.ndarray) -> Optional[Rect]:
         value = self.config.get("jigsaw_grid_bounds")
@@ -285,11 +402,11 @@ class JigsawDetector:
             x, y, w, h, _ = match
             return (x + w // 2, y + h // 2)
 
-        # Fallback: most Metin2 confirm dialogs place the OK button in the lower
-        # middle of the active modal. This is deliberately conservative and can
-        # be replaced by adding jigsaw_confirm.png / jigsaw_discard_confirm.png.
-        h, w = frame.shape[:2]
-        return (w // 2, int(h * 0.63))
+        # No template, or it did not match: no position. A guessed point
+        # (the old "lower middle of the window") was clicked whether the
+        # dialog was there or not.
+        diag.trace("ANALYSIS", f"{key} button template not matched: no position")
+        return None
 
     def detect_cursor_piece(self, frame: np.ndarray, cursor_pos: Optional[Point] = None) -> JigsawPieceResult:
         """Identify active cursor piece from a small color sample around the cursor."""
@@ -300,50 +417,50 @@ class JigsawDetector:
         roi, _ = self._cursor_color_roi(frame, cursor_pos)
         piece_pixels = self._piece_pixel_mask(roi)
         if piece_pixels is None or int(np.count_nonzero(piece_pixels)) == 0:
-            return JigsawPieceResult(None, 0, "unknown", 0.0, None)
+            diag.trace("ANALYSIS", f"cursor piece: no piece-colored pixels in roi {diag.array_summary(roi)} "
+                                   f"around {cursor_pos}")
+            return JigsawPieceResult(None, 0, "unknown", 0.0, None, 0 if piece_pixels is not None else -1)
+        colored = int(np.count_nonzero(piece_pixels))
 
         scored = self._score_cursor_piece_colors(roi, piece_pixels)
         if not scored:
-            return JigsawPieceResult(None, 0, "unknown", 0.0, None)
+            diag.trace("ANALYSIS", f"cursor piece: {colored} colored pixels but too few "
+                                   f"confident ones (jigsaw_piece_min_pixels) around {cursor_pos}")
+            return JigsawPieceResult(None, 0, "unknown", 0.0, None, colored)
 
         best_id, confidence, best_index = scored[0]
         second_score = scored[1][1] if len(scored) > 1 else 0.0
         margin = confidence - second_score
         threshold = float(self.config.get("jigsaw_piece_color_confidence_threshold", self.piece_threshold))
         min_margin = float(self.config.get("jigsaw_piece_score_margin_min", 0.06))
+        if diag.ENABLED:
+            diag.trace("ANALYSIS", f"cursor piece scores: " + ", ".join(f"{p}={c:.3f}" for p, c, _ in scored[:6])
+                       + f" threshold={threshold} margin={margin:.3f} (min {min_margin}) -> "
+                       + ("UNKNOWN" if best_id is None or confidence < threshold or margin < min_margin else best_id))
         if best_id is None or confidence < threshold or margin < min_margin:
-            return JigsawPieceResult(None, 0, "unknown", confidence, None)
+            return JigsawPieceResult(None, 0, "unknown", confidence, None, colored)
 
         # The actual bitmask is resolved by JigsawBot from the shared registry.
-        return JigsawPieceResult(best_id, 0, "cursor", confidence, best_index)
+        return JigsawPieceResult(best_id, 0, "cursor", confidence, best_index, colored)
 
     def _cell_is_filled(self, frame: np.ndarray, gx: int, gy: int, cell_w: float, cell_h: float, col: int, row: int) -> bool:
-        pad_x = max(6, int(cell_w * 0.24))
-        pad_y = max(6, int(cell_h * 0.24))
-        x1 = int(gx + col * cell_w + pad_x)
-        y1 = int(gy + row * cell_h + pad_y)
-        x2 = int(gx + (col + 1) * cell_w - pad_x)
-        y2 = int(gy + (row + 1) * cell_h - pad_y)
-        cell = frame[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
-        if cell.size == 0:
+        """One cell of a grid whose corner is (gx, gy) in ``frame``, judged by
+        the same test detect_grid uses for every cell (_grid_cell_is_filled)."""
+        roi = frame[max(0, int(gy)):, max(0, int(gx)):]
+        if roi.size == 0:
             return False
-        gray = cv2.cvtColor(cell, cv2.COLOR_BGR2GRAY)
-        hsv = cv2.cvtColor(cell, cv2.COLOR_BGR2HSV)
-        mean = float(np.mean(gray))
-        std = float(np.std(gray))
-        bright_ratio = float(np.mean(gray > int(self.config.get("jigsaw_cell_bright_min", 64))))
-        sat_ratio = float(np.mean(hsv[:, :, 1] > int(self.config.get("jigsaw_cell_saturation_min", 45))))
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         edges = cv2.Canny(gray, 35, 90)
-        edge_ratio = float(np.mean(edges > 0))
-
-        # Empty cells usually contain only the dark board well. Pieces add color,
-        # highlights, and internal edges; using several weak signals avoids
-        # classifying a shiny empty border as an occupied cell.
-        return (
-            mean > float(self.config.get("jigsaw_cell_mean_filled_min", 58.0))
-            or bright_ratio > float(self.config.get("jigsaw_cell_bright_ratio_min", 0.10))
-            or (sat_ratio > float(self.config.get("jigsaw_cell_saturation_ratio_min", 0.12)) and std > 14.0)
-            or edge_ratio > float(self.config.get("jigsaw_cell_edge_ratio_min", 0.070))
+        cfg = self.config
+        return self._grid_cell_is_filled(
+            gray, hsv, edges, cell_w, cell_h, col, row,
+            int(cfg.get("jigsaw_cell_bright_min", 64)),
+            int(cfg.get("jigsaw_cell_saturation_min", 45)),
+            float(cfg.get("jigsaw_cell_mean_filled_min", 58.0)),
+            float(cfg.get("jigsaw_cell_bright_ratio_min", 0.10)),
+            float(cfg.get("jigsaw_cell_saturation_ratio_min", 0.12)),
+            float(cfg.get("jigsaw_cell_edge_ratio_min", 0.070)),
         )
 
     def _grid_cell_is_filled(
@@ -381,6 +498,9 @@ class JigsawDetector:
         bright_ratio = float(np.mean(gray > bright_min))
         sat_ratio = float(np.mean(hsv[:, :, 1] > sat_min))
         edge_ratio = float(np.mean(edges > 0))
+        # Empty cells usually contain only the dark board well. Pieces add color,
+        # highlights, and internal edges; using several weak signals avoids
+        # classifying a shiny empty border as an occupied cell.
         return (
             mean > mean_min
             or bright_ratio > bright_ratio_min
@@ -442,6 +562,11 @@ class JigsawDetector:
             return None
         result = cv2.matchTemplate(search_gray, template, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, max_loc = cv2.minMaxLoc(result)
+        if diag.ENABLED:
+            diag.trace("ANALYSIS", f"template {key}: best={max_val:.3f} at "
+                                   f"({max_loc[0] + offset_x + tw // 2},{max_loc[1] + offset_y + th // 2}) "
+                                   f"threshold={self.threshold} search={search_rect} -> "
+                                   f"{'match' if max_val >= self.threshold else 'no match'}")
         if max_val < self.threshold:
             return None
         return (max_loc[0] + offset_x, max_loc[1] + offset_y, tw, th, float(max_val))
@@ -503,6 +628,10 @@ class JigsawDetector:
             and edge_ratio < float(self.config.get("jigsaw_empty_slot_edge_ratio_max", 0.065))
         )
         available_score = min(1.0, max(bright_ratio * 3.0, sat_ratio * 2.5, edge_ratio * 5.0, std / 55.0))
+        if diag.ENABLED:
+            diag.trace("ANALYSIS", f"crate slot at {center}: mean={mean:.1f} std={std:.1f} sat_ratio={sat_ratio:.3f} "
+                                   f"bright_ratio={bright_ratio:.3f} edge_ratio={edge_ratio:.3f} -> "
+                                   f"{'EMPTY' if empty else 'crate present'}")
         return empty, (1.0 - available_score if empty else max(0.50, available_score))
 
     def _load_optional_template(self, key: str) -> Optional[np.ndarray]:
@@ -520,9 +649,12 @@ class JigsawDetector:
             if path:
                 break
         if not path:
+            diag.log("ANALYSIS", f"optional jigsaw template '{key}' ({filenames}) not found: fallback used")
             self._template_cache[key] = None
             return None
         img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        diag.log("ANALYSIS", f"jigsaw template '{key}' loaded from {path}: "
+                             f"{None if img is None else img.shape}")
         self._template_cache[key] = img
         return img
 
@@ -723,3 +855,12 @@ class JigsawDetector:
         if priority in ("special_first", "special_when_better"):
             return ["special", "normal"]
         return ["normal"]
+
+
+# Diagnostic log: entry/exit of the detector's methods. The per-cell helpers
+# run 24 times per board read and are left out.
+diag.trace_class(JigsawDetector, exclude=(
+    "_cell_is_filled", "_grid_cell_is_filled", "_hsv_distance_image", "_hsv_distance_pixels_to_refs",
+    "_hsv_distance", "_piece_pixel_mask", "_dominant_piece_hsv", "_cursor_roi", "_cursor_color_roi",
+    "_find_asset", "_load_optional_template", "_crate_order", "_load_piece_color_refs",
+))

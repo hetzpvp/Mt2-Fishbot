@@ -7,16 +7,20 @@ from __future__ import annotations
 import os
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dc_replace
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import cv2
 import numpy as np
 
 from jigsaw_detector import CrateSlotState, CrateTarget, JigsawActionResult, JigsawDetector, JigsawGridResult
+import diag
 from humanize import Humanizer
 from input_backend import create_mouse_backend
-from screen_capture import WindowCapture
+import screen_capture
+from screen_capture import WindowCapture, frame_usable
+import inventory_layout
+import dialog_watch
 from utils import DEBUG_MODE_EN, DEBUG_PRINTS, get_project_root, input_lock
 from window_manager import WindowManager
 
@@ -35,10 +39,19 @@ _listener_subscribers: List["JigsawBot"] = []
 _shared_listener: Optional["keyboard.Listener"] = None
 
 
+_F5_DEBOUNCE = 0.5          # seconds: a held F5 repeats, and each repeat would toggle again
+_last_f5 = float("-inf")
+
+
 def _shared_on_press(key) -> None:
+    global _last_f5
     if Key is None or key != Key.f5:
         return
     with _listener_lock:
+        now = time.monotonic()
+        if now - _last_f5 < _F5_DEBOUNCE:
+            return
+        _last_f5 = now
         subscribers = list(_listener_subscribers)
     # One decision for all windows: if any is paused, F5 resumes everything,
     # otherwise it pauses everything. Toggling each bot on its own left the
@@ -48,6 +61,7 @@ def _shared_on_press(key) -> None:
         try:
             bot._on_f5_pressed(target)
         except Exception:
+            diag.exc()
             pass
 
 
@@ -73,6 +87,7 @@ def _unregister_pause_subscriber(bot: "JigsawBot") -> None:
             try:
                 _shared_listener.stop()
             except Exception:
+                diag.exc()
                 pass
             _shared_listener = None
 
@@ -101,8 +116,88 @@ def _mask_from_offsets(offsets: Iterable[Tuple[int, int]]) -> int:
     return mask
 
 
+@dataclass
+class LayoutProblem:
+    """A place the bot would click or rest the cursor that is not safe."""
+    what: str            # "confirm" or "park"
+    lies_on: str         # "puzzle grid", "normal crate slot", "special crate slot", "inventory"
+    point: Tuple[int, int]
+    message: str         # what is wrong and what to do, for the user
+    help_topic: str      # help_visuals topic that shows it
+
+
+def layout_problem(config: dict, win_w: Optional[int] = None, win_h: Optional[int] = None) -> Optional[LayoutProblem]:
+    """Checks the jigsaw layout before a start: the Confirm point and the
+    point the cursor rests at (beside it, holding a piece) must lie clear of
+    the puzzle grid, the crate slots and the inventory. The bot clicks the
+    Confirm point whenever it believes a dialog is up, and parks a held piece
+    at the other point: over the grid either one would place a piece blind.
+
+    The usual cause is the puzzle window itself: the game opens its confirm
+    dialog ("open the crate?") in the middle of the screen, so a puzzle
+    window placed under it has the dialog's buttons over its grid.
+    Returns None when the layout is fine or cannot be checked."""
+    confirm = config.get("confirm_button_pos")
+    bounds = config.get("jigsaw_grid_bounds")
+    try:
+        cx, cy = int(confirm[0]), int(confirm[1])
+        gx, gy, gw, gh = [int(round(float(v))) for v in bounds]
+    except (TypeError, ValueError, IndexError):
+        return None
+    shift_px = int(config.get("jigsaw_post_crate_cursor_right_px", 24))
+    detector = JigsawDetector(config)
+    slots = detector._crate_slot_centers(JigsawGridResult(True, (gx, gy, gw, gh), [], 0, 1.0))
+    strip = None
+    if win_w and win_h:
+        try:
+            rect, source = inventory_layout.strip_rect(
+                config, int(win_w), int(win_h),
+                int(config.get("inventory_capture_width", inventory_layout.FALLBACK_WIDTH)),
+                int(config.get("inventory_y_offset", inventory_layout.FALLBACK_TOP)))
+            if source == "tabs":
+                strip = rect
+        except Exception:
+            diag.exc("layout check: inventory strip")
+    pad = 6
+    fix_window = ("Move the puzzle window away from the middle of the game screen (for example to the "
+                  "top left), so the game's confirm dialog no longer covers it. Then press Define Grid and "
+                  "Set Confirm Coords again.")
+    for what, (x, y) in (("confirm", (cx, cy)), ("park", (cx + shift_px, cy))):
+        lies_on = None
+        if gx - pad <= x < gx + gw + pad and gy - pad <= y < gy + gh + pad:
+            lies_on = "puzzle grid"
+        else:
+            for section, (sx, sy) in slots.items():
+                if abs(x - sx) <= 22 and abs(y - sy) <= 20:
+                    lies_on = f"{section} crate slot"
+                    break
+        if lies_on is None and strip is not None:
+            ix, iy, iw, ih = strip
+            if ix <= x < ix + iw and iy <= y < iy + ih:
+                lies_on = "inventory"
+        if lies_on is None:
+            continue
+        if what == "confirm":
+            head = (f"The Confirm point ({x}, {y}) lies on the {lies_on}. The bot clicks it every time it "
+                    f"confirms a dialog; there it would click the {lies_on} instead whenever the dialog is "
+                    f"slow to appear.")
+        else:
+            head = (f"While it holds a piece, the bot rests the cursor {shift_px} px right of the Confirm "
+                    f"point, at ({x}, {y}) — that is on the {lies_on}, where the held piece could be "
+                    f"dropped by accident.")
+        if lies_on == "inventory":
+            fix = ("Move the puzzle window so the game's confirm dialog does not open over the inventory "
+                   "(or move the inventory), then press Set Confirm Coords again.")
+        else:
+            fix = fix_window
+        return LayoutProblem(what, lies_on, (x, y), f"{head}\n\n{fix}", "jigsaw_layout")
+    return None
+
+
 class JigsawBot:
     """Runs one jigsaw automation worker for one game window."""
+
+    _CAPTURE_STOP_AFTER = 30.0   # seconds without a usable frame before the worker stops
 
     def __init__(
         self,
@@ -117,6 +212,11 @@ class JigsawBot:
         self.window_manager = window_manager
         self.config = config
         self.bot_id = bot_id
+        self.diag_tag = f"W{bot_id + 1}"
+        try:
+            window_manager.diag_tag = self.diag_tag
+        except Exception:
+            pass
         self.on_status_update = on_status_update
         self.on_progress_update = on_progress_update
         self.on_bot_stop = on_bot_stop
@@ -133,8 +233,14 @@ class JigsawBot:
         self.crates_completed = 0
         self.confirm_button_pos = self._configured_point("confirm_button_pos")
         self.discard_action_pos = self._configured_point("drop_button_pos")
-        self._inventory_width = int(config.get("inventory_capture_width", 200))
-        self._inventory_y_offset = int(config.get("inventory_y_offset", 200))
+        # Inventory strip: below the configured page tabs (see _inventory_rect).
+        # These two only describe the fixed strip used when no tab is set.
+        self._inventory_width = int(config.get("inventory_capture_width", inventory_layout.FALLBACK_WIDTH))
+        self._inventory_y_offset = int(config.get("inventory_y_offset", inventory_layout.FALLBACK_TOP))
+        self._inv_rect: Optional[Tuple[int, int, int, int]] = None
+        self._tab_check_seen = False
+        self._tab_check_misses = 0
+        self._tab_check_off = False
         self._current_inv_page = 0
         self._crate_template_cache: Dict[str, List[Tuple[str, np.ndarray, int, int]]] = {}
         self._debug_lock = threading.Lock()
@@ -148,11 +254,22 @@ class JigsawBot:
         # found: not searched again in this run.
         self._exhausted_sections: Set[str] = set()
         self._check_hand: Optional[Tuple[int, int]] = None  # look for a held piece here before the next crate
+        self._crate_confirm_baseline: Optional[np.ndarray] = None  # confirm area before the last crate click
+        self._confirm_clear: Optional[np.ndarray] = None   # confirm area last seen with no dialog up
         self._hand_rounds = 0           # rounds played from the hand since the last crate
         self._unknown_streak = 0        # consecutive crates without a recognizable piece
         self._unverified_streak = 0     # consecutive placements the board never showed
+        self._refused_streak = 0        # placements in a row the game did not accept (piece discarded)
+        self._discard_streak = 0        # rounds in a row that ended in a discard of any kind
+        self._suspect_mask = 0          # cells a refused placement aimed at: treated as filled
+        self._suspect_board = 0         # the board read when they became suspect
+        self._last_click_sent = False   # the last _click_window_point really clicked
+        self._result_baseline = None    # result-button area with no dialog up (taken before a crate)
+        self._last_placement_matched = False   # the last placement showed up exactly as predicted
         self.boards_completed = 0
         self._switched = False          # the last _focus() was a real window switch
+        self._capture_bad_since: Optional[float] = None   # first unusable full-window frame in a row
+        self.stop_reason: Optional[str] = None
         self._last_focus_log = 0.0
         # Debug snapshots/events are expensive (frame copies, lock); skip when no UI is attached.
         self._debug_consumer = False
@@ -167,39 +284,53 @@ class JigsawBot:
             enabled=bool(config.get("human_like_clicking", False)),
             mouse_backend=self.mouse_backend,
         )
+        self.human.diag_tag = self.diag_tag
+        self.human.window_rect = getattr(window_manager, "get_window_rect", None)
 
     def start(self) -> None:
-        if DEBUG_PRINTS:
-            print(f"[JigsawBot W{self.bot_id + 1}] start() called; dry_run={self.dry_run}")
+        diag.set_thread_tag(self.diag_tag)
+        if diag.ENABLED:
+            self._diag_header()
+        if DEBUG_PRINTS or diag.ENABLED:
+            self._dbg(f"[JigsawBot W{self.bot_id + 1}] start() called; dry_run={self.dry_run}")
         self.running = True
 
         # Subscribe to the shared F5-pause listener (one OS hook for all bots).
         _register_pause_subscriber(self)
-        if DEBUG_PRINTS:
-            print(f"[JigsawBot W{self.bot_id + 1}] subscribed to shared keyboard listener (F5 to pause/resume)")
+        if DEBUG_PRINTS or diag.ENABLED:
+            self._dbg(f"[JigsawBot W{self.bot_id + 1}] subscribed to shared keyboard listener (F5 to pause/resume)")
 
         try:
             if self.confirm_button_pos is None:
                 self._status("Jigsaw bot requires Confirm Button Coords in Fishbot action coordinates")
-                if DEBUG_PRINTS:
-                    print(f"[JigsawBot W{self.bot_id + 1}] start() aborted: confirm_button_pos not configured")
+                if DEBUG_PRINTS or diag.ENABLED:
+                    self._dbg(f"[JigsawBot W{self.bot_id + 1}] start() aborted: confirm_button_pos not configured")
                 return
             if not self.config.get("jigsaw_grid_bounds"):
                 self._status("Jigsaw bot requires Define Grid setup before starting")
-                if DEBUG_PRINTS:
-                    print(f"[JigsawBot W{self.bot_id + 1}] start() aborted: jigsaw_grid_bounds not configured")
+                if DEBUG_PRINTS or diag.ENABLED:
+                    self._dbg(f"[JigsawBot W{self.bot_id + 1}] start() aborted: jigsaw_grid_bounds not configured")
                 return
+            screen_capture.register_active(self.capture)
             self._status("Jigsaw bot started")
-            if DEBUG_PRINTS:
-                print(f"[JigsawBot W{self.bot_id + 1}] loading solver…")
+            if DEBUG_PRINTS or diag.ENABLED:
+                self._dbg(f"[JigsawBot W{self.bot_id + 1}] loading solver…")
             self.solver = get_solver()
-            if DEBUG_PRINTS:
-                print(f"[JigsawBot W{self.bot_id + 1}] solver loaded; entering run loop")
+            if DEBUG_PRINTS or diag.ENABLED:
+                self._dbg(f"[JigsawBot W{self.bot_id + 1}] solver loaded; entering run loop")
             self._activate_window_for_jigsaw("Activate jigsaw window before solver loop")
+            if not self._refuse_overlapping_windows():
+                return
+            problem = self._point_layout_problem()
+            if problem:
+                self.stop_reason = "bad_layout"
+                self._status(f"Not started: {problem}")
+                return
             self._run_loop()
         except Exception as e:
             # Without this the worker thread died silently (the traceback goes
             # to a console the packaged app does not have).
+            diag.exc("jigsaw bot stopped by an error", tag=self.diag_tag)
             self._status(f"Jigsaw bot stopped by an error: {type(e).__name__}: {e}")
             if DEBUG_PRINTS:
                 import traceback
@@ -207,21 +338,23 @@ class JigsawBot:
         finally:
             self.running = False
             self._status("Jigsaw bot stopped")
-            if DEBUG_PRINTS:
-                print(f"[JigsawBot W{self.bot_id + 1}] stopped; crates_completed={self.crates_completed}")
+            if DEBUG_PRINTS or diag.ENABLED:
+                self._dbg(f"[JigsawBot W{self.bot_id + 1}] stopped; crates_completed={self.crates_completed}")
 
             _unregister_pause_subscriber(self)
-            if DEBUG_PRINTS:
-                print(f"[JigsawBot W{self.bot_id + 1}] unsubscribed from shared keyboard listener")
+            if DEBUG_PRINTS or diag.ENABLED:
+                self._dbg(f"[JigsawBot W{self.bot_id + 1}] unsubscribed from shared keyboard listener")
             try:
                 self.capture.close()
             except Exception:
+                diag.exc(tag=self.diag_tag)
                 pass
 
             if self.on_bot_stop:
                 self.on_bot_stop(self.bot_id)
 
     def stop(self) -> None:
+        diag.log("DECISION", "stop requested", tag=self.diag_tag)
         self.running = False
         self._step_event.set()  # unblock any waiting iteration
 
@@ -247,9 +380,10 @@ class JigsawBot:
             try:
                 self.on_pause_change(self.bot_id, self.paused)
             except Exception:
+                diag.exc(tag=self.diag_tag)
                 pass
-        if DEBUG_PRINTS:
-            print(f"[JigsawBot W{self.bot_id + 1}] F5 pressed: paused={self.paused}")
+        if DEBUG_PRINTS or diag.ENABLED:
+            self._dbg(f"[JigsawBot W{self.bot_id + 1}] F5 pressed: paused={self.paused}")
 
     def set_debug_consumer(self, attached: bool) -> None:
         """Toggle whether debug snapshots/events are recorded. Default: off."""
@@ -261,8 +395,8 @@ class JigsawBot:
         retry_delay = float(self.config.get("jigsaw_piece_detection_retry_delay", 0.20))  # Reduced from 0.2
         failure_count = 0
         iteration = 0
-        if DEBUG_PRINTS:
-            print(f"[JigsawBot W{self.bot_id + 1}] _run_loop() started; action_delay={action_delay}s retry_delay={retry_delay}s")
+        if DEBUG_PRINTS or diag.ENABLED:
+            self._dbg(f"[JigsawBot W{self.bot_id + 1}] _run_loop() started; action_delay={action_delay}s retry_delay={retry_delay}s")
         while self.running:
             if self.paused:
                 time.sleep(0.1)
@@ -274,8 +408,8 @@ class JigsawBot:
                 return
 
             iteration += 1
-            if DEBUG_PRINTS:
-                print(f"[JigsawBot W{self.bot_id + 1}] --- iteration {iteration} | crates_done={self.crates_completed} ---")
+            if DEBUG_PRINTS or diag.ENABLED:
+                self._dbg(f"[JigsawBot W{self.bot_id + 1}] --- iteration {iteration} | crates_done={self.crates_completed} ---")
 
             if self.step_mode:
                 self._debug_update("step_wait", f"Waiting for step (iteration {iteration})")
@@ -288,11 +422,13 @@ class JigsawBot:
             # Capture does NOT require the target window to be foreground,
             # so we skip the per-iteration activate that previously starved the global input_lock.
             frame = self.capture_full_window()
-            if DEBUG_PRINTS:
-                print(f"[JigsawBot W{self.bot_id + 1}] frame captured shape={frame.shape}")
+            if DEBUG_PRINTS or diag.ENABLED:
+                self._dbg(f"[JigsawBot W{self.bot_id + 1}] frame captured shape={frame.shape}")
+            if not self._capture_healthy(frame):
+                continue
             grid = self.detector.detect_grid(frame)
-            if DEBUG_PRINTS:
-                print(
+            if DEBUG_PRINTS or diag.ENABLED:
+                self._dbg(
                     f"[JigsawBot W{self.bot_id + 1}] grid_found={grid.grid_found} "
                     f"confidence={grid.confidence:.3f} "
                     f"bounds={grid.grid_bounds} "
@@ -311,59 +447,124 @@ class JigsawBot:
             )
             if not grid.grid_found:
                 failure_count += 1
-                if DEBUG_PRINTS:
-                    print(f"[JigsawBot W{self.bot_id + 1}] grid not found; failure_count={failure_count}")
-                self._status("Fishing Jigsaw grid is not configured or is outside the window")
+                if DEBUG_PRINTS or diag.ENABLED:
+                    self._dbg(f"[JigsawBot W{self.bot_id + 1}] grid not found; failure_count={failure_count}")
+                if grid.grid_bounds is None:
+                    self._status("Fishing Jigsaw grid is not configured or is outside the window")
+                elif failure_count == 1:
+                    self._status(f"Puzzle window not found at the configured grid "
+                                 f"(score {grid.confidence:.2f}) — looking again")
                 self._save_debug(frame, "grid_not_found")
+                if diag.ENABLED and failure_count in (1, 5, 20):
+                    diag.image("jigsaw_grid_not_found", frame, tag=self.diag_tag,
+                               note=f"grid bounds {self.config.get('jigsaw_grid_bounds')}, failure {failure_count}, "
+                                    f"score {grid.confidence:.2f}")
+                if failure_count >= int(self.config.get("jigsaw_grid_misses_before_pause", 4)):
+                    # Not a passing tooltip: the puzzle is closed, moved or
+                    # covered. Nothing is clicked until the player looks.
+                    failure_count = 0
+                    self._pause("puzzle window not found at the configured grid — open the Fishing Jigsaw "
+                                "window where the grid was defined (or define the grid again)")
+                    continue
                 time.sleep(min(1.5, 0.25 + failure_count * 0.1))
                 continue
 
             failure_count = 0
-            if DEBUG_PRINTS:
-                print(f"[JigsawBot W{self.bot_id + 1}] checking crate slots…")
-            frame, frame_gray, grid, slots = self._ensure_crates_available(frame, None, grid)
-            if not self.running:
-                return
-            if not grid.grid_found:
-                continue  # lost during the refill; look again
+            if diag.ENABLED and diag.first_pending("jigsaw_board", self.diag_tag):
+                marked = frame.copy()
+                gx, gy, gw, gh = grid.grid_bounds
+                cv2.rectangle(marked, (gx, gy), (gx + gw - 1, gy + gh - 1), (0, 0, 255), 1)
+                diag.first("jigsaw_board", marked, tag=self.diag_tag,
+                           note=f"grid {grid.grid_bounds} filled {sorted(grid.filled_cells or set())}")
             wanted = self.detector._crate_order(self.config.get("jigsaw_crate_priority", "normal_first"))
-            available_sections = {section for section in slots.available if section in wanted}
-            if not available_sections:
-                self._status("No jigsaw crates left in the slot or the inventory; stopping")
-                if DEBUG_PRINTS:
-                    print(f"[JigsawBot W{self.bot_id + 1}] no crates available; stopping loop")
-                self.running = False
-                return
-
-            if DEBUG_PRINTS:
-                print(f"[JigsawBot W{self.bot_id + 1}] available_sections={sorted(available_sections)}")
-
             max_detection_retries = int(self.config.get("jigsaw_piece_detection_retries", 3))
             piece = None
             section = wanted[0] if wanted else "normal"
             cursor_rel = None
+            slots = None
+            crate_opened = False   # this round opened a crate (not a piece still held from the last one)
 
             if self._check_hand is not None:
                 # The last round ended without knowing whether a piece is still
                 # on the cursor (a dialog may have been confirmed late). Opening
-                # a crate on top of a held piece is the one thing that must not
+                # a crate — or refilling a slot, which clicks the inventory —
+                # on top of a held piece is the one thing that must not
                 # happen, so look first and play that piece if it is there.
                 cursor_rel, self._check_hand = self._check_hand, None
                 piece = self._look_for_piece(cursor_rel, max_detection_retries, retry_delay)
-                if piece.piece_id is None or self._hand_rounds >= 2:
-                    # Nothing there — or "a piece" was seen there twice running
-                    # without a crate being opened, which means something
-                    # colorful in the background is being mistaken for one.
+                if piece.piece_id is None:
                     piece = None
+                elif self._hand_rounds >= 2:
+                    # "A piece" is still seen after two rounds of trying to
+                    # get rid of it. Either a real piece will not leave the
+                    # cursor (the discard dialog never came) or something
+                    # colorful is taken for one: there is no telling which,
+                    # and opening a crate over a held piece is the one thing
+                    # that must not happen. The player has to look.
+                    diag.log("DECISION", f"piece still seen on the cursor after {self._hand_rounds} rounds: "
+                                         f"pausing instead of opening a crate", tag=self.diag_tag)
+                    self._hand_rounds = 0
+                    self._check_hand = cursor_rel   # looked at again after the resume
+                    self._pause("a piece stays on the cursor and could not be placed or discarded — "
+                                "discard it by hand (or move whatever is mistaken for one), then resume")
+                    continue
                 else:
                     self._hand_rounds += 1
                     self._status("A piece is still on the cursor; playing it before opening a crate")
+            if not self.running:
+                return
+
+            if piece is None:
+                if DEBUG_PRINTS or diag.ENABLED:
+                    self._dbg(f"[JigsawBot W{self.bot_id + 1}] checking crate slots…")
+                frame, frame_gray, grid, slots = self._ensure_crates_available(frame, None, grid)
+                if not self.running or self.paused:
+                    continue
+                if not grid.grid_found:
+                    continue  # lost during the refill; look again
+                available_sections = {section for section in slots.available if section in wanted}
+                if not available_sections:
+                    self._status("No jigsaw crates left in the slot or the inventory; stopping")
+                    if DEBUG_PRINTS or diag.ENABLED:
+                        self._dbg(f"[JigsawBot W{self.bot_id + 1}] no crates available; stopping loop")
+                    self.running = False
+                    return
+                if DEBUG_PRINTS or diag.ENABLED:
+                    self._dbg(f"[JigsawBot W{self.bot_id + 1}] available_sections={sorted(available_sections)}")
+
+            if self._suspect_mask:
+                read = grid.board_mask
+                if (read & self._suspect_board) != self._suspect_board \
+                        or (read & self._suspect_mask) == self._suspect_mask:
+                    # Cells filled back then are gone (a new board), or the
+                    # suspect cells now read as filled: nothing left to avoid.
+                    diag.log("STATE", f"suspect cells {self._suspect_mask:024b} dropped (board {read:024b})",
+                             tag=self.diag_tag)
+                    self._suspect_mask = 0
+                elif (read | self._suspect_mask) == FULL_BOARD_MASK and read != FULL_BOARD_MASK:
+                    # Every cell still empty is a suspect one: the board can
+                    # only be finished in them. Kept, every piece would be
+                    # discarded from here on. A placement that is lost twice
+                    # looks exactly like a refused one, so the suspicion may be
+                    # wrong; it is given up, and a real refusal is caught again
+                    # (and pauses after jigsaw_max_refused_placements).
+                    diag.log("DECISION", f"only suspect cells {self._suspect_mask:024b} are left empty "
+                                         f"(board {read:024b}): suspicion dropped", tag=self.diag_tag)
+                    self._suspect_mask = 0
+
+            if piece is None and grid.board_mask == FULL_BOARD_MASK:
+                # A full board is handled right after the last placement. Read
+                # as full here, any piece would be discarded: the result was
+                # missed, or the cells read wrong. A crate is not spent on that.
+                self._pause("the board reads as completely full — finish or close the result dialog, "
+                            "or re-align the grid with Define Grid")
+                continue
 
             if piece is None:
                 priority = self.config.get("jigsaw_crate_priority", "normal_first")
-                crate = self._select_crate_target(slots, priority, grid.board_mask)
+                crate = self._select_crate_target(slots, priority, grid.board_mask | self._suspect_mask)
                 if crate is None:
-                    if priority == "special_when_better" and "normal" not in slots.available:
+                    if priority in ("special_when_better", "special_first") and "normal" not in slots.available:
                         # Only special crates are left and their piece has no
                         # room on this board: nothing more can be done.
                         self._status("No normal jigsaw crates left and the special piece does not fit; stopping")
@@ -380,15 +581,20 @@ class JigsawBot:
                 )
 
                 self._hand_rounds = 0
+                # What the result button's place looks like with no dialog up
+                # and the cursor parked as it will be after the last placement.
+                if not self.dry_run:
+                    self._result_baseline = dialog_watch.read_patch(self._dialog_grab, self._result_point())
                 cursor_rel = self._open_crate_and_confirm(crate.center, crate.section)
+                crate_opened = True
                 piece = self._look_for_piece(cursor_rel, max_detection_retries, retry_delay)
                 if not self.running:
                     return   # stopped mid-round: send nothing further
 
-                if piece.piece_id is None and not self.dry_run:
-                    # Most likely the "open crate?" dialog came up after the
-                    # confirm click had already been sent, so it is still
-                    # waiting. Confirm once more and look again.
+                if piece.piece_id is None and not self.dry_run and self._dialog_still_up():
+                    # The "open crate?" dialog came up after the confirm
+                    # click had already been sent, so it is still waiting.
+                    # Confirm once more and look again.
                     self._click_window_point(self.confirm_button_pos, "Confirm crate again (no piece seen)")
                     cursor_rel = self._park_cursor(cursor_rel)
                     time.sleep(retry_delay)
@@ -407,9 +613,22 @@ class JigsawBot:
             )
 
             if piece.piece_id is None:
+                if diag.ENABLED and cursor_rel is not None:
+                    r = max(10, min(24, int(self.config.get("jigsaw_cursor_capture_roi", 15))))
+                    diag.image("jigsaw_unknown_piece", self.capture_window_region(
+                        cursor_rel[0] - 3 * r, cursor_rel[1] - 3 * r, 6 * r, 6 * r), tag=self.diag_tag,
+                        note=f"area around the cursor {cursor_rel} (detector looks at +-{r}px), "
+                             f"confidence {piece.confidence:.2f}")
                 self._unknown_streak += 1
-                self._status(f"No recognizable piece on the cursor (confidence {piece.confidence:.2f}); discarding")
-                self._discard_piece(cursor_rel, "unknown piece", verify=False)
+                if piece.colored_pixels == 0:
+                    # Nothing piece-colored at the cursor at all: no piece is
+                    # held, so a right-click and a confirm would only land on
+                    # whatever is under them. Look at the hand next round.
+                    self._status("No piece on the cursor after opening the crate; nothing to discard")
+                else:
+                    self._status(f"No recognizable piece on the cursor (confidence {piece.confidence:.2f}); "
+                                 f"discarding")
+                    self._discard_piece(cursor_rel, "unknown piece", verify=False)
                 self._check_hand = cursor_rel
                 if self._unknown_streak >= int(self.config.get("jigsaw_max_unknown_pieces", 3)):
                     self._unknown_streak = 0
@@ -420,15 +639,15 @@ class JigsawBot:
             self._unknown_streak = 0
 
             spec = self._resolve_piece(piece.piece_id, piece.figure_index, section)
-            if DEBUG_PRINTS:
-                print(
+            if DEBUG_PRINTS or diag.ENABLED:
+                self._dbg(
                     f"[JigsawBot W{self.bot_id + 1}] resolved spec: {spec.piece_id if spec else None} "
                     f"figure_index={spec.figure_index if spec else None} "
                     f"mask={bin(spec.mask) if spec else None}"
                 )
             if spec is None:
-                if DEBUG_PRINTS:
-                    print(f"[JigsawBot W{self.bot_id + 1}] unsupported piece '{piece.piece_id}'; pausing")
+                if DEBUG_PRINTS or diag.ENABLED:
+                    self._dbg(f"[JigsawBot W{self.bot_id + 1}] unsupported piece '{piece.piece_id}'; pausing")
                 self._pause(f"Unsupported piece '{piece.piece_id}'")
                 continue
 
@@ -437,11 +656,15 @@ class JigsawBot:
 
             # The board mask cannot change from clicking the crate slot or confirming open —
             # only piece placement mutates it. Reuse the grid we already have.
-            if DEBUG_PRINTS:
-                print(f"[JigsawBot W{self.bot_id + 1}] computing decision for spec={spec.piece_id}…")
-            decision, explanation = self._decide_action(grid, spec)
-            if DEBUG_PRINTS:
-                print(
+            if DEBUG_PRINTS or diag.ENABLED:
+                self._dbg(f"[JigsawBot W{self.bot_id + 1}] computing decision for spec={spec.piece_id}…")
+            # Cells a refused placement aimed at are filled in the game even
+            # though they read empty: the solver must not choose them again.
+            decide_grid = dc_replace(grid, board_mask=grid.board_mask | self._suspect_mask) \
+                if self._suspect_mask else grid
+            decision, explanation = self._decide_action(decide_grid, spec)
+            if DEBUG_PRINTS or diag.ENABLED:
+                self._dbg(
                     f"[JigsawBot W{self.bot_id + 1}] decision: action={decision.action} "
                     f"target={decision.target} reason={decision.reason} "
                     f"chosen_action={explanation.get('chosen_action')} "
@@ -464,29 +687,116 @@ class JigsawBot:
                 decision_candidates=explanation.get("candidates", []),
             )
             completes_board = self._decision_completes_board(
-                grid,
+                decide_grid,
                 spec,
                 decision,
                 explanation.get("chosen_action"),
             )
-            if DEBUG_PRINTS:
-                print(f"[JigsawBot W{self.bot_id + 1}] completes_board={completes_board}; performing decision…")
+            if DEBUG_PRINTS or diag.ENABLED:
+                self._dbg(f"[JigsawBot W{self.bot_id + 1}] completes_board={completes_board}; performing decision…")
             self._perform_decision(decision, cursor_rel)
+            placed_ok = False
             if decision.action == "place" and decision.target is not None and not self.dry_run:
                 expected = grid.board_mask | (spec.mask >> explanation["chosen_action"])
-                if not self._confirm_placement(grid.board_mask, expected, decision, cursor_rel):
+                placed_ok = self._confirm_placement(grid.board_mask, expected, decision, cursor_rel)
+                if not placed_ok:
                     completes_board = False
-            self.crates_completed += 1
-            if DEBUG_PRINTS:
-                print(f"[JigsawBot W{self.bot_id + 1}] crates_completed={self.crates_completed}")
-            if self.on_progress_update:
-                self.on_progress_update(self.bot_id, self.crates_completed)
+                elif completes_board and not self._last_placement_matched:
+                    # "Something changed", not the predicted board: complete
+                    # only if the board really reads full now.
+                    check = self.detector.detect_grid(self.capture_full_window())
+                    completes_board = check.grid_found and check.board_mask == FULL_BOARD_MASK
+                    diag.log("DECISION", f"placement not matched exactly: board complete={completes_board}",
+                             tag=self.diag_tag)
+            elif decision.action == "place":
+                placed_ok = True
+            # Counted on the board as read: cells only treated as filled
+            # (suspect) are not "the last cells" of a nearly finished board.
+            empty_cells = 24 - bin(grid.board_mask).count("1")
+            if placed_ok:
+                self._discard_streak = 0
+            elif decision.action == "discard" and empty_cells <= 4 and not self._suspect_mask:
+                pass   # waiting for a piece that fits the last cells: normal play
+            else:
+                self._discard_streak += 1
+                limit = int(self.config.get("jigsaw_max_consecutive_discards", 12))
+                if self.running and not self.paused and limit > 0 and self._discard_streak >= limit:
+                    self._discard_streak = 0
+                    self._pause(f"{limit} pieces in a row were discarded — check that the board is read "
+                                f"correctly (grid alignment, nothing covering the puzzle)")
+            if crate_opened:
+                self.crates_completed += 1
+                if DEBUG_PRINTS or diag.ENABLED:
+                    self._dbg(f"[JigsawBot W{self.bot_id + 1}] crates_completed={self.crates_completed}")
+                if self.on_progress_update:
+                    self.on_progress_update(self.bot_id, self.crates_completed)
             if completes_board:
-                if DEBUG_PRINTS:
-                    print(f"[JigsawBot W{self.bot_id + 1}] board complete! handling completion…")
+                if DEBUG_PRINTS or diag.ENABLED:
+                    self._dbg(f"[JigsawBot W{self.bot_id + 1}] board complete! handling completion…")
                 self.boards_completed += 1
                 self._handle_completed_board()
             time.sleep(action_delay)
+
+    def _capture_healthy(self, frame) -> bool:
+        """False (after a short wait) while the window capture shows nothing
+        usable — a black or failed frame is no board to act on. Stops the
+        worker when that lasts ``_CAPTURE_STOP_AFTER`` seconds."""
+        if frame_usable(frame):
+            if self._capture_bad_since is not None:
+                diag.log("STATE", "capture usable again", tag=self.diag_tag)
+                self._status("Game window visible again — carrying on")
+            self._capture_bad_since = None
+            return True
+        now = time.perf_counter()
+        if self._capture_bad_since is None:
+            self._capture_bad_since = now
+            diag.log("STATE", "capture shows nothing usable (black or failed): no action", tag=self.diag_tag)
+            self._status("The game window shows nothing (black or failed capture) — waiting. "
+                         "Restore or uncover the window.")
+        elif now - self._capture_bad_since >= self._CAPTURE_STOP_AFTER:
+            self.stop_reason = "capture_unavailable"
+            self._status(f"The game window could not be seen for {self._CAPTURE_STOP_AFTER:.0f} s; stopping")
+            self.running = False
+            return False
+        time.sleep(0.25)
+        return False
+
+    def _point_layout_problem(self) -> Optional[str]:
+        """The confirm point and the parked cursor point must lie clear of
+        the grid, the crate slots and the inventory (see layout_problem).
+        Returns what is wrong, or None."""
+        if self.dry_run:
+            return None
+        try:
+            _, _, win_w, win_h = self.window_manager.get_window_rect()
+        except Exception:
+            diag.exc("layout check: window size", tag=self.diag_tag)
+            win_w = win_h = None
+        problem = layout_problem(self.config, win_w, win_h)
+        return problem.message if problem else None
+
+    def _refuse_overlapping_windows(self) -> bool:
+        """Same rule as the fishing bot: a client that can only be read from
+        the screen must not overlap another bot's window, or the bot reads
+        the other client's board. Returns False after refusing to start."""
+        capture = self.capture
+        if self.dry_run or not capture.reads_screen_when_covered:
+            return True
+        peers = capture.overlapping_peers()
+        if not peers:
+            return True
+        with input_lock:
+            if self._focus():
+                while capture.needs_verification and not capture.window_trusted and self.running:
+                    time.sleep(0.1)
+                    capture.verify()
+        if capture.window_trusted:
+            return True
+        self.stop_reason = "capture_overlap"
+        self._status(f"This game window overlaps {', '.join(peers)}, and this client can only be read "
+                     f"from the screen. Move the game windows apart so none covers another. Not started.")
+        self.running = False
+        return False
 
     def capture_full_window(self) -> np.ndarray:
         _, _, width, height = self.window_manager.get_window_rect()
@@ -495,14 +805,22 @@ class JigsawBot:
             return np.zeros((100, 100, 3), dtype=np.uint8)
         return frame
 
-    def capture_inventory_area(self) -> np.ndarray:
+    def _inventory_rect(self) -> Tuple[int, int, int, int]:
+        """Window-relative rectangle (x, y, w, h) of the inventory strip, the
+        same one the fishing bot uses: the item grid below the configured
+        page tabs, or the fixed right-hand strip without tabs. Positions
+        found in a capture of it are relative to its corner."""
         _, _, win_width, win_height = self.window_manager.get_window_rect()
-        frame = self.capture.grab(
-            win_width - self._inventory_width,
-            self._inventory_y_offset,
-            self._inventory_width,
-            win_height - self._inventory_y_offset - 30,
-        )
+        rect, source = inventory_layout.strip_rect(
+            self.config, win_width, win_height, self._inventory_width, self._inventory_y_offset)
+        if rect != self._inv_rect:
+            diag.log("STATE", f"inventory strip rect={rect} (from {source}; was {self._inv_rect})",
+                     tag=self.diag_tag)
+            self._inv_rect = rect
+        return rect
+
+    def capture_inventory_area(self) -> np.ndarray:
+        frame = self.capture.grab(*self._inventory_rect())
         if frame is None:
             return np.zeros((100, 100, 3), dtype=np.uint8)
         return frame
@@ -523,6 +841,7 @@ class JigsawBot:
             pos = self.mouse_backend.position()
             return (int(pos[0]), int(pos[1]))
         except Exception:
+            diag.exc(tag=self.diag_tag)
             return None
 
     def _restore_cursor(self, cursor_rel: Tuple[int, int]) -> None:
@@ -549,12 +868,17 @@ class JigsawBot:
         """Looks for the piece on the cursor, a few times: it appears a moment
         after the crate was confirmed."""
         piece = None
-        for attempt in range(max(1, attempts)):
-            piece = self._detect_cursor_piece(cursor_rel)
-            if piece.piece_id is not None or not self.running:
-                break
-            if attempt < attempts - 1:
-                time.sleep(delay)
+        with diag.loop("look for cursor piece", tag=self.diag_tag, cursor=cursor_rel, attempts=attempts) as lp:
+            for attempt in range(max(1, attempts)):
+                piece = self._detect_cursor_piece(cursor_rel)
+                lp.frame(f"attempt {attempt + 1}: {piece.piece_id} conf={piece.confidence:.3f}")
+                lp.score("confidence", piece.confidence)
+                if piece.piece_id is not None or not self.running:
+                    break
+                if attempt < attempts - 1:
+                    time.sleep(delay)
+            lp.set("result", f"{piece.piece_id if piece else None} conf="
+                             f"{piece.confidence if piece else 0:.3f}")
         return piece
 
     def _detect_cursor_piece(self, cursor_rel: Optional[Tuple[int, int]]):
@@ -579,11 +903,11 @@ class JigsawBot:
         frame_gray: Optional[np.ndarray],
         grid: JigsawGridResult,
     ) -> Tuple[np.ndarray, Optional[np.ndarray], JigsawGridResult, CrateSlotState]:
-        if DEBUG_PRINTS:
-            print(f"[JigsawBot W{self.bot_id + 1}] _ensure_crates_available: detecting slots…")
+        if DEBUG_PRINTS or diag.ENABLED:
+            self._dbg(f"[JigsawBot W{self.bot_id + 1}] _ensure_crates_available: detecting slots…")
         slots = self.detector.detect_crate_slots(frame, grid, gray=frame_gray)
-        if DEBUG_PRINTS:
-            print(
+        if DEBUG_PRINTS or diag.ENABLED:
+            self._dbg(
                 f"[JigsawBot W{self.bot_id + 1}] slot_state: available={sorted(slots.available)} "
                 f"missing={sorted(slots.missing)} confidence={slots.confidence}"
             )
@@ -608,28 +932,28 @@ class JigsawBot:
         wanted = set(self.detector._crate_order(self.config.get("jigsaw_crate_priority", "normal_first")))
         to_refill = {s for s in slots.missing if s in wanted and s not in self._exhausted_sections}
         if not to_refill:
-            if DEBUG_PRINTS:
-                print(f"[JigsawBot W{self.bot_id + 1}] nothing to refill")
+            if DEBUG_PRINTS or diag.ENABLED:
+                self._dbg(f"[JigsawBot W{self.bot_id + 1}] nothing to refill")
             return frame, frame_gray, grid, slots
 
         missing_names = ", ".join(sorted(to_refill))
         self._status(f"Missing jigsaw crate slot(s): {missing_names}; searching inventory")
-        if DEBUG_PRINTS:
-            print(f"[JigsawBot W{self.bot_id + 1}] refilling missing: {missing_names}")
+        if DEBUG_PRINTS or diag.ENABLED:
+            self._dbg(f"[JigsawBot W{self.bot_id + 1}] refilling missing: {missing_names}")
         placed_any = self._refill_missing_crates(to_refill, slots.centers)
-        if DEBUG_PRINTS:
-            print(f"[JigsawBot W{self.bot_id + 1}] refill complete; placed_any={placed_any}")
+        if DEBUG_PRINTS or diag.ENABLED:
+            self._dbg(f"[JigsawBot W{self.bot_id + 1}] refill complete; placed_any={placed_any}")
 
         frame = self.capture_full_window()
         frame_gray = None
         grid = self.detector.detect_grid(frame)
         if not grid.grid_found:
-            if DEBUG_PRINTS:
-                print(f"[JigsawBot W{self.bot_id + 1}] grid lost after refill attempt")
+            if DEBUG_PRINTS or diag.ENABLED:
+                self._dbg(f"[JigsawBot W{self.bot_id + 1}] grid lost after refill attempt")
             return frame, frame_gray, grid, CrateSlotState({}, set(), {"normal", "special"}, {})
         slots = self.detector.detect_crate_slots(frame, grid, gray=frame_gray)
-        if DEBUG_PRINTS:
-            print(
+        if DEBUG_PRINTS or diag.ENABLED:
+            self._dbg(
                 f"[JigsawBot W{self.bot_id + 1}] post-refill slots: available={sorted(slots.available)} "
                 f"missing={sorted(slots.missing)}"
             )
@@ -675,12 +999,25 @@ class JigsawBot:
             return ["special"]
         return ["normal"]
 
+    def _special_piece_fits(self, board: int) -> bool:
+        spec = self.pieces.get("jigsaw_piece_deluxe") or self.pieces.get("special_3x2")
+        if spec is None:
+            return True
+        return bool(self.solver.rank_custom_actions(board, spec.mask, spec.max_offset, limit=1))
+
     def _select_crate_target(self, slots: CrateSlotState, priority: str,
                              board: Optional[int] = None) -> Optional[CrateTarget]:
         if priority == "special_when_better" and board is not None and self.solver is not None:
             order = self._smart_crate_order(slots, board)
         else:
             order = self.detector._crate_order(priority)
+            if "special" in order and board is not None and self.solver is not None \
+                    and not self._special_piece_fits(board):
+                # A special crate always gives the 3x2 piece: where it has no
+                # room it could only be thrown away, and the crate with it.
+                order = [s for s in order if s != "special"]
+                diag.log("DECISION", f"special crate skipped: the 3x2 piece has no room on {board:024b}",
+                         tag=self.diag_tag)
         for section in order:
             if section in slots.available and section in slots.centers:
                 confidence = 0.50
@@ -691,48 +1028,58 @@ class JigsawBot:
 
     def _refill_missing_crates(self, missing: Set[str], slot_centers: Dict[str, Tuple[int, int]]) -> bool:
         pages = self._configured_inventory_pages()
-        if DEBUG_PRINTS:
-            print(f"[JigsawBot W{self.bot_id + 1}] _refill_missing_crates: missing={sorted(missing)} pages={[p[0]+1 for p in pages]}")
+        if DEBUG_PRINTS or diag.ENABLED:
+            self._dbg(f"[JigsawBot W{self.bot_id + 1}] _refill_missing_crates: missing={sorted(missing)} pages={[p[0]+1 for p in pages]}")
         if not pages:
             self._status("Inventory page coordinates are not configured for jigsaw crate search")
-            if DEBUG_PRINTS:
-                print(f"[JigsawBot W{self.bot_id + 1}] no inventory pages configured; aborting refill")
+            if DEBUG_PRINTS or diag.ENABLED:
+                self._dbg(f"[JigsawBot W{self.bot_id + 1}] no inventory pages configured; aborting refill")
             return False
 
         needed = set(missing)
         placed_any = False
+        unsearched = []
         for page_idx, page_pos in pages:
-            if not self.running or not needed:
+            if not self.running or self.paused or not needed:
                 break
 
-            if DEBUG_PRINTS:
-                print(f"[JigsawBot W{self.bot_id + 1}] scanning inventory page {page_idx + 1} for {sorted(needed)}")
-            self._switch_to_inventory_page(page_idx, page_pos)
+            if DEBUG_PRINTS or diag.ENABLED:
+                self._dbg(f"[JigsawBot W{self.bot_id + 1}] scanning inventory page {page_idx + 1} for {sorted(needed)}")
+            if not self._switch_to_inventory_page(page_idx, page_pos):
+                unsearched.append(page_idx + 1)
+                continue
             inventory_frame = self.capture_inventory_area()
-            if DEBUG_PRINTS:
-                print(f"[JigsawBot W{self.bot_id + 1}] inventory frame shape={inventory_frame.shape}")
+            if DEBUG_PRINTS or diag.ENABLED:
+                self._dbg(f"[JigsawBot W{self.bot_id + 1}] inventory frame shape={inventory_frame.shape}")
             found = self._find_inventory_crates(inventory_frame, needed)
-            if DEBUG_PRINTS:
-                print(f"[JigsawBot W{self.bot_id + 1}] found in inventory: {list(found.keys())}")
+            if DEBUG_PRINTS or diag.ENABLED:
+                self._dbg(f"[JigsawBot W{self.bot_id + 1}] found in inventory: {list(found.keys())}")
             for section in self.detector._crate_order(self.config.get("jigsaw_crate_priority", "normal_first")):
                 if section not in needed or section not in found or section not in slot_centers:
                     continue
                 inv_pos = found[section]
-                if DEBUG_PRINTS:
-                    print(f"[JigsawBot W{self.bot_id + 1}] placing {section}: inv_pos={inv_pos} slot={slot_centers[section]}")
+                if DEBUG_PRINTS or diag.ENABLED:
+                    self._dbg(f"[JigsawBot W{self.bot_id + 1}] placing {section}: inv_pos={inv_pos} slot={slot_centers[section]}")
+                if self.paused:
+                    break
                 if self._place_inventory_crate(section, inv_pos, slot_centers[section]):
                     placed_any = True
                     needed.remove(section)
-                    if DEBUG_PRINTS:
-                        print(f"[JigsawBot W{self.bot_id + 1}] placed {section}; still needed={sorted(needed)}")
+                    if DEBUG_PRINTS or diag.ENABLED:
+                        self._dbg(f"[JigsawBot W{self.bot_id + 1}] placed {section}; still needed={sorted(needed)}")
                     time.sleep(float(self.config.get("jigsaw_action_delay", 0.15)))
 
-        if DEBUG_PRINTS:
-            print(f"[JigsawBot W{self.bot_id + 1}] _refill_missing_crates done; placed_any={placed_any} remaining_needed={sorted(needed)}")
-        if needed and self.running:
-            # Every configured page was searched: there are none left.
-            self._exhausted_sections |= needed
-            self._status(f"No {', '.join(sorted(needed))} jigsaw crate in the inventory")
+        if DEBUG_PRINTS or diag.ENABLED:
+            self._dbg(f"[JigsawBot W{self.bot_id + 1}] _refill_missing_crates done; placed_any={placed_any} remaining_needed={sorted(needed)}")
+        if needed and self.running and not self.paused:
+            if unsearched:
+                # Not every page could be looked at: no verdict on what is left.
+                self._status(f"Inventory page(s) {unsearched} could not be opened (window not in front); "
+                             f"searching again next round")
+            else:
+                # Every configured page was searched: there are none left.
+                self._exhausted_sections |= needed
+                self._status(f"No {', '.join(sorted(needed))} jigsaw crate in the inventory")
         return placed_any
 
     def _configured_inventory_pages(self) -> List[Tuple[int, Tuple[int, int]]]:
@@ -744,19 +1091,63 @@ class JigsawBot:
                 pages.append((page_idx, point))
         return pages
 
-    def _switch_to_inventory_page(self, page_idx: int, page_pos: Tuple[int, int]) -> None:
-        self._current_inv_page = page_idx
+    def _switch_to_inventory_page(self, page_idx: int, page_pos: Tuple[int, int]) -> bool:
+        """Clicks an inventory page tab. False when the click could not be
+        sent (window not in front): the page on screen is then another one
+        and must not be searched as this page."""
         self._status(f"Searching inventory page {page_idx + 1} for jigsaw crates")
         self._debug_update("inventory_page", f"page {page_idx + 1}", inventory_page=page_idx + 1)
         if self.dry_run:
-            return
-        win_left, win_top, _, _ = self.window_manager.get_window_rect()
+            self._current_inv_page = page_idx
+            return True
+        sent = False
         with input_lock:
             if self._focus():
+                # Read after the focus: a minimized window was just restored.
+                win_left, win_top, _, _ = self.window_manager.get_window_rect()
                 self.human.move_to(win_left + page_pos[0], win_top + page_pos[1])
                 self.human.sleep(0.04)
                 self.human.click(hold=0.02)
+                sent = True
+        if not sent:
+            diag.log("DECISION", f"inventory page {page_idx + 1} tab not clicked (no focus): page not searched",
+                     tag=self.diag_tag)
+            return False
+        self._current_inv_page = page_idx
         time.sleep(float(self.config.get("jigsaw_inventory_page_delay", 0.18)))
+        self._wait_for_inventory_page(page_idx + 1)
+        return True
+
+    _PAGE_WAIT_TIMEOUT = 2.0
+
+    def _wait_for_inventory_page(self, page_num: int) -> None:
+        """After a tab click: waits until that tab is drawn as the active
+        one, so a slow machine's previous page is not searched instead. Goes
+        on after the timeout, and does nothing when the tabs cannot be read
+        (fewer than three configured, or never recognized on this client)."""
+        _, _, win_width, win_height = self.window_manager.get_window_rect()
+        points = inventory_layout.tab_points(self.config, win_width, win_height)
+        if page_num not in points or len(points) < 3 or self._tab_check_off:
+            return
+        ok, waited, active, detail, looks = inventory_layout.wait_for_tab(
+            self.capture.grab, points, win_width, win_height, page_num, lambda: self.running,
+            self._PAGE_WAIT_TIMEOUT)
+        if ok:
+            self._tab_check_seen = True
+            self._tab_check_misses = 0
+            diag.log("STATE", f"page wait: tab {page_num} active after {waited:.2f}s ({looks} looks; {detail})",
+                     tag=self.diag_tag)
+            return
+        if not self.running:
+            return
+        self._tab_check_misses += 1
+        diag.log("DECISION", f"page wait: TIMEOUT after {waited:.2f}s, tab {page_num} never read as active "
+                             f"(last read: {active}; {detail}; {looks} looks): searching the page anyway",
+                 tag=self.diag_tag)
+        if not self._tab_check_seen and self._tab_check_misses >= 2:
+            self._tab_check_off = True
+            diag.log("DECISION", "page wait: the active tab was never recognized on this client: "
+                                 "not waiting for it any more", tag=self.diag_tag)
 
     def _find_inventory_crates(self, inventory_frame: np.ndarray, sections: Set[str]) -> Dict[str, Tuple[int, int]]:
         found: Dict[str, Tuple[int, int]] = {}
@@ -778,6 +1169,7 @@ class JigsawBot:
                     result = cv2.matchTemplate(inventory, template, cv2.TM_CCOEFF_NORMED)
                     _, max_val, _, max_loc = cv2.minMaxLoc(result)
                 except Exception:
+                    diag.exc(tag=self.diag_tag)
                     continue
                 if max_val > conf:
                     conf = float(max_val)
@@ -798,6 +1190,7 @@ class JigsawBot:
                 try:
                     best = max(best, float(cv2.matchTemplate(patch, template, cv2.TM_CCOEFF_NORMED).max()))
                 except Exception:
+                    diag.exc(tag=self.diag_tag)
                     continue
             return best
 
@@ -870,17 +1263,18 @@ class JigsawBot:
             return True
         cursor_settle = float(self.config.get("timing_cursor_settle", 0.008))
         action_delay = float(self.config.get("jigsaw_action_delay", 0.08))
-        win_left, win_top, win_width, _ = self.window_manager.get_window_rect()
-        inv_x = win_left + win_width - self._inventory_width + inventory_pos[0]
-        inv_y = win_top + self._inventory_y_offset + inventory_pos[1]
-        slot_x = win_left + slot_pos[0]
-        slot_y = win_top + slot_pos[1]
+        strip_x, strip_y, _, _ = self._inv_rect or self._inventory_rect()
         park = self._parked_point()
         # Coalesce both clicks into a single lock hold so other bots aren't starved
         # by a back-to-back claim/release; activation happens once for both clicks.
         with input_lock:
             if not self._focus():
                 return False
+            win_left, win_top, _, _ = self.window_manager.get_window_rect()   # after the focus
+            inv_x = win_left + strip_x + inventory_pos[0]
+            inv_y = win_top + strip_y + inventory_pos[1]
+            slot_x = win_left + slot_pos[0]
+            slot_y = win_top + slot_pos[1]
             self.human.move_to(inv_x, inv_y)
             if cursor_settle > 0:
                 self.human.sleep(cursor_settle)
@@ -901,47 +1295,69 @@ class JigsawBot:
 
         # The crate must have arrived: one that is still on the cursor (the
         # click on the slot was lost) is in neither the slot nor the
-        # inventory, so the next search would conclude there are none left.
-        for _attempt in range(2):
+        # inventory, and the next click (open crate, confirm) would carry it
+        # into the game world.
+        for attempt in range(3):
             time.sleep(max(action_delay, 0.05))
             if not self.running:
                 return False
             frame = self.capture_full_window()
             grid = self.detector.detect_grid(frame)
-            if not grid.grid_found or section in self.detector.detect_crate_slots(frame, grid).available:
+            if not grid.grid_found:
+                break       # cannot tell: handled like a crate that did not arrive
+            if section in self.detector.detect_crate_slots(frame, grid).available:
                 return True
-            self._status(f"The {section} crate did not arrive in its slot; clicking the slot again")
-            self._click_window_point(slot_pos, f"Place {section} jigsaw crate (retry)", park_at=park)
-        return True
+            if attempt < 2:
+                self._status(f"The {section} crate did not arrive in its slot; clicking the slot again")
+                self._click_window_point(slot_pos, f"Place {section} jigsaw crate (retry)", park_at=park)
+        self._put_crate_back(section, inventory_pos, park)
+        return False
+
+    def _put_crate_back(self, section: str, inventory_pos: Tuple[int, int],
+                        park: Optional[Tuple[int, int]]) -> None:
+        """A crate taken from the inventory did not land in its slot and may
+        be on the cursor: put it back where it came from (that place is free
+        now), check it is there, and pause either way — the player has to
+        see why the slot does not take it."""
+        strip_x, strip_y, _, _ = self._inv_rect or self._inventory_rect()
+        back_point = (strip_x + inventory_pos[0], strip_y + inventory_pos[1])
+        self._click_window_point(back_point, f"Put {section} jigsaw crate back into the inventory", park_at=park)
+        time.sleep(max(float(self.config.get("jigsaw_action_delay", 0.08)), 0.05))
+        back = section in self._find_inventory_crates(self.capture_inventory_area(), {section})
+        diag.log("DECISION", f"{section} crate did not arrive in its slot: put back into the inventory={back}",
+                 tag=self.diag_tag)
+        self._pause(f"the {section} crate could not be placed into its slot"
+                    + (" (put back into the inventory)" if back else
+                       " and may still be on the cursor — check before resuming"))
 
     def _decide_action(self, grid: JigsawGridResult, spec: PieceSpec) -> Tuple[JigsawActionResult, dict]:
-        if DEBUG_PRINTS:
-            print(
+        if DEBUG_PRINTS or diag.ENABLED:
+            self._dbg(
                 f"[JigsawBot W{self.bot_id + 1}] _decide_action: spec={spec.piece_id} "
                 f"figure_index={spec.figure_index} board_mask={bin(grid.board_mask)}"
             )
         # Ranking is debug-only; skip the 24-iteration np.mean loop on the hot path.
         candidates = self._rank_legal_actions(grid.board_mask, spec) if (self._debug_consumer or DEBUG_PRINTS) else []
-        if DEBUG_PRINTS:
-            print(f"[JigsawBot W{self.bot_id + 1}] ranked {len(candidates)} legal actions; top={candidates[:3]}")
+        if DEBUG_PRINTS or diag.ENABLED:
+            self._dbg(f"[JigsawBot W{self.bot_id + 1}] ranked {len(candidates)} legal actions; top={candidates[:3]}")
         if spec.figure_index is not None:
             state = Jigsaw(grid.board_mask, spec.figure_index, 0)
             action = self.solver.solve(state)
-            if DEBUG_PRINTS:
-                print(f"[JigsawBot W{self.bot_id + 1}] solver returned action={action} (SKIP={action == SKIP_ACTION})")
+            if DEBUG_PRINTS or diag.ENABLED:
+                self._dbg(f"[JigsawBot W{self.bot_id + 1}] solver returned action={action} (SKIP={action == SKIP_ACTION})")
             if action == SKIP_ACTION:
                 return JigsawActionResult("discard", reason="solver requested skip"), {"candidates": candidates}
             if not state.is_legal(action):
-                if DEBUG_PRINTS:
-                    print(f"[JigsawBot W{self.bot_id + 1}] solver action={action} is not legal; discarding")
+                if DEBUG_PRINTS or diag.ENABLED:
+                    self._dbg(f"[JigsawBot W{self.bot_id + 1}] solver action={action} is not legal; discarding")
                 return JigsawActionResult("discard", reason="solver action is not legal"), {
                     "chosen_action": action,
                     "candidates": candidates,
                 }
             target = self._target_for_action(grid, action, spec)
             cells = self._cells_for_action(action, spec)
-            if DEBUG_PRINTS:
-                print(f"[JigsawBot W{self.bot_id + 1}] placing at target={target} cells={cells}")
+            if DEBUG_PRINTS or diag.ENABLED:
+                self._dbg(f"[JigsawBot W{self.bot_id + 1}] placing at target={target} cells={cells}")
             return JigsawActionResult("place", target, f"action={action}"), {
                 "chosen_action": action,
                 "placement_cells": cells,
@@ -949,16 +1365,16 @@ class JigsawBot:
             }
 
         action = self._best_special_action(grid.board_mask, spec)
-        if DEBUG_PRINTS:
-            print(f"[JigsawBot W{self.bot_id + 1}] special piece best_action={action}")
+        if DEBUG_PRINTS or diag.ENABLED:
+            self._dbg(f"[JigsawBot W{self.bot_id + 1}] special piece best_action={action}")
         if action is None:
-            if DEBUG_PRINTS:
-                print(f"[JigsawBot W{self.bot_id + 1}] no legal special placement; discarding")
+            if DEBUG_PRINTS or diag.ENABLED:
+                self._dbg(f"[JigsawBot W{self.bot_id + 1}] no legal special placement; discarding")
             return JigsawActionResult("discard", reason="no legal special placement"), {"candidates": candidates}
         target = self._target_for_action(grid, action, spec)
         cells = self._cells_for_action(action, spec)
-        if DEBUG_PRINTS:
-            print(f"[JigsawBot W{self.bot_id + 1}] special placing at target={target} cells={cells}")
+        if DEBUG_PRINTS or diag.ENABLED:
+            self._dbg(f"[JigsawBot W{self.bot_id + 1}] special placing at target={target} cells={cells}")
         return JigsawActionResult("place", target, f"special action={action}"), {
             "chosen_action": action,
             "placement_cells": cells,
@@ -966,8 +1382,8 @@ class JigsawBot:
         }
 
     def _best_special_action(self, board: int, spec: PieceSpec) -> Optional[int]:
-        if DEBUG_PRINTS:
-            print(f"[JigsawBot W{self.bot_id + 1}] _best_special_action: spec={spec.piece_id} max_offset={spec.max_offset}")
+        if DEBUG_PRINTS or diag.ENABLED:
+            self._dbg(f"[JigsawBot W{self.bot_id + 1}] _best_special_action: spec={spec.piece_id} max_offset={spec.max_offset}")
         ranked = self.solver.rank_custom_actions(board, spec.mask, spec.max_offset, limit=1)
         best_action = ranked[0].action if ranked else None
         if DEBUG_PRINTS:
@@ -1017,11 +1433,11 @@ class JigsawBot:
 
     def _perform_decision(self, decision: JigsawActionResult,
                           cursor_rel: Optional[Tuple[int, int]] = None) -> None:
-        if DEBUG_PRINTS:
-            print(f"[JigsawBot W{self.bot_id + 1}] _perform_decision: action={decision.action} target={decision.target} reason={decision.reason}")
+        if DEBUG_PRINTS or diag.ENABLED:
+            self._dbg(f"[JigsawBot W{self.bot_id + 1}] _perform_decision: action={decision.action} target={decision.target} reason={decision.reason}")
         if decision.action == "place" and decision.target is not None:
-            if DEBUG_PRINTS:
-                print(f"[JigsawBot W{self.bot_id + 1}] placing piece at {decision.target}")
+            if DEBUG_PRINTS or diag.ENABLED:
+                self._dbg(f"[JigsawBot W{self.bot_id + 1}] placing piece at {decision.target}")
             self._click_window_point(decision.target, f"Place jigsaw piece ({decision.reason})",
                                      park_at=cursor_rel)
             return
@@ -1033,14 +1449,29 @@ class JigsawBot:
         """Right-clicks the held piece and confirms the discard dialog.
         ``verify``: check afterwards that the piece left the cursor (pointless
         when no piece could be recognized there in the first place)."""
-        if DEBUG_PRINTS:
-            print(f"[JigsawBot W{self.bot_id + 1}] discarding piece: {reason}")
+        if DEBUG_PRINTS or diag.ENABLED:
+            self._dbg(f"[JigsawBot W{self.bot_id + 1}] discarding piece: {reason}")
         self._status(f"Discarding jigsaw piece: {reason}")
+        # The held piece is drawn on top of the dialog. At the parked point
+        # (just right of Confirm) a 3x2 piece hides the whole Confirm area and
+        # the bigger normal pieces most of it, so the dialog would never be
+        # seen there. The area is watched with the piece moved clear of it,
+        # the baseline included.
+        watch = self._discard_watch_point()
+        if watch is not None:
+            self._move_held_piece(watch)
         baseline = self._confirm_area()
-        self._right_click_current_position("Discard jigsaw piece", cursor_rel)
-        self._wait_for_dialog(baseline, float(self.config.get("jigsaw_action_delay", 0.08)) * 0.6)
+        self._right_click_current_position("Discard jigsaw piece", cursor_rel, then_move_to=watch)
+        dialog_up = self._wait_for_dialog(baseline, float(self.config.get("jigsaw_action_delay", 0.08)) * 0.6)
         if not self.running:
             return   # stopped while waiting: leave the dialog alone
+        if baseline is not None and not dialog_up:
+            # No dialog: a confirm click now would land in the game world.
+            # The piece may still be held: the next round looks at the hand.
+            self._status("No discard dialog appeared; not clicking Confirm")
+            diag.log("DECISION", "discard: no dialog seen -> confirm not clicked", tag=self.diag_tag)
+            self._check_hand = cursor_rel
+            return
         self._click_window_point(self.confirm_button_pos, "Confirm discard",
                                  park_at=cursor_rel if verify else None)
         if not verify or cursor_rel is None or self.dry_run or not self.running:
@@ -1057,19 +1488,38 @@ class JigsawBot:
 
     # ------------------------------------------------------------ verification
 
-    _CONFIRM_AREA = (40, 16)   # width, height of the patch watched for a dialog
+    def _dialog_grab(self, x: int, y: int, w: int, h: int) -> np.ndarray:
+        """A fresh (uncached) capture of a window rectangle, for dialog_watch."""
+        self.capture.invalidate()
+        return self.capture_window_region(x, y, w, h)
 
     def _confirm_area(self) -> Optional[np.ndarray]:
         """Small grayscale patch around the confirm button (None in dry run)."""
         if self.dry_run or self.confirm_button_pos is None:
             return None
-        w, h = self._CONFIRM_AREA
-        cx, cy = self.confirm_button_pos
-        self.capture.invalidate()
-        patch = self.capture_window_region(cx - w // 2, cy - h // 2, w, h)
-        if patch.shape[0] < 4 or patch.shape[1] < 4:
-            return None
-        return cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+        return dialog_watch.read_patch(self._dialog_grab, self.confirm_button_pos)
+
+    def _dialog_still_up(self) -> bool:
+        """Does the confirm button area still differ from how it looked
+        before the crate click (a dialog waiting for its confirm)? Without
+        that baseline there is no telling: a blind confirm click would land
+        in the game world when no dialog is up, so the answer is no."""
+        # Compared with the area as last seen with no dialog up: a confirm
+        # that was lost leaves its dialog open, and the crate click after it
+        # then changes nothing (its own baseline already shows the dialog).
+        baseline = self._confirm_clear
+        if baseline is None:
+            baseline = self._crate_confirm_baseline
+        if baseline is None:
+            return False
+        change = dialog_watch.difference(
+            dialog_watch.read_patch(self._dialog_grab, self.confirm_button_pos,
+                                    (baseline.shape[1], baseline.shape[0])), baseline)
+        up = change is not None and change > dialog_watch.CHANGED
+        diag.log("DECISION", f"no piece after the crate: confirm area change {change} -> dialog "
+                             f"{'still up: confirm again' if up else 'not up: no second confirm'}",
+                 tag=self.diag_tag)
+        return up
 
     def _wait_for_dialog(self, baseline: Optional[np.ndarray], minimum: float) -> bool:
         """Waits until the confirm-button area changes, i.e. the dialog is up.
@@ -1078,37 +1528,48 @@ class JigsawBot:
         it — it depends on the client and, with several windows, on the focus
         switch — and a confirm click sent before it is there is simply lost.
         Always waits at least ``minimum``; gives up after the configured
-        timeout and lets the caller click anyway (the old fixed-delay
-        behavior). Returns True when a change was seen."""
-        start = time.perf_counter()
-        seen = False
-        if baseline is not None:
-            deadline = start + float(self.config.get("jigsaw_dialog_wait_timeout", 0.6))
-            while self.running and time.perf_counter() < deadline:
-                current = self._confirm_area()
-                if current is None or current.shape != baseline.shape:
-                    break
-                if float(cv2.absdiff(current, baseline).mean()) > 6.0:
-                    seen = True
-                    break
-                time.sleep(0.012)
-        remaining = minimum - (time.perf_counter() - start)
-        if remaining > 0:
-            time.sleep(remaining)
-        return seen
+        timeout and lets the caller decide. Returns True when a change was seen."""
+        if baseline is None:
+            diag.log("DECISION", "dialog wait: no baseline (dry run / no confirm position): fixed delay only",
+                     tag=self.diag_tag)
+            time.sleep(max(0.0, minimum))
+            return False
+        timeout = float(self.config.get("jigsaw_dialog_wait_timeout", 0.6))
+        if dialog_watch.wait(self._dialog_grab, self.confirm_button_pos, baseline, timeout,
+                             lambda: self.running, minimum=minimum, what="dialog", tag=self.diag_tag):
+            self._confirm_clear = baseline   # a dialog came up over it: it was clear
+            return True
+        if not self.running:
+            return False
+        # Not there yet. A slow client or a busy focus switch can be later
+        # than the usual wait; the confirm goes out only on a dialog, so a
+        # late one is worth a longer look before the round is given up.
+        late = max(1.0, 3 * timeout)
+        diag.log("DECISION", f"dialog not up within {timeout:.2f}s: waiting up to {late:.2f}s more",
+                 tag=self.diag_tag)
+        if dialog_watch.wait(self._dialog_grab, self.confirm_button_pos, baseline, late,
+                             lambda: self.running, what="late dialog", tag=self.diag_tag):
+            self._confirm_clear = baseline
+            return True
+        return False
 
     def _await_board(self, expected: int, timeout: float) -> Tuple[Optional[JigsawGridResult], bool]:
         """Reads the board until it shows ``expected`` or ``timeout`` passes.
         Returns (last reading, matched)."""
         deadline = time.perf_counter() + timeout
         grid = None
-        while self.running:
-            grid = self.detector.detect_grid(self.capture_full_window())
-            if grid.grid_found and grid.board_mask == expected:
-                return grid, True
-            if time.perf_counter() >= deadline:
-                break
-            time.sleep(0.05)
+        with diag.loop("await board", tag=self.diag_tag, expected=f"{expected:024b}", timeout=timeout) as lp:
+            while self.running:
+                grid = self.detector.detect_grid(self.capture_full_window())
+                lp.frame(f"board {grid.board_mask:024b} found={grid.grid_found}")
+                if grid.grid_found and grid.board_mask == expected:
+                    lp.set("result", "board shows the placement")
+                    return grid, True
+                if time.perf_counter() >= deadline:
+                    break
+                time.sleep(0.05)
+            lp.set("result", f"not matched; last board "
+                             f"{'never read' if grid is None else format(grid.board_mask, '024b')}")
         return grid, False
 
     def _confirm_placement(self, before: int, expected: int, decision: JigsawActionResult,
@@ -1121,9 +1582,18 @@ class JigsawBot:
         with the game. Returns False when the placement did not happen (the
         piece is then discarded so the next round starts clean)."""
         timeout = float(self.config.get("jigsaw_place_verify_timeout", 1.0))
+        self._last_placement_matched = False
+        first_sent = self._last_click_sent   # the placement click of _perform_decision
         grid, matched = self._await_board(expected, timeout)
+        if not matched and diag.ENABLED:
+            diag.log("DECISION", f"placement not confirmed: before={before:024b} expected={expected:024b} "
+                                 f"now={'?' if grid is None else format(grid.board_mask, '024b')}", tag=self.diag_tag)
+            diag.image("jigsaw_placement_not_seen", self.capture_full_window(), tag=self.diag_tag,
+                       note=f"decision {decision}")
         if matched:
             self._unverified_streak = 0
+            self._refused_streak = 0
+            self._last_placement_matched = True
             return True
         if not self.running:
             return False   # stopped while waiting: send nothing further
@@ -1135,16 +1605,40 @@ class JigsawBot:
             return True
 
         self._status("Placement did not show up on the board; clicking again")
-        self._click_window_point(decision.target, "Place jigsaw piece (retry)", park_at=cursor_rel)
+        retry_sent = self._click_window_point(decision.target, "Place jigsaw piece (retry)", park_at=cursor_rel)
         grid, matched = self._await_board(expected, timeout)
+        self._last_placement_matched = matched
         if matched or grid is None or not grid.grid_found or grid.board_mask != before:
             self._unverified_streak = 0
             return True
 
         piece = self._detect_cursor_piece(cursor_rel)
+        if not (first_sent and retry_sent):
+            # A placement click was never sent (the window was not in front):
+            # the game had nothing to refuse, so no cell is suspect. The piece
+            # is most likely still held — also when it was not recognized just
+            # now (the cursor may not have been brought back without the
+            # focus) — so the next round looks at the hand before opening a crate.
+            diag.log("DECISION", f"placement not seen, but the click was not sent (first={first_sent}, "
+                                 f"retry={retry_sent}, piece seen={piece.piece_id}): no cell marked suspect, "
+                                 f"hand checked next round", tag=self.diag_tag)
+            self._check_hand = cursor_rel
+            return False
         if piece.piece_id is not None:
+            # The game refused: at least one of the target cells is filled
+            # although it reads empty. Those cells are avoided from now on.
+            self._suspect_mask |= expected & ~before
+            self._suspect_board = before
+            self._refused_streak += 1
+            diag.log("DECISION", f"placement refused ({self._refused_streak} in a row): cells "
+                                 f"{expected & ~before:024b} now treated as filled", tag=self.diag_tag)
             self._discard_piece(cursor_rel, "the game did not accept the placement")
             self._check_hand = cursor_rel
+            limit = int(self.config.get("jigsaw_max_refused_placements", 2))
+            if limit > 0 and self._refused_streak >= limit:
+                self._refused_streak = 0
+                self._pause("the game refused placements on cells that read as empty — re-align the grid "
+                            "with Define Grid, or check that nothing covers the puzzle")
             return False
         # No piece in hand and no change on the board: the piece went somewhere
         # the detector cannot see. Repeatedly => the grid is probably misaligned.
@@ -1210,13 +1704,14 @@ class JigsawBot:
         return (grid.board_mask | (spec.mask >> action)) == FULL_BOARD_MASK
 
     def _handle_completed_board(self) -> None:
+        self._suspect_mask = self._suspect_board = 0   # the next board starts empty
         # After the last piece slots in, the game shows a 3 s "board complete" animation
         # before the result dialog appears. Wait it out before polling for the OK button.
         post_complete_wait = float(self.config.get("jigsaw_post_complete_wait", 3.0))
         if post_complete_wait > 0:
             self._status(f"Board complete; waiting {post_complete_wait:.1f}s for animation")
-            if DEBUG_PRINTS:
-                print(f"[JigsawBot W{self.bot_id + 1}] post-complete wait {post_complete_wait}s")
+            if DEBUG_PRINTS or diag.ENABLED:
+                self._dbg(f"[JigsawBot W{self.bot_id + 1}] post-complete wait {post_complete_wait}s")
             self._debug_update("board_complete_wait", f"waiting {post_complete_wait:.1f}s")
             wait_end = time.perf_counter() + post_complete_wait
             while self.running and time.perf_counter() < wait_end:
@@ -1229,28 +1724,64 @@ class JigsawBot:
         poll_interval = float(self.config.get("jigsaw_completion_poll_interval", 0.10))
 
         self._status(f"Board complete; polling for result confirm (budget {total_budget:.1f}s)")
-        if DEBUG_PRINTS:
-            print(f"[JigsawBot W{self.bot_id + 1}] _handle_completed_board: polling up to {total_budget}s")
+        if DEBUG_PRINTS or diag.ENABLED:
+            self._dbg(f"[JigsawBot W{self.bot_id + 1}] _handle_completed_board: polling up to {total_budget}s")
         self._debug_update("board_complete", f"polling up to {total_budget:.1f}s for result")
 
         deadline = time.perf_counter() + total_budget
-        while self.running and time.perf_counter() < deadline:
-            frame = self.capture_full_window()
-            # detect_confirm_button does its own gray conversion only if needed.
-            ok_pos = self.detector.detect_confirm_button(frame)
-            if ok_pos is not None:
-                target = (ok_pos[0] + offset_x, ok_pos[1])
-                if DEBUG_PRINTS:
-                    print(f"[JigsawBot W{self.bot_id + 1}] clicking result confirm at {target}")
-                self._debug_update("result_confirm", f"OK={ok_pos} click={target}", decision_target=target)
-                self._click_window_point(target, "Confirm jigsaw result")
-                time.sleep(float(self.config.get("jigsaw_action_delay", 0.08)))
-                return
-            time.sleep(poll_interval)
+        frame = None
+        result_pt = self._result_point()
+        baseline = self._result_baseline
+        changed_polls = 0
+        with diag.loop("poll result confirm", tag=self.diag_tag, budget=total_budget, at=result_pt,
+                       baseline=baseline is not None) as lp:
+            while self.running and time.perf_counter() < deadline:
+                frame = self.capture_full_window()
+                lp.frame()
+                target = None
+                # A shipped template finds the button itself...
+                ok_pos = self.detector.detect_confirm_button(frame)
+                if ok_pos is not None:
+                    target = (ok_pos[0] + offset_x, ok_pos[1])
+                    lp.set("result", f"OK template at {ok_pos}, click {target}")
+                elif baseline is not None:
+                    # ... otherwise the dialog must be seen at the result
+                    # point: it looks different from before the crate (twice
+                    # in a row, so a passing effect does not count).
+                    change = dialog_watch.difference(
+                        dialog_watch.read_patch(self._dialog_grab, result_pt,
+                                                (baseline.shape[1], baseline.shape[0])), baseline)
+                    lp.score("change", change or 0.0)
+                    changed_polls = changed_polls + 1 if change is not None and change > dialog_watch.CHANGED else 0
+                    if changed_polls >= 2:
+                        target = result_pt
+                        lp.set("result", f"dialog seen at {result_pt} (change {change:.1f})")
+                if target is not None:
+                    if DEBUG_PRINTS or diag.ENABLED:
+                        self._dbg(f"[JigsawBot W{self.bot_id + 1}] clicking result confirm at {target}")
+                    self._debug_update("result_confirm", f"click={target}", decision_target=target)
+                    self._click_window_point(target, "Confirm jigsaw result")
+                    time.sleep(float(self.config.get("jigsaw_action_delay", 0.08)))
+                    return
+                time.sleep(poll_interval)
+            lp.set("result", "not found")
+        if diag.ENABLED and frame is not None:
+            diag.image("jigsaw_result_confirm_not_found", frame, tag=self.diag_tag)
 
-        if DEBUG_PRINTS:
-            print(f"[JigsawBot W{self.bot_id + 1}] result confirm button not detected within {total_budget}s")
-        self._status("Jigsaw result confirm button not detected")
+        if DEBUG_PRINTS or diag.ENABLED:
+            self._dbg(f"[JigsawBot W{self.bot_id + 1}] result dialog not seen within {total_budget}s")
+        self._status("Jigsaw result dialog not seen — nothing clicked")
+
+    def _result_point(self) -> Tuple[int, int]:
+        """Window point of the result dialog's OK button: configured
+        (jigsaw_result_button_pos), or the lower middle of the window where
+        the game puts it (half width + jigsaw_result_confirm_x_offset, 63 %
+        of the height)."""
+        point = self._configured_point("jigsaw_result_button_pos")
+        if point is not None:
+            return point
+        _, _, w, h = self.window_manager.get_window_rect()
+        return (w // 2 + int(self.config.get("jigsaw_result_confirm_x_offset", 15)), int(h * 0.63))
 
     def _open_crate_and_confirm(self, crate_point: Tuple[int, int], section: str) -> Optional[Tuple[int, int]]:
         """Open a crate, confirm it, and park the cursor with one foreground lock hold."""
@@ -1264,26 +1795,36 @@ class JigsawBot:
         if self.dry_run:
             return parked
 
-        left, top, _, _ = self.window_manager.get_window_rect()
         cursor_settle = float(self.config.get("timing_cursor_settle", 0.008))
         between_click_delay = float(self.config.get("jigsaw_crate_confirm_delay", 0.06))
-        crate_x, crate_y = left + crate_point[0], top + crate_point[1]
-        confirm_x, confirm_y = left + confirm_point[0], top + confirm_point[1]
-        parked_x, parked_y = left + parked[0], top + parked[1]
 
         with input_lock:
             if not self._focus():
                 return parked
+            # Read after the focus: a minimized window was just restored and
+            # has its real place only now.
+            left, top, _, _ = self.window_manager.get_window_rect()
+            crate_x, crate_y = left + crate_point[0], top + crate_point[1]
+            confirm_x, confirm_y = left + confirm_point[0], top + confirm_point[1]
+            parked_x, parked_y = left + parked[0], top + parked[1]
             switched = self._switched
             self._verify_capture()
             self.human.move_to(crate_x, crate_y)
             self.human.sleep(max(cursor_settle, self._SWITCH_SETTLE if switched else 0.0))
             baseline = self._confirm_area()
+            self._crate_confirm_baseline = baseline
             self.human.click()
             # Click "confirm" when the dialog is there, not a fixed time later.
-            self._wait_for_dialog(baseline, between_click_delay)
+            dialog_up = self._wait_for_dialog(baseline, between_click_delay)
             if not self.running:
                 return parked   # stopped while waiting: leave the dialog alone
+            if baseline is not None and not dialog_up:
+                # No dialog came: a confirm click would land in the game
+                # world. The round finds no new piece and tries again.
+                diag.log("DECISION", "open crate: no dialog seen -> confirm not clicked", tag=self.diag_tag)
+                self._status("No dialog appeared after clicking the crate; not clicking Confirm")
+                self.human.move_to(parked_x, parked_y)
+                return parked
             self.human.move_to(confirm_x, confirm_y)
             if cursor_settle > 0:
                 self.human.sleep(cursor_settle)
@@ -1342,23 +1883,26 @@ class JigsawBot:
         return cursor_rel
 
     def _click_window_point(self, point: Tuple[int, int], description: str,
-                            park_at: Optional[Tuple[int, int]] = None) -> None:
+                            park_at: Optional[Tuple[int, int]] = None) -> bool:
         """Clicks a window-relative point. With ``park_at`` the cursor is taken
         there right after the click, in the same lock hold: a piece that is
         still on the cursor (the click was not accepted) must not stay over
         the grid, where it looks exactly like placed cells."""
-        left, top, _, _ = self.window_manager.get_window_rect()
-        screen_x, screen_y = left + point[0], top + point[1]
-        if DEBUG_PRINTS:
-            print(f"[JigsawBot W{self.bot_id + 1}] _click_window_point: {description} rel={point} screen=({screen_x},{screen_y}) dry_run={self.dry_run}")
+        if DEBUG_PRINTS or diag.ENABLED:
+            self._dbg(f"[JigsawBot W{self.bot_id + 1}] _click_window_point: {description} rel={point} dry_run={self.dry_run}")
         self._status(f"{description} at ({point[0]}, {point[1]})")
+        self._last_click_sent = False
         if self.dry_run:
-            return
+            return False
         cursor_settle = float(self.config.get("timing_cursor_settle", 0.008))
         with input_lock:
             # Fast path inside activate_window early-returns when our HWND is already foreground.
             if not self._focus():
-                return
+                diag.log("DECISION", f"{description}: window not in front, click NOT sent", tag=self.diag_tag)
+                return False
+            # Read after the focus: a restored window has its real place only now.
+            left, top, _, _ = self.window_manager.get_window_rect()
+            screen_x, screen_y = left + point[0], top + point[1]
             switched = self._switched
             self.human.move_to(screen_x, screen_y)
             # After a focus switch the game first has to notice the cursor (and
@@ -1373,13 +1917,18 @@ class JigsawBot:
                 self.human.move_to(left + park_at[0], top + park_at[1])
                 self.human.sleep(max(cursor_settle, self._PARK_SETTLE))
             self.capture.invalidate()
+        self._last_click_sent = True
+        return True
 
     def _right_click_current_position(self, description: str,
-                                      cursor_rel: Optional[Tuple[int, int]] = None) -> None:
+                                      cursor_rel: Optional[Tuple[int, int]] = None,
+                                      then_move_to: Optional[Tuple[int, int]] = None) -> None:
         """Right-clicks where this window's piece is held (``cursor_rel``), or at
-        the current cursor position when that is unknown."""
-        if DEBUG_PRINTS:
-            print(f"[JigsawBot W{self.bot_id + 1}] _right_click_current_position: {description} dry_run={self.dry_run}")
+        the current cursor position when that is unknown. With ``then_move_to``
+        the cursor (and the piece with it) goes there right after, in the
+        same lock hold."""
+        if DEBUG_PRINTS or diag.ENABLED:
+            self._dbg(f"[JigsawBot W{self.bot_id + 1}] _right_click_current_position: {description} dry_run={self.dry_run}")
         self._status(description)
         if self.dry_run:
             return
@@ -1389,6 +1938,55 @@ class JigsawBot:
             if cursor_rel is not None:
                 self._restore_cursor(cursor_rel)
             self.human.click(button="right")
+            if then_move_to is not None:
+                self._settle_held_piece_at(then_move_to)
+
+    # dialog_watch.PATCH half width, plus a margin: the watched Confirm area
+    _CONFIRM_PATCH_HALF_W = 20 + 6
+
+    def _discard_watch_point(self) -> Optional[Tuple[int, int]]:
+        """Where the cursor rests while the discard dialog is awaited: far
+        enough beside Confirm that a held piece (centered on the cursor, up
+        to 3 cells wide) leaves the watched Confirm area uncovered. Right of
+        Confirm, else left of it; None when neither fits in the window (the
+        piece then stays where it is held)."""
+        if self.dry_run or self.confirm_button_pos is None:
+            return None
+        bounds = self.config.get("jigsaw_grid_bounds")
+        try:
+            cell = float(bounds[2]) / 6.0
+        except (TypeError, ValueError, IndexError):
+            cell = JigsawDetector.DEFAULT_GRID_SIZE[0] / 6.0
+        offset = self._CONFIRM_PATCH_HALF_W + int(round(1.5 * cell)) + 1
+        cx, cy = self.confirm_button_pos
+        try:
+            _, _, win_w, _ = self.window_manager.get_window_rect()
+        except Exception:
+            diag.exc("discard watch point: window size", tag=self.diag_tag)
+            return None
+        half_piece = int(round(1.5 * cell))
+        if cx + offset + half_piece < win_w:
+            return (cx + offset, cy)
+        if cx - offset - half_piece >= 0:
+            return (cx - offset, cy)
+        return None
+
+    def _settle_held_piece_at(self, point: Tuple[int, int]) -> None:
+        """Moves the cursor (input_lock held, window in front) and gives the
+        game a moment to redraw the held piece there."""
+        left, top, _, _ = self.window_manager.get_window_rect()
+        self.human.move_to(left + point[0], top + point[1])
+        self.human.sleep(max(float(self.config.get("timing_cursor_settle", 0.008)), self._PARK_SETTLE))
+        self.capture.invalidate()
+
+    def _move_held_piece(self, point: Tuple[int, int]) -> None:
+        """Takes the cursor (and a held piece) to a window point. Nothing is
+        clicked."""
+        if self.dry_run:
+            return
+        with input_lock:
+            if self._focus():
+                self._settle_held_piece_at(point)
 
     def _verify_capture(self) -> None:
         """While per-window capture is unproven, check it now (input_lock held,
@@ -1403,15 +2001,15 @@ class JigsawBot:
         if self.dry_run or self.window_manager is None:
             return
         try:
-            if DEBUG_PRINTS:
-                print(f"[JigsawBot W{self.bot_id + 1}] _activate_window_for_jigsaw: {description}")
+            if DEBUG_PRINTS or diag.ENABLED:
+                self._dbg(f"[JigsawBot W{self.bot_id + 1}] _activate_window_for_jigsaw: {description}")
             self._status(description)
             with input_lock:
                 self.window_manager.activate_window()
                 self._verify_capture()
         except Exception as e:
-            if DEBUG_PRINTS:
-                print(f"[JigsawBot W{self.bot_id + 1}] _activate_window_for_jigsaw ERROR: {e}")
+            if DEBUG_PRINTS or diag.ENABLED:
+                self._dbg(f"[JigsawBot W{self.bot_id + 1}] _activate_window_for_jigsaw ERROR: {e}")
             self._status(f"Could not activate jigsaw window: {e}")
 
     def _current_cursor_relative(self) -> Optional[Tuple[int, int]]:
@@ -1440,25 +2038,25 @@ class JigsawBot:
             return None
 
     def _resolve_piece(self, piece_id: str, figure_index: Optional[int], section: str) -> Optional[PieceSpec]:
-        if DEBUG_PRINTS:
-            print(f"[JigsawBot W{self.bot_id + 1}] _resolve_piece: piece_id={piece_id} figure_index={figure_index} section={section}")
+        if DEBUG_PRINTS or diag.ENABLED:
+            self._dbg(f"[JigsawBot W{self.bot_id + 1}] _resolve_piece: piece_id={piece_id} figure_index={figure_index} section={section}")
         if figure_index is not None:
             key = f"figure_{figure_index}"
             spec = self.pieces.get(key)
-            if DEBUG_PRINTS:
-                print(f"[JigsawBot W{self.bot_id + 1}] resolved by figure_index -> key={key} found={spec is not None}")
+            if DEBUG_PRINTS or diag.ENABLED:
+                self._dbg(f"[JigsawBot W{self.bot_id + 1}] resolved by figure_index -> key={key} found={spec is not None}")
             return spec
         if piece_id in self.pieces:
-            if DEBUG_PRINTS:
-                print(f"[JigsawBot W{self.bot_id + 1}] resolved by piece_id={piece_id}")
+            if DEBUG_PRINTS or diag.ENABLED:
+                self._dbg(f"[JigsawBot W{self.bot_id + 1}] resolved by piece_id={piece_id}")
             return self.pieces[piece_id]
         if section == "special":
             spec = self.pieces.get("jigsaw_piece_deluxe") or self.pieces.get("special_3x2")
-            if DEBUG_PRINTS:
-                print(f"[JigsawBot W{self.bot_id + 1}] special fallback resolved: {spec.piece_id if spec else None}")
+            if DEBUG_PRINTS or diag.ENABLED:
+                self._dbg(f"[JigsawBot W{self.bot_id + 1}] special fallback resolved: {spec.piece_id if spec else None}")
             return spec
-        if DEBUG_PRINTS:
-            print(f"[JigsawBot W{self.bot_id + 1}] _resolve_piece: no match found for piece_id={piece_id}")
+        if DEBUG_PRINTS or diag.ENABLED:
+            self._dbg(f"[JigsawBot W{self.bot_id + 1}] _resolve_piece: no match found for piece_id={piece_id}")
         return None
 
     def _build_piece_registry(self) -> Dict[str, PieceSpec]:
@@ -1493,8 +2091,8 @@ class JigsawBot:
                     (5 - max_x, 3 - max_y),
                 )
             except Exception as e:
-                if DEBUG_PRINTS:
-                    print(f"Invalid jigsaw special mask {piece_id}: {e}")
+                if DEBUG_PRINTS or diag.ENABLED:
+                    self._dbg(f"Invalid jigsaw special mask {piece_id}: {e}")
         return pieces
 
     def _pause(self, reason: str) -> None:
@@ -1505,9 +2103,14 @@ class JigsawBot:
             try:
                 self.on_pause_change(self.bot_id, True)
             except Exception:
+                diag.exc(tag=self.diag_tag)
                 pass
 
     def _debug_update(self, event: str, detail: str = "", **snapshot) -> None:
+        if diag.ENABLED:
+            extra = {k: v for k, v in snapshot.items() if k != "frame"}
+            diag.log("STATE", f"{event}: {detail} {diag.summarize(extra, 80) if extra else ''}".rstrip(),
+                     tag=self.diag_tag, depth=1)
         # Skip when no debug UI is attached: avoids per-event lock contention and
         # multi-MB frame.copy() that otherwise runs ~10x per loop iteration.
         if not self._debug_consumer:
@@ -1541,8 +2144,50 @@ class JigsawBot:
             path = os.path.join(self.debug_dir, f"{int(time.time() * 1000)}_{label}.png")
             cv2.imwrite(path, frame)
         except Exception:
-            pass
+            diag.exc("jigsaw debug screenshot", tag=self.diag_tag)
 
     def _status(self, message: str) -> None:
+        if diag.ENABLED:
+            diag.log("STAT", message, tag=self.diag_tag, depth=1)
         if self.on_status_update:
             self.on_status_update(f"[W{self.bot_id + 1}] {message}")
+
+    def _dbg(self, message: str) -> None:
+        """A decision trace line: diagnostic log (release builds too) and
+        console when DEBUG_PRINTS is on."""
+        if diag.ENABLED:
+            text = message.split("] ", 1)[1] if message.startswith("[JigsawBot") and "] " in message else message
+            diag.log("DECISION", text, tag=self.diag_tag, depth=1)
+        if DEBUG_PRINTS:
+            print(message)
+
+    def _diag_header(self) -> None:
+        try:
+            keys = sorted(k for k in self.config if k.startswith("jigsaw_"))
+            effective = {k: self.config.get(k) for k in keys}
+            effective.update({
+                "window_rect": self.window_manager.get_window_rect(),
+                "confirm_button_pos": self.confirm_button_pos,
+                "discard_action_pos": self.discard_action_pos,
+                "inventory_pages": self._configured_inventory_pages(),
+                "inventory_strip": {"rect": self._inventory_rect(),
+                                    "fixed_fallback": {"width_from_right": self._inventory_width,
+                                                       "y_offset": self._inventory_y_offset}},
+                "mouse_backend_used": getattr(self.mouse_backend, "name", type(self.mouse_backend).__name__),
+                "capture_mode": getattr(self.capture, "requested", None),
+                "dry_run": self.dry_run,
+                "human_like_clicking": self.human.enabled,
+                "timing_cursor_settle": self.config.get("timing_cursor_settle"),
+            })
+            diag.set_effective(f"{self.diag_tag}_jigsaw", effective)
+            diag.block("SESSION", f"jigsaw bot {self.diag_tag} starts with:",
+                       [f"{k} = {v}" for k, v in effective.items()], tag=self.diag_tag)
+        except Exception:
+            diag.exc("jigsaw header", tag=self.diag_tag)
+
+
+# Diagnostic log: entry/exit of every worker method (no-op while off).
+diag.trace_class(JigsawBot, exclude=(
+    "_status", "_dbg", "_debug_update", "debug_snapshot", "debug_events", "set_debug_consumer",
+    "_diag_header", "_cursor_position", "_configured_point",
+))

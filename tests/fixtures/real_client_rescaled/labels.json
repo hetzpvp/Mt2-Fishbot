@@ -1,0 +1,712 @@
+{
+ "source": "YouTube tutorial recording (Italian client), 1280x720 game uploaded as 1920x1080; frames shrunk 1.5x (INTER_AREA) back to the game's size, so the UI is 1:1 but slightly blurred",
+ "inventory": {
+  "204.39": {
+   "empty": [
+    [
+     1,
+     3
+    ],
+    [
+     1,
+     4
+    ],
+    [
+     1,
+     5
+    ],
+    [
+     2,
+     5
+    ]
+   ],
+   "row1": {
+    "1": "Carp_living.jpg",
+    "2": "Salmon_living.jpg"
+   }
+  },
+  "210.90": {
+   "empty": [
+    [
+     1,
+     4
+    ],
+    [
+     1,
+     5
+    ],
+    [
+     2,
+     5
+    ]
+   ],
+   "row1": {
+    "1": "Carp_living.jpg",
+    "2": "Salmon_living.jpg",
+    "3": "Aal_living.jpg"
+   }
+  },
+  "228.92": {
+   "empty": [
+    [
+     1,
+     5
+    ],
+    [
+     2,
+     5
+    ]
+   ],
+   "row1": {
+    "1": "Carp_living.jpg",
+    "2": "Salmon_living.jpg",
+    "3": "Aal_living.jpg",
+    "4": "Shiri_living.jpg"
+   }
+  }
+ },
+ "board": {
+  "549.02": {
+   "filled": []
+  },
+  "551.02": {
+   "filled": [
+    14,
+    15,
+    21
+   ]
+  },
+  "597.06": {
+   "filled": [
+    6,
+    12,
+    14,
+    15,
+    18,
+    21
+   ]
+  },
+  "607.07": {
+   "filled": [
+    6,
+    12,
+    13,
+    14,
+    15,
+    18,
+    19,
+    20,
+    21
+   ]
+  },
+  "715.18": {
+   "filled": [
+    0,
+    1,
+    7,
+    8,
+    14,
+    15,
+    16,
+    17,
+    21,
+    22,
+    23
+   ]
+  },
+  "537.00": {
+   "filled": [
+    2,
+    3,
+    9,
+    13,
+    14,
+    15,
+    16,
+    17,
+    19,
+    20,
+    21,
+    22,
+    23
+   ]
+  },
+  "612.08": {
+   "filled": [
+    0,
+    1,
+    2,
+    3,
+    6,
+    7,
+    9,
+    12,
+    13,
+    14,
+    15,
+    18,
+    19,
+    20,
+    21
+   ]
+  },
+  "694.66": {
+   "filled": [
+    4,
+    5,
+    6,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    22,
+    23
+   ]
+  },
+  "697.16": {
+   "filled": [
+    2,
+    3,
+    4,
+    5,
+    6,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23
+   ]
+  },
+  "623.59": {
+   "filled": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23
+   ]
+  },
+  "547.51": {
+   "filled": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23
+   ]
+  }
+ },
+ "held": {
+  "565.53": {
+   "piece": "piece3",
+   "box": [
+    30,
+    30,
+    29,
+    28
+   ]
+  },
+  "579.80": {
+   "piece": "piece1",
+   "box": [
+    30,
+    30,
+    59,
+    27
+   ]
+  },
+  "582.55": {
+   "piece": "piece5",
+   "box": [
+    30,
+    30,
+    28,
+    30
+   ]
+  },
+  "602.82": {
+   "piece": "piece4",
+   "box": [
+    30,
+    30,
+    27,
+    91
+   ]
+  },
+  "612.83": {
+   "piece": "piece2",
+   "box": [
+    30,
+    30,
+    27,
+    30
+   ]
+  },
+  "691.41": {
+   "piece": "piece6",
+   "box": [
+    30,
+    30,
+    29,
+    27
+   ]
+  },
+  "727.69": {
+   "piece": "piece5",
+   "box": [
+    30,
+    30,
+    29,
+    29
+   ]
+  },
+  "737.20": {
+   "piece": "piece3",
+   "box": [
+    30,
+    30,
+    59,
+    28
+   ]
+  }
+ },
+ "panel": {
+  "101.00": {
+   "fish": [
+    173,
+    64
+   ]
+  },
+  "120.50": {
+   "fish": [
+    243,
+    78
+   ]
+  },
+  "224.50": {
+   "fish": [
+    98,
+    66
+   ]
+  },
+  "231.00": {
+   "fish": [
+    163,
+    73
+   ]
+  },
+  "302.50": {
+   "fish": [
+    116,
+    72
+   ]
+  },
+  "328.50": {
+   "fish": [
+    26,
+    92
+   ]
+  },
+  "413.00": {
+   "fish": [
+    63,
+    72
+   ]
+  },
+  "361.00": {
+   "fish": null
+  }
+ },
+ "inventory_layout": {
+  "size": [
+   220,
+   350
+  ],
+  "tabs": {
+   "1": [
+    62,
+    21
+   ],
+   "2": [
+    100,
+    21
+   ],
+   "3": [
+    138,
+    21
+   ],
+   "4": [
+    178,
+    21
+   ]
+  },
+  "active_tab": 3,
+  "first_slot_center": [
+   68,
+   49
+  ],
+  "slot": 32
+ },
+ "board_layout": {
+  "grid_bounds": [
+   18,
+   19,
+   194,
+   130
+  ],
+  "crates": "both slots hold a crate in every board frame"
+ },
+ "inventory_page4": {
+  "file": "inventory_page4_0660.00.png",
+  "active_tab": 4,
+  "tabs": {
+   "1": [
+    56,
+    21
+   ],
+   "2": [
+    94,
+    21
+   ],
+   "3": [
+    132,
+    21
+   ],
+   "4": [
+    172,
+    21
+   ]
+  },
+  "first_slot_center": [
+   62,
+   49
+  ],
+  "empty": [
+   [
+    3,
+    5
+   ],
+   [
+    5,
+    5
+   ]
+  ],
+  "note": "jigsaw puzzle items only, no fish. The arrows in row 5, columns 1-3, match Large_zander_living at 0.81 in gray."
+ },
+ "dialog_replay": {
+  "point": "the No button of the game's yes/no dialogs (680, 375 in the 1280x720 frame)",
+  "fps": 60,
+  "patch": [
+   40,
+   16
+  ],
+  "note": "gray patches, one per video frame; up_from/up_to: frames where the dialog is on screen (checked with a template of its No button)",
+  "sequences": [
+   {
+    "kind": "dialog",
+    "up_from": 30,
+    "up_to": 54,
+    "n": 85,
+    "t0": 522.655
+   },
+   {
+    "kind": "dialog",
+    "up_from": 30,
+    "up_to": 58,
+    "n": 89,
+    "t0": 545.462
+   },
+   {
+    "kind": "dialog",
+    "up_from": 30,
+    "up_to": 50,
+    "n": 81,
+    "t0": 547.997
+   },
+   {
+    "kind": "dialog",
+    "up_from": 30,
+    "up_to": 70,
+    "n": 101,
+    "t0": 556.856
+   },
+   {
+    "kind": "dialog",
+    "up_from": 30,
+    "up_to": 45,
+    "n": 76,
+    "t0": 558.725
+   },
+   {
+    "kind": "dialog",
+    "up_from": 30,
+    "up_to": 100,
+    "n": 131,
+    "t0": 586.286
+   },
+   {
+    "kind": "dialog",
+    "up_from": 30,
+    "up_to": 49,
+    "n": 80,
+    "t0": 590.123
+   },
+   {
+    "kind": "dialog",
+    "up_from": 30,
+    "up_to": 55,
+    "n": 86,
+    "t0": 596.763
+   },
+   {
+    "kind": "dialog",
+    "up_from": 30,
+    "up_to": 65,
+    "n": 96,
+    "t0": 600.45
+   },
+   {
+    "kind": "dialog",
+    "up_from": 30,
+    "up_to": 45,
+    "n": 76,
+    "t0": 637.27
+   },
+   {
+    "kind": "dialog",
+    "up_from": 30,
+    "up_to": 63,
+    "n": 94,
+    "t0": 645.879
+   },
+   {
+    "kind": "dialog",
+    "up_from": 30,
+    "up_to": 46,
+    "n": 77,
+    "t0": 647.28
+   },
+   {
+    "kind": "dialog",
+    "up_from": 30,
+    "up_to": 56,
+    "n": 87,
+    "t0": 662.061
+   },
+   {
+    "kind": "dialog",
+    "up_from": 30,
+    "up_to": 43,
+    "n": 74,
+    "t0": 664.864
+   },
+   {
+    "kind": "dialog",
+    "up_from": 30,
+    "up_to": 57,
+    "n": 88,
+    "t0": 667.55
+   },
+   {
+    "kind": "dialog",
+    "up_from": 30,
+    "up_to": 66,
+    "n": 97,
+    "t0": 700.116
+   },
+   {
+    "kind": "dialog",
+    "up_from": 30,
+    "up_to": 45,
+    "n": 76,
+    "t0": 702.852
+   },
+   {
+    "kind": "dialog",
+    "up_from": 30,
+    "up_to": 60,
+    "n": 91,
+    "t0": 715.982
+   },
+   {
+    "kind": "dialog",
+    "up_from": 30,
+    "up_to": 57,
+    "n": 88,
+    "t0": 717.433
+   },
+   {
+    "kind": "dialog",
+    "up_from": 30,
+    "up_to": 64,
+    "n": 95,
+    "t0": 747.447
+   },
+   {
+    "kind": "dialog",
+    "up_from": 30,
+    "up_to": 52,
+    "n": 83,
+    "t0": 761.277
+   },
+   {
+    "kind": "dialog",
+    "up_from": 30,
+    "up_to": 63,
+    "n": 94,
+    "t0": 766.649
+   },
+   {
+    "kind": "dialog",
+    "up_from": 30,
+    "up_to": 42,
+    "n": 73,
+    "t0": 767.85
+   },
+   {
+    "kind": "dialog",
+    "up_from": 30,
+    "up_to": 72,
+    "n": 103,
+    "t0": 780.413
+   },
+   {
+    "kind": "quiet",
+    "n": 61,
+    "t0": 546.73
+   },
+   {
+    "kind": "quiet",
+    "n": 61,
+    "t0": 559.776
+   },
+   {
+    "kind": "quiet",
+    "n": 61,
+    "t0": 568.384
+   },
+   {
+    "kind": "quiet",
+    "n": 61,
+    "t0": 588.254
+   },
+   {
+    "kind": "quiet",
+    "n": 61,
+    "t0": 597.981
+   },
+   {
+    "kind": "quiet",
+    "n": 61,
+    "t0": 611.177
+   },
+   {
+    "kind": "quiet",
+    "n": 61,
+    "t0": 635.785
+   },
+   {
+    "kind": "quiet",
+    "n": 61,
+    "t0": 681.164
+   },
+   {
+    "kind": "quiet",
+    "n": 61,
+    "t0": 701.517
+   },
+   {
+    "kind": "quiet",
+    "n": 61,
+    "t0": 718.685
+   },
+   {
+    "kind": "quiet",
+    "n": 61,
+    "t0": 723.356
+   },
+   {
+    "kind": "quiet",
+    "n": 61,
+    "t0": 733.549
+   }
+  ]
+ },
+ "crates_in_inventory": {
+  "note": "puzzle crates in the inventory, as the refill search must find them. Normal crate (green lid, tooltip 'Sc. Puzzle pesci') on page II row 4 col 4; special crate (yellow coin lid, red with blue sides, the look of the puzzle's special slot) on page III row 1 col 5; page IV row 1 col 5 holds another chest that is neither.",
+  "frames": {
+   "inventory_page2_0117.00.png": {
+    "crates": {
+     "normal": [
+      164,
+      140
+     ]
+    }
+   },
+   "inventory_page3_0300.00.png": {
+    "crates": {
+     "special": [
+      196,
+      44
+     ]
+    }
+   }
+  },
+  "none": "inventory_page4_0660.00.png"
+ }
+}

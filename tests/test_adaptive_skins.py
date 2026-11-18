@@ -406,6 +406,7 @@ class GameLoopAdaptTests(unittest.TestCase):
         bot._grab = grab
         bot.bait_and_cast = cast
         bot._startup_scan_and_process_all_pages = lambda: None
+        bot._resume_inventory_check = lambda: None
         bot.handle_caught_item = lambda may_have_catch=True: None
         thread = threading.Thread(target=bot.play_game, daemon=True)
         thread.start()

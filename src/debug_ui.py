@@ -226,11 +226,11 @@ class IgnoredPositionsWindow(DebugWindow):
                 _, _, win_width, win_height = self.bot.window_manager.get_window_rect()
 
                 # Capture the right-side inventory strip (same region the bot scans)
-                inventory_frame = self.sct.grab(
-                    win_width - self.bot._inventory_width,
-                    self.bot._inventory_y_offset,
-                    self.bot._inventory_width,
-                    max(0, win_height - self.bot._inventory_y_offset - 30))
+                import inventory_layout
+                (inv_x, inv_y, inv_w, inv_h), _ = inventory_layout.strip_rect(
+                    self.bot.config, win_width, win_height,
+                    self.bot._inventory_width, self.bot._inventory_y_offset)
+                inventory_frame = self.sct.grab(inv_x, inv_y, inv_w, max(0, inv_h))
 
             except Exception as e:
                 if DEBUG_PRINTS:

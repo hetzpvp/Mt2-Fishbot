@@ -7,6 +7,7 @@ lives in those shared modules.
 """
 
 import ctypes
+import sys
 from ctypes import wintypes
 from typing import List, Optional, Tuple
 
@@ -147,6 +148,53 @@ def restore(hwnd) -> None:
     _user32.ShowWindow(hwnd, _SW_RESTORE)
 
 
+def get_client_rect(hwnd) -> Optional[Tuple[int, int, int, int]]:
+    """Client area in screen coordinates (diagnostics only: the bot itself
+    works in GetWindowRect coordinates)."""
+    if not hwnd or _user32 is None:
+        return None
+    r = wintypes.RECT()
+    if not _user32.GetClientRect(wintypes.HWND(hwnd), ctypes.byref(r)):
+        return None
+    pt = wintypes.POINT(0, 0)
+    _user32.ClientToScreen(wintypes.HWND(hwnd), ctypes.byref(pt))
+    return (pt.x, pt.y, r.right - r.left, r.bottom - r.top)
+
+
+def monitor_of(hwnd) -> Optional[str]:
+    """The monitor the window is (mostly) on, with its rect and DPI
+    (diagnostics only)."""
+    if not hwnd or _user32 is None:
+        return None
+    try:
+        class _MI(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                        ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD),
+                        ("szDevice", wintypes.WCHAR * 32)]
+        _user32.MonitorFromWindow.restype = wintypes.HMONITOR
+        _user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+        hmon = _user32.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
+        info = _MI()
+        info.cbSize = ctypes.sizeof(_MI)
+        _user32.GetMonitorInfoW(hmon, ctypes.byref(info))
+        r = info.rcMonitor
+        dpi = ""
+        try:
+            dx, dy = ctypes.c_uint(0), ctypes.c_uint(0)
+            ctypes.WinDLL("shcore").GetDpiForMonitor(hmon, 0, ctypes.byref(dx), ctypes.byref(dy))
+            dpi = f" dpi={dx.value} scale={dx.value / 96 * 100:.0f}%"
+        except Exception:
+            pass
+        try:
+            dpi += f" window_dpi={_user32.GetDpiForWindow(wintypes.HWND(hwnd))}"
+        except Exception:
+            pass
+        return (f"{info.szDevice} ({r.left},{r.top})-({r.right},{r.bottom}) "
+                f"{r.right - r.left}x{r.bottom - r.top} primary={bool(info.dwFlags & 1)}{dpi}")
+    except Exception as e:
+        return f"unknown ({e})"
+
+
 def get_window_rect(hwnd) -> Optional[Tuple[int, int, int, int]]:
     """One GetWindowRect syscall (pygetwindow issues one per attribute)."""
     if not hwnd or _user32 is None:
@@ -155,6 +203,49 @@ def get_window_rect(hwnd) -> Optional[Tuple[int, int, int, int]]:
     if _user32.GetWindowRect(hwnd, ctypes.byref(r)):
         return (r.left, r.top, r.right - r.left, r.bottom - r.top)
     return None
+
+
+# Shell windows that are "foreground" when the desktop or taskbar was
+# clicked, but lie under (or beside) every normal window.
+_SHELL_CLASSES = {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"}
+_MIN_COVER_PX = 16   # overlap that counts (window rects include invisible resize borders)
+
+
+def foreground_cover(hwnd, ignore=()) -> Optional[str]:
+    """Optional platform function (screen_capture.py): the title of the
+    foreground window when it is another program's window lying over
+    ``hwnd`` — a screen copy of ``hwnd`` then shows that window. None when
+    the game itself (or one of ``ignore``, or the shell) is in front, or the
+    foreground window does not overlap it."""
+    if not hwnd or _user32 is None:
+        return None
+    fg = get_foreground()
+    if not fg or fg == hwnd or fg in ignore:
+        return None
+    try:
+        if not _user32.IsWindowVisible(fg) or _user32.IsIconic(fg):
+            return None
+        cls = ctypes.create_unicode_buffer(256)
+        _user32.GetClassNameW(fg, cls, 256)
+        if cls.value in _SHELL_CLASSES:
+            return None
+        pid_game, pid_fg = wintypes.DWORD(), wintypes.DWORD()
+        _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid_game))
+        _user32.GetWindowThreadProcessId(fg, ctypes.byref(pid_fg))
+        if pid_game.value and pid_game.value == pid_fg.value:
+            return None   # the game's own pop-up
+        a, b = get_window_rect(hwnd), get_window_rect(fg)
+        if not a or not b:
+            return None
+        w = min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0])
+        h = min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1])
+        if w < _MIN_COVER_PX or h < _MIN_COVER_PX:
+            return None
+        title = ctypes.create_unicode_buffer(256)
+        _user32.GetWindowTextW(fg, title, 256)
+        return title.value or cls.value or "another window"
+    except Exception:
+        return None
 
 
 # ------------------------------------------------------------------ capture
@@ -207,3 +298,9 @@ def render_window(hwnd, width: int, height: int) -> Optional[np.ndarray]:
         if hdc_mem:
             _gdi32.DeleteDC(hdc_mem)
         _user32.ReleaseDC(None, hdc_screen)
+
+
+# Diagnostic log: the requests that change the desktop are traced.
+import diag  # noqa: E402
+
+diag.trace_module(sys.modules[__name__], ("list_windows", "set_foreground", "force_foreground", "restore"))
