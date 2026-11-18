@@ -31,29 +31,31 @@ STABLE = 3.0            # a dialog is drawn still: consecutive reads differ by l
 STABLE_READS = 3        # ... over this many reads in a row before it counts as "up"
 SAME_DIALOG = 10.0      # mean difference to a learned dialog look that still counts as that dialog
 
-# What the patch looked like with the dialog up, per button point, once a
-# whole sequence confirmed it really was the dialog (see ``confirm``). With
-# that known, "up" means "looks like the dialog", not just "changed": moving
-# scenery behind the button point changes the patch too.
+# What the patch looked like with the dialog up, per window (``owner``) and
+# button point, once a whole sequence confirmed it really was the dialog (see
+# ``confirm``). With that known, "up" means "looks like the dialog", not just
+# "changed": moving scenery behind the button point changes the patch too.
+# Per window: a client with another skin would otherwise never see its own
+# dialog as "up" after another window taught the look.
 _learned: dict = {}
 _last_up: dict = {}
 
 
-def _key(point: Point, what: str = "dialog") -> Tuple[str, int, int]:
+def _key(point: Point, what: str = "dialog", owner=None) -> tuple:
     # Per dialog name too: two features may watch the same point for
     # dialogs that do not look alike.
-    return what, int(point[0]), int(point[1])
+    return owner, what, int(point[0]), int(point[1])
 
 
-def confirm(point: Point, what: str = "dialog") -> None:
+def confirm(point: Point, what: str = "dialog", owner=None) -> None:
     """The last patch seen "up" at ``point`` (watched as ``what``) really
     was the dialog (the action it asked for happened): remember its look
     for later waits."""
     if point is None:
         return
-    patch = _last_up.get(_key(point, what))
+    patch = _last_up.get(_key(point, what, owner))
     if patch is not None:
-        _learned[_key(point, what)] = patch
+        _learned[_key(point, what, owner)] = patch
 
 
 def forget() -> None:
@@ -87,7 +89,7 @@ def difference(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> Optional[flo
 
 def wait(grab: Grab, point: Point, baseline: Optional[np.ndarray], timeout: float,
          keep_going: Callable[[], bool], want_change: bool = True, minimum: float = 0.0,
-         poll: float = 0.012, what: str = "dialog", tag: Optional[str] = None) -> bool:
+         poll: float = 0.012, what: str = "dialog", tag: Optional[str] = None, owner=None) -> bool:
     """Polls the patch at ``point`` until it differs from ``baseline``
     (``want_change``: the dialog came up) or matches it again (the dialog
     went away). "Up" needs the changed patch to hold still for
@@ -100,7 +102,7 @@ def wait(grab: Grab, point: Point, baseline: Optional[np.ndarray], timeout: floa
     seen = False
     if baseline is not None:
         deadline = start + timeout
-        learned = _learned.get(_key(point, what)) if want_change else None
+        learned = _learned.get(_key(point, what, owner)) if want_change else None
         if learned is not None and learned.shape != baseline.shape:
             learned = None
         prev = None
@@ -127,7 +129,7 @@ def wait(grab: Grab, point: Point, baseline: Optional[np.ndarray], timeout: floa
                     looks_right = learned is None or difference(patch, learned) < SAME_DIALOG
                     steady = steady + 1 if (change > CHANGED and still and looks_right) else 0
                     if steady >= STABLE_READS - 1:
-                        _last_up[_key(point, what)] = patch
+                        _last_up[_key(point, what, owner)] = patch
                         seen = True
                         break
                 if time.perf_counter() >= deadline:

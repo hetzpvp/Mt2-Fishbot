@@ -66,7 +66,7 @@ def game_key(name: str):
         return keyboard.KeyCode.from_vk(0x30 + int(name))
     return name
 from window_manager import WindowManager, GameRegion
-from fish_detector import FishDetector, DetectionProfile, WindowLearner
+from fish_detector import FishDetector, DetectionProfile, WindowLearner, abs_diff_max
 from humanize import Humanizer
 from input_backend import create_keyboard_controller, create_mouse_backend
 import screen_capture
@@ -404,7 +404,8 @@ class FishingBot:
             cls._known_profiles = []
         cls._shared_recast_wait = None
         cls._classic_fish_last_scale = None
-        diag.log("STATE", "shared session state reset (learned looks, recast wait, classic scale)")
+        dialog_watch.forget()   # the drop dialog's look, learned per window slot
+        diag.log("STATE", "shared session state reset (learned looks, recast wait, classic scale, dialog looks)")
 
     def _load_timings(self):
         """Caches all timing values from config (called at init and at session start)."""
@@ -1806,14 +1807,33 @@ class FishingBot:
             self._drop_steps(fish_name, inv_x, inv_y, slot_screen, ground_screen, win_left, win_top,
                              drop_pt, confirm_pt, base_drop, base_confirm, timeout, keep_going, grab,
                              click_at, slot_has_item, put_back)
-        except FocusLost:
-            diag.log("DECISION", f"drop of {fish_name}: the window lost the focus mid-sequence", tag=self.diag_tag)
-            if self.running and self._focus(force=True):
-                if not slot_has_item():
-                    put_back("the game window lost the focus")
-                    return
+        except Exception as e:
+            # Whatever broke the sequence, the item may be on the cursor now
+            # (picked up, not dropped): it goes back before the lock is let go,
+            # or the next click anywhere drops it there.
+            why = "the game window lost the focus" if isinstance(e, FocusLost) else f"error: {e}"
+            if isinstance(e, FocusLost):
+                diag.log("DECISION", f"drop of {fish_name}: the window lost the focus mid-sequence",
+                         tag=self.diag_tag)
             else:
-                self._log(f"Drop of {fish_name} stopped: the game window lost the focus — check the cursor")
+                diag.exc(f"drop sequence of {fish_name}", tag=self.diag_tag)
+            try:
+                if self.running and self._focus(force=True):
+                    if not slot_has_item():
+                        put_back(why)
+                        return
+                else:
+                    self._log(f"Drop of {fish_name} stopped: {why} — check the cursor")
+            except Exception:
+                diag.exc(f"putting {fish_name} back", tag=self.diag_tag)
+                self._mark_occupied(inv_x, inv_y)
+                # Unknown whether the item is on the cursor: the next click
+                # of this bot would drop it wherever that lands.
+                self._stop_bot(
+                    self.STOP_ERROR,
+                    f"[W{self.bot_id+1}] Drop of {fish_name} failed ({why}) and the item could not be put "
+                    f"back — it may still be on the cursor. Stopping bot.")
+                return
             self._mark_occupied(inv_x, inv_y)
 
     def _drop_steps(self, fish_name, inv_x, inv_y, slot_screen, ground_screen, win_left, win_top,
@@ -1833,7 +1853,8 @@ class FishingBot:
         self.human.move_to(*slot_screen)
         first_pt, first_base = (drop_pt, base_drop) if drop_pt else (confirm_pt, base_confirm)
         if not dialog_watch.wait(grab, first_pt, first_base, timeout, keep_going,
-                                 minimum=self._t_drop_settle, what="drop dialog", tag=self.diag_tag):
+                                 minimum=self._t_drop_settle, what="drop dialog", tag=self.diag_tag,
+                                 owner=self.bot_id):
             # Also when stopped meanwhile: the item is on the cursor and
             # must not be left there for the player.
             running = self.running
@@ -1852,7 +1873,8 @@ class FishingBot:
             click_at((win_left + drop_pt[0], win_top + drop_pt[1]), settle=False)
             self.human.move_to(*slot_screen)
             if not dialog_watch.wait(grab, confirm_pt, base_confirm, timeout, keep_going,
-                                     minimum=self._t_drop_settle, what="confirm dialog", tag=self.diag_tag):
+                                     minimum=self._t_drop_settle, what="confirm dialog", tag=self.diag_tag,
+                                     owner=self.bot_id):
                 running = self.running
                 put_back("no confirm dialog after the drop button" if running else "bot stopped")
                 if running:
@@ -1864,7 +1886,8 @@ class FishingBot:
         click_at((win_left + confirm_pt[0], win_top + confirm_pt[1]), settle=False)
         self.human.move_to(*ground_screen)
         gone = dialog_watch.wait(grab, confirm_pt, base_confirm, timeout, keep_going, want_change=False,
-                                 minimum=self._t_drop_settle, what="confirm dialog", tag=self.diag_tag)
+                                 minimum=self._t_drop_settle, what="confirm dialog", tag=self.diag_tag,
+                                 owner=self.bot_id)
         if slot_has_item():
             self._log(f"{fish_name} is still in its slot after the drop — leaving it there")
             if diag.ENABLED:
@@ -1882,9 +1905,9 @@ class FishingBot:
             # The whole drop happened: what was seen at the button points
             # really was the dialog. Later drops then need that look, not
             # just any change (moving scenery changes the patch too).
-            dialog_watch.confirm(confirm_pt, "confirm dialog" if drop_pt else "drop dialog")
+            dialog_watch.confirm(confirm_pt, "confirm dialog" if drop_pt else "drop dialog", owner=self.bot_id)
             if drop_pt:
-                dialog_watch.confirm(drop_pt, "drop dialog")
+                dialog_watch.confirm(drop_pt, "drop dialog", owner=self.bot_id)
 
     def _update_region_cache(self):
         """Updates cached constants when region changes."""
@@ -2460,9 +2483,30 @@ class FishingBot:
             # Horse mode: double press CTRL+G
             if self.on_status_update:
                 self.on_status_update(f"[W{self.bot_id+1}] Quick skip (Horse mode - CTRL+G)...")
-            self.press_ctrl_key(self.config.get('mount_key', 'g'))
+            mount_key = self.config.get('mount_key', 'g')
+            if not self.press_ctrl_key(mount_key):
+                # Nothing sent (window not in front, paused, stopped): no
+                # second Ctrl+G either — alone it would mount the character.
+                # The animation was not skipped, so it is waited out.
+                diag.log("DECISION", "quick skip: first CTRL+G not sent -> normal recast wait",
+                         tag=self.diag_tag)
+                if self._wait_before_recast():
+                    self._was_paused = True
+                return
             time.sleep(self._t_qs_between)  # game must process the first CTRL+G
-            self.press_ctrl_key(self.config.get('mount_key', 'g'))
+            second = self.press_ctrl_key(mount_key)
+            if not second and self.running:
+                # Mounted by the first one: one more try to get off the horse.
+                time.sleep(self._t_qs_between)
+                second = self.press_ctrl_key(mount_key)
+            if not second:
+                diag.log("DECISION", "quick skip: second CTRL+G not sent -> normal recast wait",
+                         tag=self.diag_tag)
+                self._log("Quick skip: the second CTRL+G could not be sent — the character may still be "
+                          "on the horse")
+                if self._wait_before_recast():
+                    self._was_paused = True
+                return
             time.sleep(self._t_qs_after)    # before the next action
         else:
             # Armour mode: right-click the spare armor to swap it with the worn one
@@ -2515,8 +2559,8 @@ class FishingBot:
         once its tab reads as active; the page being filled is clicked
         again right after (checked before the next inventory read, see
         ``_restore_fill_page``). False when the armor was not right-clicked
-        and the caller should wait for the animation instead (True as well
-        when the window could not be focused: nothing was sent, as before)."""
+        (also when the window could not be focused) and the caller should
+        wait for the animation instead."""
         armor_pos = self.config.get('armor_slot_pos')
         if not armor_pos:
             if self.on_status_update:
@@ -2546,7 +2590,7 @@ class FishingBot:
             tab = points[page]
             with input_lock:
                 if not self.running or not self._focus(force=True):
-                    return True   # nothing sent; as before, no wait either
+                    return False   # nothing sent: the animation is waited out
                 win_left, win_top, _, _ = self.window_manager.get_window_rect()
                 self._click_page_tab(win_left + tab[0], win_top + tab[1])
             self._fill_page_pending = True   # the armor's page may be on screen from here on
@@ -2579,7 +2623,7 @@ class FishingBot:
         with input_lock:
             switch_before = getattr(self.window_manager, "last_switch_time", 0.0)
             if not self.running or not self._focus(force=True):
-                return True   # nothing sent; as before, no wait either
+                return False   # nothing sent: the animation is waited out
             switched = getattr(self.window_manager, "last_switch_time", 0.0) != switch_before
             # Another window may have had the cursor since the tab was
             # confirmed: one more look right before the click.
@@ -2817,7 +2861,7 @@ class FishingBot:
         before = ref[region.top:region.top + region.height, region.left:region.left + region.width]
         if before.shape != frame.shape or before.size == 0:
             return False
-        diff = cv2.absdiff(before, frame).max(axis=2)
+        diff = abs_diff_max(before, frame)
         return cv2.countNonZero(cv2.compare(diff, 25, cv2.CMP_GT)) > diff.size * 0.5
 
     def _try_calibrate(self, frame: np.ndarray, elapsed: float, adapt: Optional[bool] = None) -> bool:
@@ -3830,16 +3874,17 @@ class FishingBot:
                         FishingBot._classic_fish_last_scale = best_scale
                         # Start timer IMMEDIATELY after detection (configurable delay)
                         delay = self.config.get('classic_fishing_delay', 3.0)
-                        # Use interruptible sleep that checks running/paused state
-                        delay_start = perf_counter()   # monotonic: a clock change must not skew it
-                        while perf_counter() - delay_start < (delay - 0.05):
+                        # The bite does not wait for the bot: the reel moment
+                        # is fixed in real time. A pause neither restarts nor
+                        # extends it (a restart reeled in a whole delay late);
+                        # the caller reels in after the resume.
+                        reel_at = perf_counter() + delay - 0.05   # monotonic: a clock change must not skew it
+                        while perf_counter() < reel_at:
                             if not self.running:
                                 return False  # Bot stopped during delay
                             if self.paused:
-                                time.sleep(0.1)
-                                delay_start = perf_counter()  # Reset delay when paused
-                                continue
-                            time.sleep(0.05)  # Small sleep increments
+                                self._was_paused = True
+                            time.sleep(min(0.05, max(0.0, reel_at - perf_counter())))
                         if self.on_status_update:
                             self.on_status_update(f"[W{self.bot_id+1}] Classic fish detected (confidence: {best_match_val:.2f}, scale: {best_scale:.1f}x, delay: {delay}s)")
                         return True

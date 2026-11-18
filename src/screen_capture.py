@@ -365,8 +365,10 @@ class WindowCapture:
                 return False
             return time.perf_counter() - getattr(wm, "last_switch_time", 0.0) >= self._FOREGROUND_SETTLE
         except Exception:
+            # Unknown is not "in front": the window's own render is read
+            # instead, so a covering window is never taken for this client.
             diag.exc("screen reliability check", tag=self.diag_tag)
-            return True
+            return False
 
     @property
     def reads_screen_when_covered(self) -> bool:

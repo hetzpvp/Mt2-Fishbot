@@ -4531,11 +4531,16 @@ class JigsawRunner(QObject):
         # Workers from the previous run must be gone, or two would drive the
         # same window at once. Wait at most one second in total (the UI is
         # frozen while waiting).
-        win._join_threads(list(self._threads.values()) + self._old_threads, budget=1.0)
+        # Fishing bots of a stopped fishing run as well: one still finishing
+        # a drop would click alongside these workers.
+        win._join_threads(list(self._threads.values()) + self._old_threads + list(win._stopping_threads),
+                          budget=1.0)
         self._old_threads = [t for t in list(self._threads.values()) + self._old_threads if t.is_alive()]
-        if self._old_threads:
+        win._stopping_threads = [t for t in win._stopping_threads if t.is_alive()]
+        if self._old_threads or win._stopping_threads:
             QMessageBox.information(win, "Still stopping",
-                                    "The previous jigsaw run is still finishing. Try again in a moment.")
+                                    "The previous run is still finishing its last action. "
+                                    "Try again in a moment.")
             return False
 
         self.bots.clear()
@@ -6479,9 +6484,11 @@ class FishbotWindow(QMainWindow):
         # Workers from the previous run must have exited, otherwise two bots
         # would drive the same window (and fight over the cursor). Wait at most
         # one second in total (the UI is frozen while waiting).
-        self._join_threads(self._stopping_threads, budget=1.0)
+        # The jigsaw workers of a stopped jigsaw run count too: one still
+        # finishing its last move would click alongside these bots.
+        self._join_threads(self._stopping_threads + self.jigsaw.threads(), budget=1.0)
         self._stopping_threads = [t for t in self._stopping_threads if t.is_alive()]
-        if self._stopping_threads:
+        if self._stopping_threads or any(t.is_alive() for t in self.jigsaw.threads()):
             QMessageBox.information(self, "Still stopping",
                                     "The previous run is still finishing its last action. "
                                     "Try again in a moment.")

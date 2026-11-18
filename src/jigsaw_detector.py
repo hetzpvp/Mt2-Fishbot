@@ -286,6 +286,8 @@ class JigsawDetector:
                                    f"{diag.array_summary(grid_roi)}")
         return JigsawGridResult(True, bounds, centers, board_mask, confidence, filled_cells)
 
+    _GRID_EDGE_TOLERANCE = 2   # px the configured grid may stick out of the frame
+
     def _configured_grid_bounds(self, frame: np.ndarray) -> Optional[Rect]:
         value = self.config.get("jigsaw_grid_bounds")
         if not value or len(value) != 4:
@@ -296,6 +298,12 @@ class JigsawDetector:
             return None
         frame_h, frame_w = frame.shape[:2]
         if w <= 0 or h <= 0 or x >= frame_w or y >= frame_h:
+            return None
+        # A grid that sticks out of the frame cannot be read: clamping it
+        # shifted or squeezed the rectangle, and the cells read and clicked
+        # were no longer the real ones. A pixel or two of rounding is fine.
+        tol = self._GRID_EDGE_TOLERANCE
+        if x < -tol or y < -tol or x + w > frame_w + tol or y + h > frame_h + tol:
             return None
         x = max(0, x)
         y = max(0, y)
@@ -347,9 +355,11 @@ class JigsawDetector:
         slots = self.detect_crate_slots(frame, grid, gray=gray)
         centers = slots.centers
         
-        # Use first priority section that's available
+        # Use first priority section that's available (and in the picture:
+        # a slot off the frame is not read, see detect_crate_slots)
+        frame_h, frame_w = frame.shape[:2]
         for section in priority_sections:
-            if section in centers:
+            if section in centers and 0 <= centers[section][0] < frame_w and 0 <= centers[section][1] < frame_h:
                 confidence = 0.50
                 if slots.confidence and section in slots.confidence:
                     confidence = slots.confidence[section]
@@ -371,7 +381,14 @@ class JigsawDetector:
         if not centers:
             return CrateSlotState({}, available, {"normal", "special"}, {})
 
+        frame_h, frame_w = frame.shape[:2]
         for section, center in centers.items():
+            if not (0 <= center[0] < frame_w and 0 <= center[1] < frame_h):
+                # Not in the picture: unknown, neither a crate to open nor
+                # an empty slot to refill (the refill would click off the window).
+                diag.log("ANALYSIS", f"{section} crate slot {center} lies outside the frame "
+                                     f"{frame_w}x{frame_h}: not read")
+                continue
             crate_template_key = f"{section}_crate"
             if self._slot_has_matching_template(frame, crate_template_key, center, gray=gray):
                 available.add(section)
@@ -611,7 +628,7 @@ class JigsawDetector:
         color_crop = frame[y1:y2, x1:x2]
         crop = gray[y1:y2, x1:x2] if gray is not None else cv2.cvtColor(color_crop, cv2.COLOR_BGR2GRAY)
         if crop.size == 0:
-            return True, 0.0
+            return True, 0.0    # not reached for off-frame centers: detect_crate_slots skips them
         mean = float(np.mean(crop))
         std = float(np.std(crop))
         hsv = cv2.cvtColor(color_crop, cv2.COLOR_BGR2HSV)

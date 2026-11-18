@@ -539,7 +539,12 @@ class InputSafetyTests(unittest.TestCase):
     def test_nothing_is_sent_when_the_window_cannot_be_focused(self):
         bot, screen, mouse, keys, logs = self._bot()
         bot.window_manager.activate_window = lambda force_activate=False: False
+        # A quick skip that sent nothing waits for the animation instead
+        # (both modes); the wait itself is not what this test times.
+        recast_waits = []
+        bot._wait_before_recast = lambda: recast_waits.append(1) and False
         self._try_everything(bot)
+        self.assertEqual(len(recast_waits), 2)
         screen.panel_open = True
         screen.t = 0.0                                   # fish in the middle of the circle
         bot.window_manager.activate_window = lambda force_activate=False: True
