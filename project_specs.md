@@ -4,9 +4,10 @@
 
 An automated fishing bot for Metin2 that uses computer vision (no memory reading) to detect fishing minigame state and perform all required actions. Supports up to 8 simultaneous game windows, two fishing modes, automatic inventory handling, multi-page inventory switching, an integrated jigsaw puzzle solver, and fully configurable timing.
 
-**Current version:** 2.0.0  
+**Current version:** see `src/version.py` (the single source; `tools/release.py bump` sets it)  
 **Platform:** Windows; Linux with the game under Wine (see `docs/LINUX.md`)  
-**Stack:** Python 3.14.2, OpenCV, Tkinter, mss, pynput, PyAutoGUI, PyInstaller
+**Stack:** Python 3.14, OpenCV, PySide6 (Qt GUI), numpy/numba, mss, pynput, PyInstaller.
+Input: Interception or PyAutoGUI on Windows, uinput or XTest on Linux (`src/input_backend.py`)
 
 ---
 
@@ -15,30 +16,42 @@ An automated fishing bot for Metin2 that uses computer vision (no memory reading
 ```
 Mt2-Fishbot/
 ├── src/
-│   ├── fishing_bot.py       # Core bot logic (~2098 lines)
-│   ├── fish_detector.py     # Computer vision detection (~106 lines)
-│   ├── window_manager.py    # Window discovery & focus (~169 lines)
-│   ├── utils.py             # Shared constants, helpers (~202 lines)
-│   ├── debug_ui.py          # Live debug visualizers (~1291 lines)
-│   ├── jigsaw_bot.py        # Jigsaw puzzle automation (~1241 lines)
-│   ├── jigsaw_detector.py   # Jigsaw piece recognition (~725 lines)
+│   ├── fishing_bot.py       # Per-window fishing loop
+│   ├── fish_detector.py     # Minigame panel and fish detection
+│   ├── window_manager.py    # Window discovery, focus and rectangles
+│   ├── utils.py             # input_lock, paths, sounds, shared helpers
+│   ├── dialog_watch.py      # "Dialog up / gone" by watching a button patch
+│   ├── inventory_layout.py  # Inventory strip and page tabs
+│   ├── humanize.py          # Click and key timing
+│   ├── diag.py              # Diagnostic session log and zip
+│   ├── setup_checks.py      # Setup warnings
+│   ├── help_visuals.py      # Drawings for the help / guide dialogs
+│   ├── debug_ui.py          # Live debug visualizers (Tk, only with DEBUG_MODE_EN)
+│   ├── debug_host.py        # Runs the Tk debug windows on their own thread
+│   ├── jigsaw_bot.py        # Per-window jigsaw loop
+│   ├── jigsaw_detector.py   # Grid, crates, cursor piece
 │   ├── qt_gui.py            # PySide6 GUI (Fishing + Jigsaw, setup wizards)
 │   ├── screen_capture.py    # WindowCapture: screen copy / per-window render policy
 │   ├── input_backend.py     # Mouse/keyboard backends (Interception, PyAutoGUI, uinput, XTest)
+│   ├── interception_wrapper.py  # Windows Interception driver DLL
 │   ├── platforms/           # OS layer: win32.py (Windows), x11.py + uinput.py (Linux)
 │   └── __init__.py
 ├── src/jigsaw_solver/       # Fishing jigsaw puzzle solver package
-│   ├── fishing_jigsaw_solver.py   # Core solver (~1099 lines)
-│   ├── deterministic.py           # DP optimal solver (~630 lines)
-│   ├── app.py                     # Tkinter GUI (~409 lines)
-│   ├── jigsaw.py                  # Board model (~230 lines)
-│   ├── main.py                    # Entry point (~94 lines)
-│   └── solver.py                  # Solver interface (~25 lines)
+│   ├── deterministic.py           # DP optimal solver (the one the bot uses)
+│   ├── jigsaw.py                  # Board model
+│   ├── cache_location.py          # Solver cache path
+│   ├── fishing_jigsaw_solver.py   # Standalone solver (not used by the bot)
+│   ├── app.py                     # Standalone Tkinter solver GUI (not used by the bot)
+│   ├── main.py                    # Standalone entry point
+│   └── solver.py                  # Solver interface
 ├── assets/                  # Categorized images: fishing templates, UI icons/GIFs, jigsaw templates
-├── dist/                    # PyInstaller executables (v1.0.0 → v1.2)
-├── tools/build.py           # Build automation script
-├── packaging/build.spec     # PyInstaller spec
-├── bot_config.json          # Runtime configuration (72 keys, user-editable)
+├── dist/                    # Build output (gitignored); releases go to dist/release-X.Y.Z/
+├── tools/release.py         # Release flow: status, bump, build, publish (see CLAUDE.md)
+├── tools/build.py           # Pinned versions for the Windows build
+├── tools/build_windows_exe.sh  # Windows exe built under Wine
+├── packaging/build.spec     # PyInstaller spec (Windows)
+├── packaging/build_linux.spec  # PyInstaller spec (Linux)
+├── bot_config.json          # Runtime configuration (user-editable, gitignored)
 ├── src/version.py           # Version constant
 └── docs/gui_demo.png        # Screenshot for README
 ```
@@ -114,7 +127,7 @@ All click/key delays are individually tunable via **Timing Settings** modal (`Ti
 | `timing_quickskip_between` | 100 ms | Delay between quick skip presses |
 | `timing_quickskip_after` | 100 ms | Delay after quick skip completes |
 
-### Configuration (bot_config.json — 72 keys)
+### Configuration (bot_config.json)
 All settings persist across sessions:
 - `human_like_clicking` — randomised click timing and positional offsets
 - `classic_fishing` + `classic_fishing_delay`
@@ -232,12 +245,12 @@ Automates the in-game jigsaw fishing minigame end-to-end.
 ## Threading Model
 
 ```
-Main thread        → Tkinter GUI event loop
+Main thread        → Qt (PySide6) GUI event loop
 Bot thread × N     → FishingBot.play_game() loops (N ≤ 8)
 Jigsaw thread × N  → JigsawBot loops (one per selected window, when enabled)
 Debug threads      → debug_ui.py capture loops (daemon)
 
-All mouse/keyboard via:  input_lock (threading.Lock)
+All mouse/keyboard via:  input_lock (PriorityInputLock: FIFO-fair, urgent lane for the fish click)
 Screen capture:          per-thread mss.mss() instances (not shared)
 Templates:               class-level dicts (read-only after init, no lock needed)
 ```

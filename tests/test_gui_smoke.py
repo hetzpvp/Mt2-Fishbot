@@ -130,11 +130,12 @@ class GuiSmokeTests(GuiFixture):
         self.assertEqual(w2.dashboard.window_rows[0].selectedWindow(), "Metin2 (2)")
         self.assertEqual(w2.window_stats[0]["bait"], 321)
 
-        # Unrelated setting does not refill the bait; changing capacity does
+        # Neither an unrelated setting nor a capacity change refills counted
+        # bait (only Reset Bait does)
         w2.settings.sound_check.setChecked(False)
         self.assertEqual(w2.window_stats[0]["bait"], 321)
         w2.settings.bait_checks["4"].setChecked(False)
-        self.assertEqual(w2.window_stats[0]["bait"], 600)
+        self.assertEqual(w2.window_stats[0]["bait"], 321)
 
         # Explicitly clearing the slot is remembered too
         w2.dashboard.window_rows[0].combo.setCurrentIndex(0)
@@ -177,7 +178,12 @@ class GuiSmokeTests(GuiFixture):
         w._on_profile_learned_ui(profile)
         self.assertEqual(self._saved()["detection_profile"]["name"], "learned")
         self.assertTrue(w.settings.forget_profile_btn.isEnabled())
-        w.settings.forget_profile.emit()
+        orig = QMessageBox.question
+        QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.Yes)   # "Forget the learned colors?"
+        try:
+            w.settings.forget_profile.emit()
+        finally:
+            QMessageBox.question = orig
         self.assertIsNone(self._saved()["detection_profile"])
         self.assertFalse(w.settings.forget_profile_btn.isEnabled())
 

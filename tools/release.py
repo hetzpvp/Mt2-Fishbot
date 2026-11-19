@@ -15,16 +15,22 @@ Release helper for MT2 Fishing Bot. The full flow is in CLAUDE.md
         Builds both binaries into dist/release-X.Y.Z/, packs the release
         assets (Windows .exe, Linux .tar.gz) and writes SHA256SUMS.txt.
         Headless: the Windows exe is built under Wine, the smoke tests run on
-        a private Xvfb display. Takes several minutes.
+        a private Xvfb display. Takes several minutes. Each asset that passed
+        its smoke test is recorded with its SHA-256 in VERIFIED.json; one
+        built with --no-smoke, or whose smoke test failed, is not.
 
     python tools/release.py publish --notes-file FILE [--draft]
-        Tags HEAD as Mt2-Fishbot-vX.Y.Z, pushes main and the tag, and creates
-        the GitHub release with the assets. Refuses if HEAD does not carry the
-        version, the tag exists, or an asset is missing.
+        Runs the unit tests on the committed tree, then tags HEAD as
+        Mt2-Fishbot-vX.Y.Z, pushes main and the tag, and creates the GitHub
+        release with the assets. Refuses if HEAD does not carry the version,
+        the work tree has changes that would not be in the tag, an asset is
+        missing or did not pass its smoke test (VERIFIED.json), the tests
+        fail, or the tag exists.
 """
 
 import argparse
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -64,6 +70,11 @@ def linux_asset(v):
 
 def asset_url(v, name):
     return f"https://github.com/{REPO}/releases/download/{tag_name(v)}/{name}"
+
+
+VERIFIED = "VERIFIED.json"   # in release_dir: {asset name: sha256} of the assets that passed a smoke test
+# Paths whose untracked files would end up in a binary without being in the tag
+BUILD_INPUTS = ("src", "packaging", "assets")
 
 
 # ---------------------------------------------------------------- helpers
@@ -198,6 +209,59 @@ def consistency(v):
     return res
 
 
+# Windows-only pins (not part of the Linux build)
+_WINDOWS_ONLY = {"PyAutoGUI", "pygetwindow"}
+
+
+def windows_pins():
+    """{distribution: version} from tools/build.py (BEGIN/END_REQUIRED_VERSIONS)."""
+    import ast
+    text = read(os.path.join(ROOT, "tools", "build.py"))
+    block = re.search(r"BEGIN_REQUIRED_VERSIONS\s*\n(.*?)# END_REQUIRED_VERSIONS", text, re.S).group(1)
+    return ast.literal_eval(block.split("=", 1)[1].strip())
+
+
+def stack_drift():
+    """{name: (.venv version, pinned version)} for the packages whose version
+    in .venv (what the Linux binary is built from) is not the Windows pin.
+    None when .venv cannot be asked. Only reported: the two builds can use
+    different stacks, but then the tests ran on one of them only."""
+    pins = {k: v for k, v in windows_pins().items() if k not in _WINDOWS_ONLY}
+    probe = ("import importlib.metadata as m, json, platform, sys\n"
+             "names = json.loads(sys.argv[1])\n"
+             "res = {}\n"
+             "for n in names:\n"
+             "    try: res[n] = platform.python_version() if n == 'Python' else m.version(n)\n"
+             "    except Exception: res[n] = None\n"
+             "print(json.dumps(res))")
+    code, text = out([VENV_PY, "-c", probe, json.dumps(sorted(pins))])
+    if code != 0:
+        return None
+    try:
+        have = json.loads(text.splitlines()[-1])
+    except (ValueError, IndexError):
+        return None
+    drift = {}
+    for name, want in pins.items():
+        got = have.get(name)
+        # opencv wheels carry a build number (4.13.0.92 for the pin 4.13.0)
+        if got is None or not (got == want or got.startswith(want + ".")):
+            drift[name] = (got, want)
+    return drift
+
+
+def wine_has_mscms():
+    """Qt 6.12's qwindows.dll imports mscms.dll (color management). Every
+    Windows has it; Fedora ships it for Wine in the separate wine-cms package.
+    Without it the exe cannot open a window under Wine, so the smoke fails."""
+    for d in ("/usr/lib64/wine-wow64/wine/x86_64-windows", "/usr/lib64/wine/x86_64-windows",
+              "/usr/lib/wine/x86_64-windows", "/usr/lib/x86_64-linux-gnu/wine/x86_64-windows",
+              "/opt/wine-staging/lib64/wine/x86_64-windows", "/opt/wine-stable/lib64/wine/x86_64-windows"):
+        if os.path.exists(os.path.join(d, "mscms.dll")):
+            return True
+    return False
+
+
 def cmd_status(args):
     v = current_version()
     print(f"version (src/version.py): {v}")
@@ -222,9 +286,19 @@ def cmd_status(args):
         ("Windows build env (~/.local/share/fishbot-winbuild)",
          os.path.exists(os.path.expanduser("~/.local/share/fishbot-winbuild/py/tools/python.exe"))),
         ("xvfb-run (smoke tests)", shutil.which("xvfb-run") is not None),
+        ("Wine mscms.dll (Qt 6.12 windows plugin; Fedora: wine-cms)", wine_has_mscms()),
         ("gh logged in", out(["gh", "auth", "status"])[0] == 0),
     ]:
         print(f"  {'ok ' if ok else 'NO '} {label}")
+    drift = stack_drift()
+    if drift is None:
+        print("Linux build stack: could not be read from .venv")
+    elif drift:
+        print("Linux build stack (.venv) differs from the Windows pins in tools/build.py:")
+        for name, (have, want) in sorted(drift.items()):
+            print(f"  OUT {name}: .venv {have or 'missing'}, Windows {want}")
+    else:
+        print("Linux build stack (.venv) matches the Windows pins")
     rd = release_dir(v)
     if os.path.isdir(rd):
         print(f"built assets in {os.path.relpath(rd, ROOT)}:")
@@ -239,25 +313,77 @@ def cmd_status(args):
 
 # ---------------------------------------------------------------- build
 
-def smoke(cmd, env, seconds=25):
+def smoke(cmd, env, seconds=25, windows=False):
     """Starts the program on a private X display; ok if it is still running
-    after `seconds` (the GUI came up and did not crash)."""
+    after `seconds` (the GUI came up and did not crash).
+
+    windows: `cmd` is ["wine", exe]. Being alive is not enough there: a fatal
+    Qt error ("no Qt platform plugin could be initialized") is a message box
+    that keeps the process running. So the exe is copied into a fresh folder
+    with a config that opens jigsaw mode, and the solver-cache folder it then
+    creates next to itself (only after the main window is set up) must exist."""
     env = dict(env)
     env.pop("WAYLAND_DISPLAY", None)       # never the real desktop
-    env["QT_QPA_PLATFORM"] = "xcb"
+    proof = None
+    if windows:
+        env.pop("QT_QPA_PLATFORM", None)   # a Windows Qt only has the "windows" plugin
+        box = os.path.join(release_tmp, "win")
+        shutil.rmtree(box, ignore_errors=True)
+        os.makedirs(box)
+        exe = os.path.join(box, os.path.basename(cmd[-1]))
+        shutil.copy2(cmd[-1], exe)
+        write(os.path.join(box, "bot_config.json"), json.dumps({"ui_mode": "jigsaw"}))
+        cmd = cmd[:-1] + [exe]
+        proof = os.path.join(box, "data", "cache", "jigsaw")
+    else:
+        env["QT_QPA_PLATFORM"] = "xcb"
     full = ["xvfb-run", "-a", "-s", "-screen 0 1920x1080x24", "timeout", "-s", "TERM", str(seconds)] + cmd
     print("$", " ".join(full), flush=True)
     t = time.time()
     r = subprocess.run(full, cwd=release_tmp, env=env, capture_output=True, text=True)
-    if r.returncode == 124:
+    if r.returncode == 124 and (proof is None or os.path.isdir(proof)):
         print(f"smoke ok: still running after {seconds}s")
+        if proof:
+            shutil.rmtree(os.path.dirname(os.path.dirname(os.path.dirname(proof))), ignore_errors=True)
         return True
-    print(f"smoke FAILED: exited with {r.returncode} after {time.time() - t:.1f}s")
+    if r.returncode == 124:
+        print(f"smoke FAILED: still running after {seconds}s, but the main window never set up "
+              f"jigsaw mode (no {os.path.relpath(proof, ROOT)}): probably a startup error box. "
+              "Under Wine, Qt 6.12 also needs mscms.dll (Fedora: sudo dnf install wine-cms).")
+    else:
+        print(f"smoke FAILED: exited with {r.returncode} after {time.time() - t:.1f}s")
     print((r.stdout + r.stderr)[-4000:])
     return False
 
 
 release_tmp = None
+
+
+def read_verified(rd):
+    """{asset name: sha256} of the assets that passed their smoke test."""
+    try:
+        with open(os.path.join(rd, VERIFIED), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, str)} \
+        if isinstance(data, dict) else {}
+
+
+def write_verified(rd, verified):
+    write(os.path.join(rd, VERIFIED), json.dumps(verified, indent=2, sort_keys=True) + "\n")
+
+
+def unverified_assets(rd, names):
+    """The assets in ``names`` that are missing from VERIFIED.json or were
+    changed since their smoke test passed."""
+    verified = read_verified(rd)
+    bad = []
+    for name in names:
+        path = os.path.join(rd, name)
+        if verified.get(name) is None or not os.path.exists(path) or sha256(path) != verified[name]:
+            bad.append(name)
+    return bad
 
 
 def cmd_build(args):
@@ -275,8 +401,16 @@ def cmd_build(args):
     win_raw = os.path.join(raw, f"{APP} v{v}.exe")
     lin_raw = os.path.join(raw, f"{APP} v{v} (linux)")
     ok = True
+    can_smoke = not args.no_smoke and shutil.which("xvfb-run") is not None
+    if not args.no_smoke and not can_smoke:
+        print("xvfb-run not found: no smoke tests, so publish will refuse these assets")
+    # A platform rebuilt now is recorded again only if its smoke test passes;
+    # one skipped keeps its record (publish checks the file still matches).
+    verified = read_verified(rd)
 
     if not args.skip_windows:
+        verified.pop(win_asset(v), None)
+        write_verified(rd, verified)
         run([os.path.join(ROOT, "tools", "build_windows_exe.sh"), "--distpath", raw])
         if not os.path.exists(win_raw):
             sys.exit(f"Windows build produced no {win_raw}")
@@ -284,14 +418,28 @@ def cmd_build(args):
         archive = os.path.join(ROOT, "releases", "windows")
         if os.path.isdir(archive):
             shutil.copy2(win_raw, os.path.join(archive, os.path.basename(win_raw)))
-        if not args.no_smoke and shutil.which("xvfb-run"):
+        if can_smoke:
             env = dict(os.environ,
                        WINEPREFIX=os.path.expanduser("~/.local/share/fishbot-winbuild/prefix"),
                        WINEDEBUG="-all", WINEDLLOVERRIDES="mscoree,mshtml=")
-            ok = smoke(["wine", win_raw], env, seconds=45) and ok
+            passed = smoke(["wine", win_raw], env, seconds=45, windows=True)
             subprocess.run(["wineserver", "-k"], env=env)
+            # timeout kills the exe before the onefile bootloader can delete
+            # its unpacked copy (~300 MB per run) from the build prefix.
+            temp = os.path.join(env["WINEPREFIX"], "drive_c", "users", os.environ.get("USER", ""),
+                                "AppData", "Local", "Temp")
+            if os.path.isdir(temp):
+                for name in os.listdir(temp):
+                    if name.startswith(("_MEI", "fishbot-ui-")):
+                        shutil.rmtree(os.path.join(temp, name), ignore_errors=True)
+            ok = passed and ok
+            if passed:
+                verified[win_asset(v)] = sha256(os.path.join(rd, win_asset(v)))
+                write_verified(rd, verified)
 
     if not args.skip_linux:
+        verified.pop(linux_asset(v), None)
+        write_verified(rd, verified)
         run([os.path.join(ROOT, ".venv", "bin", "pyinstaller"), "--clean", "--noconfirm",
              "--distpath", raw, "--workpath", os.path.join("build", "linux"), LINUX_SPEC])
         if not os.path.exists(lin_raw):
@@ -299,8 +447,12 @@ def cmd_build(args):
         tgz = os.path.join(rd, linux_asset(v))
         with tarfile.open(tgz, "w:gz") as tf:
             tf.add(lin_raw, arcname=os.path.basename(lin_raw))
-        if not args.no_smoke and shutil.which("xvfb-run"):
-            ok = smoke([lin_raw], os.environ) and ok
+        if can_smoke:
+            passed = smoke([lin_raw], os.environ)
+            ok = passed and ok
+            if passed:
+                verified[linux_asset(v)] = sha256(tgz)
+                write_verified(rd, verified)
 
     sums = []
     for name in (win_asset(v), linux_asset(v)):
@@ -318,6 +470,21 @@ def cmd_build(args):
 
 # ---------------------------------------------------------------- publish
 
+def worktree_problem():
+    """Why the work tree is not what would be tagged (None when it is):
+    changes to tracked files, or untracked files where the build picks them
+    up. Ignored files (bot_config.json, dist/, ...) do not count."""
+    code, dirty = out(["git", "status", "--porcelain", "--untracked-files=no"])
+    if code != 0:
+        return "git status failed: " + dirty
+    if dirty:
+        return "uncommitted changes (the tag would not contain them):\n" + dirty
+    code, untracked = out(["git", "ls-files", "--others", "--exclude-standard", "--", *BUILD_INPUTS])
+    if untracked:
+        return "untracked files that the build includes but the tag would not:\n" + untracked
+    return None
+
+
 def cmd_publish(args):
     v = current_version()
     tag = tag_name(v)
@@ -334,9 +501,13 @@ def cmd_publish(args):
     probs = {k: p for k, p in consistency(v).items() if p}
     if probs:
         sys.exit("version files disagree: " + "; ".join(f"{k}: {p}" for k, p in probs.items()))
-    code, dirty = out(["git", "status", "--porcelain", "--", "src/version.py", "README.md", "packaging"])
-    if dirty:
-        sys.exit("uncommitted changes to release files:\n" + dirty)
+    unverified = unverified_assets(rd, (win_asset(v), linux_asset(v)))
+    if unverified:
+        sys.exit("no passed smoke test recorded for " + ", ".join(unverified)
+                 + f" ({VERIFIED}): run build again (without --no-smoke)")
+    problem = worktree_problem()
+    if problem:
+        sys.exit(problem)
     code, branch = out(["git", "rev-parse", "--abbrev-ref", "HEAD"])
     if branch != "main":
         sys.exit(f"on branch {branch}, releases are made from main")
@@ -344,6 +515,10 @@ def cmd_publish(args):
         sys.exit(f"tag {tag} already exists")
     if out(["gh", "release", "view", tag, "--repo", REPO])[0] == 0:
         sys.exit(f"GitHub release {tag} already exists")
+    # The committed tree (it is clean, see above) is what gets tagged.
+    print("running the unit tests on the committed tree…", flush=True)
+    if subprocess.run([sys.executable, os.path.join(ROOT, "tools", "run_tests.py"), "-q"], cwd=ROOT).returncode:
+        sys.exit("unit tests failed: not publishing")
 
     run(["git", "tag", "-a", tag, "-m", f"v{v}"])
     run(["git", "push", "origin", "main"])

@@ -20,6 +20,15 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 W="${FISHBOT_WINBUILD:-$HOME/.local/share/fishbot-winbuild}"
 PY_VERSION="${FISHBOT_WIN_PY:-3.14.4}"
+# SHA-256 of the NuGet package of that Python (python.3.14.4.nupkg; checked
+# against nuget.org's published SHA-512 when it was pinned). The package
+# becomes the compiler of the release exe: a different file is refused.
+# Another FISHBOT_WIN_PY needs its own FISHBOT_WIN_PY_SHA256.
+if [ "$PY_VERSION" = "3.14.4" ]; then
+    PY_SHA256="${FISHBOT_WIN_PY_SHA256:-c33a8d6183da776b0988e9d44646ab7abe16c4e02cfbacb20a0e52c61342c71f}"
+else
+    PY_SHA256="${FISHBOT_WIN_PY_SHA256:-}"
+fi
 export WINEPREFIX="$W/prefix"
 export WINEDEBUG=-all
 export WINEDLLOVERRIDES="mscoree,mshtml="   # no Mono/Gecko install dialogs in a new prefix
@@ -30,8 +39,15 @@ command -v wine >/dev/null || { echo "wine is not installed"; exit 1; }
 if [ ! -f "$PY" ]; then
     echo "== Setting up the Windows build environment in $W (Python $PY_VERSION)"
     mkdir -p "$W/dl" "$W/py"
+    [ -n "$PY_SHA256" ] || { echo "no SHA-256 pinned for Python $PY_VERSION: set FISHBOT_WIN_PY_SHA256"; exit 1; }
     [ -f "$W/dl/python.nupkg" ] || curl -fL -o "$W/dl/python.nupkg" \
         "https://www.nuget.org/api/v2/package/python/$PY_VERSION"
+    got="$(sha256sum "$W/dl/python.nupkg" | cut -d' ' -f1)"
+    if [ "$got" != "$PY_SHA256" ]; then
+        echo "python.nupkg SHA-256 mismatch: expected $PY_SHA256, got $got — refusing to use it"
+        rm -f "$W/dl/python.nupkg"
+        exit 1
+    fi
     (cd "$W/py" && unzip -qo "$W/dl/python.nupkg" 'tools/*')
     wineboot -i >/dev/null 2>&1 || true
     wine "$PY" -m pip install --upgrade pip

@@ -48,7 +48,7 @@ except ImportError:
     # Key names as strings: the Linux uinput keyboard accepts them directly.
     Key = SimpleNamespace(ctrl="ctrl", space="space", f1="f1", f2="f2", f3="f3", f4="f4", f5="f5")
 
-from utils import get_resource_path, input_lock, DEBUG_PRINTS
+from utils import get_resource_path, input_lock, normalize_fish_action, DEBUG_PRINTS
 
 
 def game_key(name: str):
@@ -185,7 +185,14 @@ class FishingBot:
     STOP_REPEATED_ERROR = "repeated_error"     # the same loop kept failing
     STOP_DROP_FAILING = "drop_failing"         # drops failed several times in a row: Drop / Confirm points?
     STOP_CATCH_NOT_RECOGNIZED = "catch_not_recognized"   # catches land but none was ever recognized
-    
+    STOP_CURSOR_ITEM = "cursor_item"           # a failed drop may have left an item on the (shared) cursor
+
+    # Set (window number, item name) when a drop failed and the item could
+    # not be put back: it may still be on the cursor, which every window
+    # shares. From then on no bot sends anything (see _focus) until the
+    # player starts again (reset_session_state).
+    _cursor_hazard: Optional[Tuple[int, str]] = None
+
     # Class-level template cache (shared by all bot instances - loaded only once)
     _template_cache = None
     _template_border_crop = 7  # Pixels to crop from each edge of templates
@@ -323,6 +330,8 @@ class FishingBot:
         self._last_cast_wait = None       # recast wait that preceded the current cast
         self._game_end_time = None        # when the last game ended (recast wait is counted from here)
         self._wait_interrupted = False    # the wait for the bite was cut short by a pause
+        self._classic_scale_cursor = 0    # next classic icon scale tried besides the known one
+        self._classic_scale = None        # icon scale this window's last bite was found at
         self._cast_error: Optional[str] = None   # why the last bait_and_cast sent nothing
         self._cast_errors = 0             # casts in a row that failed with an error
         self._full_rescan_wanted = False  # next resume reads every page again, not just the current one
@@ -404,8 +413,10 @@ class FishingBot:
             cls._known_profiles = []
         cls._shared_recast_wait = None
         cls._classic_fish_last_scale = None
+        cls._cursor_hazard = None   # the player has had the chance to clear the cursor
         dialog_watch.forget()   # the drop dialog's look, learned per window slot
-        diag.log("STATE", "shared session state reset (learned looks, recast wait, classic scale, dialog looks)")
+        diag.log("STATE", "shared session state reset (learned looks, recast wait, classic scale, dialog looks, "
+                          "cursor hazard)")
 
     def _load_timings(self):
         """Caches all timing values from config (called at init and at session start)."""
@@ -494,7 +505,20 @@ class FishingBot:
 
         False means the OS did not put the window in front: whatever is sent
         now would go to another window (with several clients, into another
-        client's game), so the caller must send nothing."""
+        client's game), so the caller must send nothing.
+
+        Also False, and the bot stops, once any window has left an item on
+        the cursor (``_cursor_hazard``): the next click anywhere would drop it."""
+        hazard = FishingBot._cursor_hazard
+        if hazard is not None:
+            window, item = hazard
+            if window != self.bot_id + 1:
+                self._stop_bot(
+                    self.STOP_CURSOR_ITEM,
+                    f"[W{self.bot_id+1}] W{window} could not put {item} back after a failed drop — it may "
+                    f"still be on the cursor. Stopping bot so no click drops it. Put it back by hand, then "
+                    f"start again.")
+            return False
         ok = self.window_manager.activate_window(force_activate=True) if force \
             else self.window_manager.activate_window()
         if ok is False:
@@ -1550,7 +1574,7 @@ class FishingBot:
             self._unrecognized_in_a_row = 0
 
             filename, (inv_x, inv_y) = match
-            action = fish_actions.get(filename, 'keep')
+            action = normalize_fish_action(fish_actions.get(filename))
             fish_name = filename.replace('_living.jpg', '').replace('_item.jpg', '')
             diag.log("DECISION", f"caught {filename} at strip ({inv_x},{inv_y}): configured action "
                                  f"{fish_actions.get(filename)!r} -> {action}", tag=self.diag_tag)
@@ -1590,6 +1614,11 @@ class FishingBot:
         the mouse between its steps. Returns False when nothing could be sent
         (window not in front, bot stopped)."""
         fish_name = filename.replace('_living.jpg', '').replace('_item.jpg', '')
+        if action not in ('drop', 'open'):
+            # Only an explicit drop may take the drop path (an empty or
+            # unknown action once dropped the fish): anything else is kept.
+            self._mark_occupied(inv_x, inv_y)
+            return True
         if action == 'open':
             return self._open_item(fish_name, inv_x, inv_y, label)
         try:
@@ -1818,12 +1847,28 @@ class FishingBot:
             else:
                 diag.exc(f"drop sequence of {fish_name}", tag=self.diag_tag)
             try:
-                if self.running and self._focus(force=True):
+                # Also after a stop: the item must not be left for the player
+                # (or another window) to drop with the next click.
+                if self._focus(force=True):
                     if not slot_has_item():
                         put_back(why)
                         return
                 else:
-                    self._log(f"Drop of {fish_name} stopped: {why} — check the cursor")
+                    # The window cannot be brought back, so the item cannot
+                    # be put back. It may be on the cursor, which every
+                    # window shares: nothing may click from here on — this
+                    # bot nor any other (they check this in _focus, under
+                    # the input lock still held here).
+                    FishingBot._cursor_hazard = (self.bot_id + 1, fish_name)
+                    self._mark_occupied(inv_x, inv_y)
+                    diag.log("DECISION", f"drop of {fish_name} failed ({why}) and the window could not be "
+                                         f"focused to put it back: every bot stops", tag=self.diag_tag)
+                    self._stop_bot(
+                        self.STOP_CURSOR_ITEM,
+                        f"[W{self.bot_id+1}] Drop of {fish_name} failed ({why}) and the game window could not "
+                        f"be brought back to put it back — it may still be on the cursor. Stopping all bots. "
+                        f"Put it back by hand, then start again.")
+                    return
             except Exception:
                 diag.exc(f"putting {fish_name} back", tag=self.diag_tag)
                 self._mark_occupied(inv_x, inv_y)
@@ -2668,25 +2713,47 @@ class FishingBot:
         if not self._goto_page(page_pos):
             self._fill_page_pending = True   # try again before the next read
 
-    def press_key(self, key: str, description: str = ""):
-        """Presses a keyboard key using pynput. Uses input lock for thread safety."""
+    def press_key(self, key: str, description: str = "") -> bool:
+        """Presses a keyboard key using pynput. Uses input lock for thread safety.
+        Returns True when the key was sent: False when there is no keyboard,
+        the bot stopped, the window could not be focused or the press failed."""
         if not self.keyboard_controller:
-            return
+            return False
         
         with input_lock:
             try:
                 if not self.running or not self._focus():
-                    return
+                    return False
                 self.human.sleep(self._t_key_set)
 
                 self.human.tap_key(game_key(key), hold=self._t_key_hold)
 
                 if description and self.on_status_update:
                     self.on_status_update(f"[W{self.bot_id+1}] {description}")
+                return True
             except Exception as e:
                 diag.exc(f"press_key {key}", tag=self.diag_tag)
                 if self.on_status_update:
                     self.on_status_update(f"[W{self.bot_id+1}] Error pressing key '{key}': {e}")
+                return False
+
+    # Classic reel: how long the reel key is retried when the window cannot
+    # be brought to the front. The bite window is short; after this the
+    # round is given up rather than counted.
+    _REEL_RETRY_SECONDS = 1.5
+
+    def _send_reel(self) -> bool:
+        """Sends the classic reel key, retrying for a short while when it
+        could not be sent (focus refused, key error). Returns True once
+        it was sent."""
+        key = self.config.get('cast_key', 'space')
+        deadline = time.perf_counter() + self._REEL_RETRY_SECONDS
+        while True:
+            if self.press_key(key, "Reel in fish"):
+                return True
+            if not self.running or not self.keyboard_controller or time.perf_counter() >= deadline:
+                return False
+            time.sleep(0.1)
     
     def wait_for_minigame_window(self, timeout: float = 6.0) -> bool:
         """Waits for the fishing minigame panel after a cast.
@@ -3679,8 +3746,8 @@ class FishingBot:
                     matched_filename = self._disambiguate_confusable_fish(
                         inventory_frame, cx, cy, best_filename)
                 diag.log("DECISION", f"slot ({cx},{cy}) {matched_filename}: "
-                                     f"{fish_actions.get(matched_filename, 'keep')}", tag=self.diag_tag)
-                if fish_actions.get(matched_filename, 'keep') == 'keep':
+                                     f"{normalize_fish_action(fish_actions.get(matched_filename))}", tag=self.diag_tag)
+                if normalize_fish_action(fish_actions.get(matched_filename)) == 'keep':
                     self._ignored_positions.add((cx, cy))
                     keep_count += 1
 
@@ -3696,7 +3763,7 @@ class FishingBot:
                 if not match:
                     break
                 filename, (inv_x, inv_y) = match
-                action = fish_actions.get(filename, 'keep')
+                action = normalize_fish_action(fish_actions.get(filename))
                 if action == 'keep':
                     self._ignored_positions.add((inv_x, inv_y))
                     continue
@@ -3748,6 +3815,9 @@ class FishingBot:
         
         return FishingBot._classic_fish_template
     
+    # Scales matched per poll besides the known one (see wait_for_classic_fish).
+    _CLASSIC_ROTATING_SCALES = 3
+
     def wait_for_classic_fish(self, timeout: float = 10.0) -> bool:
         """Waits for the classic fish image to appear in the game window.
         Returns True if found, False if timeout. A pause ends the wait
@@ -3781,16 +3851,23 @@ class FishingBot:
                     _scaled.append((_s, _nw, _nh, cv2.resize(template, (_nw, _nh), interpolation=_interp)))
             FishingBot._classic_fish_scaled_cache = _scaled
 
-        scaled_templates = FishingBot._classic_fish_scaled_cache
+        all_scales = FishingBot._classic_fish_scaled_cache
 
-        # Promote the last-known-good scale to the front so subsequent polls
-        # (and subsequent casts) early-exit on the very first matchTemplate.
-        last_scale = FishingBot._classic_fish_last_scale
-        if last_scale is not None:
-            scaled_templates = sorted(
-                scaled_templates,
-                key=lambda st: 0 if st[0] == last_scale else 1,
-            )
+        # Once the icon has been found, its scale is known (the window size
+        # does not change between casts) and is tried on every poll. A poll
+        # without the icon then matches that scale plus a few others in turn
+        # instead of all 19: a full miss scan took ~30 ms at 720p and ~50 ms
+        # at 1080p, most of a core for the whole bite wait. Every scale is
+        # still tried within a few polls, so a stale scale (window resized)
+        # is found again. Until a scale is known, every poll tries them all.
+        # The scale is kept per window (clients drawn at different sizes must
+        # not keep swapping one shared value, each paying the rotation); the
+        # shared one only seeds a window that has not seen its icon yet.
+        last_scale = self._classic_scale if self._classic_scale is not None \
+            else FishingBot._classic_fish_last_scale
+        known = [st for st in all_scales if st[0] == last_scale]
+        others = [st for st in all_scales if st[0] != last_scale]
+        rotate = self._CLASSIC_ROTATING_SCALES if known and others else 0
 
         # Local refs for tight inner loop
         match_template = cv2.matchTemplate
@@ -3842,6 +3919,14 @@ class FishingBot:
                     best_match_val = 0.0
                     best_scale = 1.0
 
+                    if rotate:
+                        start = self._classic_scale_cursor % len(others)
+                        self._classic_scale_cursor = start + rotate
+                        scaled_templates = known + [others[(start + i) % len(others)]
+                                                    for i in range(min(rotate, len(others)))]
+                    else:
+                        scaled_templates = all_scales
+
                     for scale, new_w, new_h, scaled_template in scaled_templates:
                         # Skip if scaled template is larger than current cropped frame
                         if new_h > f_h or new_w > f_w:
@@ -3861,7 +3946,7 @@ class FishingBot:
 
                     lp.score("best", best_match_val)
                     lp.frame(f"classic fish best={best_match_val:.3f} at scale {best_scale} "
-                             f"(accept {ACCEPT_THRESHOLD})")
+                             f"of {len(scaled_templates)} scales (accept {ACCEPT_THRESHOLD})")
                     if best_match_val >= ACCEPT_THRESHOLD:  # Found the classic fish indicator
                         lp.set("result", f"found best={best_match_val:.3f} scale={best_scale}")
                         diag.first("classic_fish", frame, tag=self.diag_tag,
@@ -3871,6 +3956,7 @@ class FishingBot:
                                              f"classic_fishing_delay {self.config.get('classic_fishing_delay', 3.0)}s "
                                              f"before reeling in", tag=self.diag_tag)
                         # Persist the winning scale for the next poll/cast
+                        self._classic_scale = best_scale
                         FishingBot._classic_fish_last_scale = best_scale
                         # Start timer IMMEDIATELY after detection (configurable delay)
                         delay = self.config.get('classic_fishing_delay', 3.0)
@@ -4370,8 +4456,20 @@ class FishingBot:
                         break
 
                     # Timer already elapsed in wait_for_classic_fish - press space to reel in
-                    self.press_key(self.config.get('cast_key', 'space'), "Reel in fish")
+                    reeled = self._send_reel()
                     self._game_end_time = time.perf_counter()
+                    if not self.running:
+                        break
+                    if not reeled:
+                        # Nothing was sent, so nothing was caught: no catch,
+                        # no bait spent, no inventory click. The line is
+                        # still out; the recast wait below lets it run out
+                        # before the next cast.
+                        diag.log("DECISION", "classic reel key not sent: round not counted", tag=self.diag_tag)
+                        self._log("Could not send the reel key (game window not in front) — round not counted")
+                        if self._wait_before_recast():
+                            self._was_paused = True
+                        continue
                     time.sleep(0.05)
 
                     self.total_games += 1

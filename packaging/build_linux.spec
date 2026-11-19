@@ -22,7 +22,7 @@ a = Analysis(
         'PySide6.QtCore', 'PySide6.QtGui', 'PySide6.QtSvg', 'PySide6.QtWidgets',
         'pynput.keyboard', 'pynput.mouse', 'pynput.keyboard._xorg', 'pynput.mouse._xorg',
         'tkinter', 'Xlib', 'Xlib.display', 'Xlib.ext.xtest', 'Xlib.XK',
-        'cv2', 'numpy', 'numba', 'llvmlite', 'psutil', 'mss',
+        'cv2', 'numpy', 'numba', 'llvmlite', 'mss',
         'platforms', 'platforms.x11', 'platforms.uinput',
         'screen_capture', 'input_backend', 'jigsaw_bot', 'jigsaw_detector',
         'jigsaw_solver', 'jigsaw_solver.deterministic', 'jigsaw_solver.jigsaw',
@@ -40,7 +40,7 @@ pyz = PYZ(a.pure, a.zipped_data)
 
 exe = EXE(
     pyz, a.scripts, a.binaries, a.zipfiles, a.datas, [],
-    name='Fishing Puzzle Player v2.0.0 (linux)',
+    name='Fishing Puzzle Player v2.0.2 (linux)',
     debug=False, bootloader_ignore_signals=False,
     strip=False, upx=False, upx_exclude=[],
     runtime_tmpdir=None, console=False,

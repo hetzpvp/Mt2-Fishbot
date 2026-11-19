@@ -6,14 +6,13 @@
 # Python headers (Fedora: sudo dnf install python3-devel,
 # Debian/Ubuntu: sudo apt install python3-dev). See docs/LINUX.md.
 
-numpy>=2.4
-opencv-python-headless>=4.13
+numpy>=2.5
+opencv-python-headless>=5.0
 mss>=10.2
-Pillow>=12.2
-PySide6>=6.11
-pynput>=1.8.1
-numba>=0.65
-psutil>=7.2
+Pillow>=13.0
+PySide6>=6.12
+pynput>=1.8.2
+numba>=0.68
 
 # Windows only
 pyautogui>=0.9.54; sys_platform == "win32"

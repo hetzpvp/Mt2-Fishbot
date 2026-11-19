@@ -38,6 +38,8 @@ for p in (TESTS, os.path.join(ROOT, "src")):
 # temporary folder, so they never read or overwrite the real configuration
 # (which lives next to the program, see qt_gui.config_file_path).
 os.environ["FISHBOT_CONFIG_DIR"] = "."
+# No pause chime or no-bait melody from the speakers while the tests run.
+os.environ["FISHBOT_MUTE"] = "1"
 
 
 def pytest_addoption(parser):
@@ -69,3 +71,14 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(pytest.mark.skip(reason="Linux-only test"))
         if "live" in item.keywords and not live:
             item.add_marker(pytest.mark.skip(reason="live desktop test (run with --live)"))
+
+
+@pytest.fixture(autouse=True)
+def _no_cursor_hazard_between_tests():
+    """FishingBot._cursor_hazard is shared by every bot (it stops them all):
+    one test that sets it must not stop the bots of the next."""
+    yield
+    fishing_bot = sys.modules.get("fishing_bot")
+    bot_cls = getattr(fishing_bot, "FishingBot", None)
+    if bot_cls is not None and isinstance(getattr(bot_cls, "_cursor_hazard", None), tuple):
+        bot_cls._cursor_hazard = None

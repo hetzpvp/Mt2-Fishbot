@@ -12,8 +12,8 @@ Free fishing-minigame bot for Metin2. No subscriptions, no licenses.
 <details>
 <summary>More screenshots</summary>
 
-![Inventory](docs/gui_inventory.png)
-![Settings](docs/gui_settings.png)
+![Positions](docs/gui_inventory.png)
+![Fishing options](docs/gui_settings.png)
 
 </details>
 
@@ -23,17 +23,17 @@ Free fishing-minigame bot for Metin2. No subscriptions, no licenses.
 - Reads the screen only; it never touches game memory
 - Auto fish handling per fish type (keep / open / drop), across up to 8 inventory pages
 - Built-in jigsaw solver for the fishing puzzle
-- Up to 4 bait hotkeys, quick skip (horse or armor), adjustable timings, human-like clicking
+- Up to 8 bait hotkeys (1–4, F1–F4), quick skip (horse or armor), adjustable timings, human-like clicking
 - Adapts to re-skinned minigames, saves and loads profiles
-- **F5** pauses and resumes every bot
+- **F5** pauses and resumes every bot, with a short chime you hear while the game is in front
 - Runs on Windows, and on Linux with the game under Wine ([docs/LINUX.md](docs/LINUX.md))
 
 ## Quick start
 
 1. Run the bot **as administrator** (Windows) and pick your Metin2 windows. The setup wizard (the highlighted **Fishing setup** / **Jigsaw setup** button at the top right) walks you through the rest, and the **Guide** button (bottom bar, and on each setup card) shows with pictures where to click for every coordinate.
-2. In the **Inventory** tab, set the position of inventory page 1 and of every further page your client has, in order, so the bot can switch pages when one fills up.
+2. In the **Positions** tab, set the position of inventory page 1 and of every further page your client has, in order, so the bot can switch pages when one fills up.
 3. Open the inventory and leave it open: the bot reads it to know where catches land and when a page is full, also with automatic fish handling off. Optional: turn on automatic fish handling and choose what to do with each fish.
-4. Put bait in the selected hotkey slots and press **Start All**.
+4. Put bait in the selected hotkey slots and press **START FISHING**.
 
 Quick skip needs a horse (Horse mode), or a spare armor in the inventory with its position set as **Spare Armor** (Armor mode: the bot right-clicks it, which swaps it with the worn armor). Set the page tabs before Spare Armor: the bot then knows the armor's page and switches to it for the right-click while it fills other pages.
 
@@ -41,10 +41,10 @@ Quick skip needs a horse (Horse mode), or a spare armor in the inventory with it
 
 | Problem | Fix |
 |---|---|
-| Start button not showing | Set Windows display scale to 100% |
+| Bottom of the window cut off by the screen | **Settings → Interface size**: pick a smaller size (or Auto) and restart the bot, or lower the Windows display scale. Below 70 % the window gets shorter and its tabs scroll instead |
 | Fish are not opened or dropped | Keep the inventory open, set the drop and confirm positions, then raise the item timings in **Timing Settings** (useful on high ping) |
-| Jigsaw pieces not detected | Lower the detection threshold and keep the whole grid visible |
-| Jigsaw won't start: "the Confirm point lies on the puzzle grid" | The game opens its confirm dialog in the middle of the screen. Move the puzzle window away from the centre (top left works), then Define Grid and Set Confirm Coords (JIGSAW tab) again — see **Guide → Jigsaw: window placement** |
+| Jigsaw pieces not detected | Keep the whole puzzle window visible and uncovered, then **Define Grid** (JIGSAW tab) again so the ghost grid covers the 24 cells exactly. Still failing: send a diagnostic log (below) |
+| Jigsaw won't start: "the Confirm point lies on the puzzle grid" | The game opens its confirm dialog in the middle of the screen. Move the puzzle window away from the centre (top left works), then Define Grid and Set Confirm (JIGSAW tab) again — see **Guide → Jigsaw: window placement** |
 | Pages stop switching | Re-set the page positions after changing resolution |
 | Stops with "Game screen lost" | The inventory vanished while no fish bit (disconnect, death, login screen). Log back in, open the inventory, start again |
 
@@ -55,7 +55,7 @@ The game window can sit in the background but must not be minimized.
 If something goes wrong and the table above does not help, send a diagnostic log:
 
 1. **Settings** tab → tick **Diagnostic log** (leave **Verbose** off unless asked for it).
-2. Press **Start All** and do what triggers the problem, then stop the bot (or let it stop by itself).
+2. Press **START FISHING** (or **START JIGSAW**) and do what triggers the problem, then stop the bot (or let it stop by itself).
 3. A file like `diagnostics/20261115_143022.zip` is written **next to the bot's .exe**. The Settings tab shows its path and **Open log folder** opens the folder with it selected.
 4. Send that one `.zip` (the newest one) in the [Discord support server](https://discord.gg/vZaHCRFqW7).
 

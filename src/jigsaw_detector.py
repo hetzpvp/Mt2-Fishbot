@@ -144,7 +144,7 @@ class JigsawDetector:
         frame_h, frame_w = frame.shape[:2]
         cols, rows = self.COLS, self.ROWS
         cw, ch = w / cols, h / rows
-        tol = max(3, int(round(min(cw, ch) * 0.09)))
+        tol = self._structure_tolerance(w, h)
         margin = tol + 2
         x0, y0 = max(0, x - margin), max(0, y - margin)
         x1, y1 = min(frame_w, x + w + margin), min(frame_h, y + h + margin)
@@ -212,22 +212,56 @@ class JigsawDetector:
                   + " ".join(f"{n}={v:.2f}" for n, v in side_share.items()) + f" (tol {tol}px)")
         return score, detail
 
-    def detect_grid(self, frame: np.ndarray) -> JigsawGridResult:
+    @classmethod
+    def _structure_tolerance(cls, w: int, h: int) -> int:
+        """How far (px) grid_structure looks for a line around where it should be."""
+        return max(3, int(round(min(w / cls.COLS, h / cls.ROWS) * 0.09)))
+
+    def board_area(self, win_w: int, win_h: int) -> Optional[Rect]:
+        """The window rectangle detect_grid reads: the configured grid plus the
+        margin grid_structure looks at around it. A capture of just this
+        rectangle, passed with its corner as ``origin``, reads the same as the
+        whole window. None when the configured grid is not in the window."""
+        bounds = self._configured_grid_bounds(None, (win_w, win_h))
+        if bounds is None:
+            return None
+        x, y, w, h = bounds
+        margin = self._structure_tolerance(w, h) + 2
+        x0, y0 = max(0, x - margin), max(0, y - margin)
+        x1, y1 = min(win_w, x + w + margin), min(win_h, y + h + margin)
+        return (x0, y0, x1 - x0, y1 - y0)
+
+    def detect_grid(self, frame: np.ndarray, origin: Point = (0, 0),
+                    window_size: Optional[Tuple[int, int]] = None) -> JigsawGridResult:
         """Read the configured 6x4 grid and return board occupancy as a 24-bit mask.
 
         ``grid_found`` is False when the configured rectangle does not show
         the puzzle grid (window closed, moved or covered): its cells must
-        not be read, and nothing must be clicked there."""
-        bounds = self._configured_grid_bounds(frame)
+        not be read, and nothing must be clicked there.
+
+        ``frame`` is the whole window, or only the board_area() part of it:
+        then ``origin`` is that part's corner and ``window_size`` the window's
+        (w, h). The bounds and cell centers returned are window coordinates
+        either way."""
+        bounds = self._configured_grid_bounds(frame, window_size)
         if bounds is None:
             diag.log("ANALYSIS", f"grid NOT found: configured jigsaw_grid_bounds="
-                                 f"{self.config.get('jigsaw_grid_bounds')} vs frame {frame.shape[1]}x{frame.shape[0]} "
+                                 f"{self.config.get('jigsaw_grid_bounds')} vs window "
+                                 f"{window_size or (frame.shape[1], frame.shape[0])} "
                                  f"({diag.array_summary(frame)})")
+            return JigsawGridResult(False, None, [], 0, 0.0)
+
+        # Where the grid lies in ``frame`` (the same as ``bounds`` for a whole window).
+        local = (bounds[0] - origin[0], bounds[1] - origin[1], bounds[2], bounds[3])
+        if (local[0] < 0 or local[1] < 0 or local[0] + local[2] > frame.shape[1]
+                or local[1] + local[3] > frame.shape[0]):
+            diag.log("ANALYSIS", f"grid NOT read: {bounds} is not inside the captured part "
+                                 f"{frame.shape[1]}x{frame.shape[0]} at {origin}")
             return JigsawGridResult(False, None, [], 0, 0.0)
 
         confidence = 1.0
         if self.config.get("jigsaw_grid_check", True):
-            confidence, detail = self.grid_structure(frame, bounds)
+            confidence, detail = self.grid_structure(frame, local)
             min_conf = float(self.config.get("jigsaw_grid_min_confidence", 0.6))
             if confidence < min_conf:
                 diag.log("ANALYSIS", f"grid NOT found at the configured bounds {bounds}: structure score "
@@ -239,7 +273,7 @@ class JigsawDetector:
         x, y, w, h = bounds
         cell_w = w / self.COLS
         cell_h = h / self.ROWS
-        grid_roi = frame[y:y + h, x:x + w]
+        grid_roi = frame[local[1]:local[1] + h, local[0]:local[0] + w]
         if grid_roi.size == 0:
             return JigsawGridResult(False, None, [], 0, 0.0)
 
@@ -288,7 +322,10 @@ class JigsawDetector:
 
     _GRID_EDGE_TOLERANCE = 2   # px the configured grid may stick out of the frame
 
-    def _configured_grid_bounds(self, frame: np.ndarray) -> Optional[Rect]:
+    def _configured_grid_bounds(self, frame: Optional[np.ndarray],
+                                window_size: Optional[Tuple[int, int]] = None) -> Optional[Rect]:
+        """The configured grid in window coordinates, checked against the
+        window (``window_size``, or the size of ``frame``)."""
         value = self.config.get("jigsaw_grid_bounds")
         if not value or len(value) != 4:
             return None
@@ -296,7 +333,7 @@ class JigsawDetector:
             x, y, w, h = [int(round(float(part))) for part in value]
         except (TypeError, ValueError):
             return None
-        frame_h, frame_w = frame.shape[:2]
+        frame_w, frame_h = window_size if window_size is not None else (frame.shape[1], frame.shape[0])
         if w <= 0 or h <= 0 or x >= frame_w or y >= frame_h:
             return None
         # A grid that sticks out of the frame cannot be read: clamping it
@@ -407,6 +444,11 @@ class JigsawDetector:
 
         return CrateSlotState(centers, available, missing, confidence)
 
+    def has_confirm_template(self, discard: bool = False) -> bool:
+        """True when the confirm (or discard confirm) button template was
+        shipped: without it detect_confirm_button never finds anything."""
+        return self._load_optional_template("discard_confirm" if discard else "confirm") is not None
+
     def detect_confirm_button(
         self,
         frame: np.ndarray,
@@ -438,6 +480,16 @@ class JigsawDetector:
                                    f"around {cursor_pos}")
             return JigsawPieceResult(None, 0, "unknown", 0.0, None, 0 if piece_pixels is not None else -1)
         colored = int(np.count_nonzero(piece_pixels))
+        if cursor_pos is None:
+            # Without the cursor's position the whole frame is the sample: the
+            # colors of the board, the crates and the rest of the UI mixed
+            # together. They never named a piece (and must not), but scoring
+            # them took ~120 ms at 720p and ~250 ms at 1080p (it grows with the
+            # number of saturated pixels). Colored pixels are
+            # still reported, so the caller treats it as an unknown piece.
+            diag.trace("ANALYSIS", f"cursor piece: no cursor position, {colored} colored pixels in the "
+                                   f"whole frame: unknown")
+            return JigsawPieceResult(None, 0, "unknown", 0.0, None, colored)
 
         scored = self._score_cursor_piece_colors(roi, piece_pixels)
         if not scored:

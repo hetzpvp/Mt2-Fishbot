@@ -133,6 +133,15 @@ DEBUG_MODE_EN = False
 # Debug prints - enable/disable verbose debug print statements
 DEBUG_PRINTS = False
 
+FISH_ACTIONS = ("keep", "drop", "open")
+
+
+def normalize_fish_action(action) -> str:
+    """A configured fish / item action as the bot acts on it. Only "drop" and
+    "open" do anything; every other value (missing, empty, a typo in a
+    hand-edited config) keeps the item, so a broken entry never drops one."""
+    return action if action in ("drop", "open") else "keep"
+
 
 def get_project_root() -> str:
     """Return the repository root in development, or the bundle root in PyInstaller."""
@@ -235,86 +244,78 @@ def _play_wav_file(path: str) -> bool:
     return False
 
 
-def play_rickroll_beep():
-    """Plays a Rick Roll-themed beep sequence with smooth ADSR envelopes.
-    Uses numpy to generate WAV audio with professional envelope curves."""
+# The no-bait alert
+_RICKROLL_MELODY = [
+    (554, 600),   # C5s - strong opening
+    (622, 1000),  # E5f - longer note
+    (622, 600),   # E5f
+    (698, 600),   # F5
+    (831, 100),   # A5f - quick notes
+    (740, 100),   # F5s
+    (698, 100),   # F5
+    (622, 100),   # E5f
+    (554, 600),   # C5s
+    (622, 800),   # E5f - held note
+    (415, 400),   # A4f - step down
+    (415, 200),   # A4f
+]
+# Pause: falling two-note chime. Resume: rising. Short and unlike the alert.
+_PAUSE_MELODY = [(880, 90), (587, 160)]
+_RESUME_MELODY = [(587, 90), (880, 160)]
+
+
+def _melody_wav(melody, volume: float) -> bytes:
+    """A mono 16-bit WAV of ``melody`` [(Hz, ms), ...]: sine notes with
+    smooth attack and release, 10 ms apart."""
+    import io
+    import wave
+    import numpy as np
+
+    sample_rate = 44100
+    audio_data = []
+    for frequency, duration in melody:
+        num_samples = int(sample_rate * duration / 1000)
+        t = np.linspace(0, duration / 1000, num_samples, False)
+        wave_data = np.sin(2.0 * np.pi * frequency * t)
+
+        # ADSR-like envelope: attack and release ramps (exponential for musicality)
+        attack_ms = min(20, duration * 0.12)      # 20ms or 12% of note
+        release_ms = min(40, duration * 0.25)     # 40ms or 25% of note
+        attack_samples = max(int(sample_rate * attack_ms / 1000), 1)
+        release_samples = max(int(sample_rate * release_ms / 1000), 1)
+        envelope = np.ones(num_samples)
+        if attack_samples < num_samples:
+            envelope[:attack_samples] = (np.linspace(0, 1, attack_samples) ** 1.5)
+        if release_samples < num_samples:
+            envelope[-release_samples:] = (np.linspace(1, 0, release_samples) ** 1.5)
+
+        audio_data.extend(wave_data * envelope * volume)
+        audio_data.extend(np.zeros(int(sample_rate * 0.01)))   # gap between notes
+
+    audio_array = np.clip(np.array(audio_data, dtype=np.float32), -1.0, 1.0)
+    audio_int16 = (audio_array * 32767).astype(np.int16)
+    wav_buffer = io.BytesIO()
+    with wave.open(wav_buffer, 'wb') as wav_file:
+        wav_file.setnchannels(1)       # Mono
+        wav_file.setsampwidth(2)       # 16-bit
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(audio_int16.tobytes())
+    return wav_buffer.getvalue()
+
+
+def _play_melody(melody, volume: float) -> None:
+    """Plays ``melody`` and waits for it (call it from a thread). Falls back
+    to winsound beeps on Windows when the WAV cannot be made. Silent when
+    FISHBOT_MUTE=1 (the test suite sets it)."""
+    if os.environ.get("FISHBOT_MUTE") == "1":
+        return
     try:
-        import numpy as np
-        import io
-        import wave
         import tempfile
         import time
-        
-        melody = [
-            (554, 600),   # C5s - strong opening
-            (622, 1000),  # E5f - longer note
-            (622, 600),   # E5f
-            (698, 600),   # F5
-            (831, 100),   # A5f - quick notes
-            (740, 100),   # F5s
-            (698, 100),   # F5
-            (622, 100),   # E5f
-            (554, 600),   # C5s
-            (622, 800),   # E5f - held note
-            (415, 400),   # A4f - step down
-            (415, 200),   # A4f
-        ]
-        
-        sample_rate = 44100
-        audio_data = []
-        
-        for frequency, duration in melody:
-            # Generate samples for this note
-            num_samples = int(sample_rate * duration / 1000)
-            t = np.linspace(0, duration / 1000, num_samples, False)
-            
-            # Generate sine wave
-            wave_data = np.sin(2.0 * np.pi * frequency * t)
-            
-            # ADSR Envelope (Attack, Decay, Sustain, Release)
-            attack_ms = min(20, duration * 0.12)      # 20ms or 12% of note
-            release_ms = min(40, duration * 0.25)     # 40ms or 25% of note
-            
-            attack_samples = max(int(sample_rate * attack_ms / 1000), 1)
-            release_samples = max(int(sample_rate * release_ms / 1000), 1)
-            
-            envelope = np.ones(num_samples)
-            
-            # Attack: smooth fade in (exponential curve for musicality)
-            if attack_samples < num_samples:
-                envelope[:attack_samples] = (np.linspace(0, 1, attack_samples) ** 1.5)
-            
-            # Release: smooth fade out
-            if release_samples < num_samples:
-                envelope[-release_samples:] = (np.linspace(1, 0, release_samples) ** 1.5)
-            
-            # Apply envelope and volume
-            wave_data = wave_data * envelope * 0.28  # 28% volume
-            audio_data.extend(wave_data)
-            
-            # Add gap between notes (10ms)
-            gap_samples = int(sample_rate * 0.01)
-            audio_data.extend(np.zeros(gap_samples))
-        
-        # Convert to 16-bit PCM
-        audio_array = np.array(audio_data, dtype=np.float32)
-        audio_array = np.clip(audio_array, -1.0, 1.0)
-        audio_int16 = (audio_array * 32767).astype(np.int16)
-        
-        # Create WAV in memory
-        wav_buffer = io.BytesIO()
-        with wave.open(wav_buffer, 'wb') as wav_file:
-            wav_file.setnchannels(1)      # Mono
-            wav_file.setsampwidth(2)       # 16-bit
-            wav_file.setframerate(sample_rate)
-            wav_file.writeframes(audio_int16.tobytes())
-        
-        # Write to temp file and play
-        wav_buffer.seek(0)
+        data = _melody_wav(melody, volume)
         with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
-            tmp.write(wav_buffer.getvalue())
+            tmp.write(data)
             tmp_path = tmp.name
-        
         try:
             if winsound is not None:
                 winsound.PlaySound(tmp_path, winsound.SND_FILENAME | winsound.SND_NODEFAULT)
@@ -323,17 +324,21 @@ def play_rickroll_beep():
         finally:
             time.sleep(0.1)  # Small delay before cleanup
             os.remove(tmp_path)
-    
-    except (ImportError, Exception):
-        # Fallback to original winsound beeps if numpy not available
+    except Exception:
         if winsound is None:
             return
         import time
-        melody = [
-            (554, 600), (622, 1000), (622, 600), (698, 600),
-            (831, 100), (740, 100), (698, 100), (622, 100),
-            (554, 600), (622, 800), (415, 400), (415, 200),
-        ]
         for frequency, duration in melody:
             winsound.Beep(frequency, duration)
             time.sleep(0.01)  # Small gap between notes
+
+
+def play_rickroll_beep():
+    """Plays a Rick Roll-themed beep sequence (the no-bait alert)."""
+    _play_melody(_RICKROLL_MELODY, 0.28)
+
+
+def play_pause_beep(paused: bool) -> None:
+    """A short chime when the bots are paused (falling) or resumed (rising),
+    so F5 is confirmed while the game window is in front."""
+    _play_melody(_PAUSE_MELODY if paused else _RESUME_MELODY, 0.22)

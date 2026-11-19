@@ -161,7 +161,7 @@ def layout_problem(config: dict, win_w: Optional[int] = None, win_h: Optional[in
     pad = 6
     fix_window = ("Move the puzzle window away from the middle of the game screen (for example to the "
                   "top left), so the game's confirm dialog no longer covers it. Then press Define Grid and "
-                  "Set Confirm Coords again.")
+                  "Set Confirm again.")
     for what, (x, y) in (("confirm", (cx, cy)), ("park", (cx + shift_px, cy))):
         lies_on = None
         if gx - pad <= x < gx + gw + pad and gy - pad <= y < gy + gh + pad:
@@ -187,7 +187,7 @@ def layout_problem(config: dict, win_w: Optional[int] = None, win_h: Optional[in
                     f"dropped by accident.")
         if lies_on == "inventory":
             fix = ("Move the puzzle window so the game's confirm dialog does not open over the inventory "
-                   "(or move the inventory), then press Set Confirm Coords again.")
+                   "(or move the inventory), then press Set Confirm again.")
         else:
             fix = fix_window
         return LayoutProblem(what, lies_on, (x, y), f"{head}\n\n{fix}", "jigsaw_layout")
@@ -704,7 +704,7 @@ class JigsawBot:
                 elif completes_board and not self._last_placement_matched:
                     # "Something changed", not the predicted board: complete
                     # only if the board really reads full now.
-                    check = self.detector.detect_grid(self.capture_full_window())
+                    check = self._read_board()
                     completes_board = check.grid_found and check.board_mask == FULL_BOARD_MASK
                     diag.log("DECISION", f"placement not matched exactly: board complete={completes_board}",
                              tag=self.diag_tag)
@@ -883,6 +883,8 @@ class JigsawBot:
 
     def _detect_cursor_piece(self, cursor_rel: Optional[Tuple[int, int]]):
         if cursor_rel is None:
+            # No cursor position: the detector can only tell whether anything
+            # piece-colored is in the window at all (never which piece).
             return self.detector.detect_cursor_piece(self.capture_full_window(), None)
         radius = int(self.config.get("jigsaw_cursor_capture_roi", 15))
         radius = max(10, min(24, radius))
@@ -1465,11 +1467,17 @@ class JigsawBot:
         dialog_up = self._wait_for_dialog(baseline, float(self.config.get("jigsaw_action_delay", 0.08)) * 0.6)
         if not self.running:
             return   # stopped while waiting: leave the dialog alone
-        if baseline is not None and not dialog_up:
-            # No dialog: a confirm click now would land in the game world.
-            # The piece may still be held: the next round looks at the hand.
-            self._status("No discard dialog appeared; not clicking Confirm")
-            diag.log("DECISION", "discard: no dialog seen -> confirm not clicked", tag=self.diag_tag)
+        if not dialog_up and not self.dry_run and self.confirm_button_pos is not None:
+            # No dialog seen — or the confirm area could not be read at all
+            # (no baseline): either way a confirm click now could land in
+            # the game world. The piece may still be held: the next round
+            # looks at the hand.
+            if baseline is None:
+                self._status("Could not read the Confirm area; not clicking Confirm")
+                diag.log("DECISION", "discard: confirm area unreadable -> confirm not clicked", tag=self.diag_tag)
+            else:
+                self._status("No discard dialog appeared; not clicking Confirm")
+                diag.log("DECISION", "discard: no dialog seen -> confirm not clicked", tag=self.diag_tag)
             self._check_hand = cursor_rel
             return
         self._click_window_point(self.confirm_button_pos, "Confirm discard",
@@ -1560,7 +1568,7 @@ class JigsawBot:
         grid = None
         with diag.loop("await board", tag=self.diag_tag, expected=f"{expected:024b}", timeout=timeout) as lp:
             while self.running:
-                grid = self.detector.detect_grid(self.capture_full_window())
+                grid = self._read_board()
                 lp.frame(f"board {grid.board_mask:024b} found={grid.grid_found}")
                 if grid.grid_found and grid.board_mask == expected:
                     lp.set("result", "board shows the placement")
@@ -1571,6 +1579,23 @@ class JigsawBot:
             lp.set("result", f"not matched; last board "
                              f"{'never read' if grid is None else format(grid.board_mask, '024b')}")
         return grid, False
+
+    def _read_board(self) -> JigsawGridResult:
+        """detect_grid from a capture of only the grid and the margin around it
+        that the reading looks at: the same result as from the whole window,
+        without grabbing and copying the whole window on every poll."""
+        _, _, win_w, win_h = self.window_manager.get_window_rect()
+        area = self.detector.board_area(win_w, win_h)
+        if area is None:
+            return self.detector.detect_grid(self.capture_full_window())   # not found; logs why
+        frame = self.capture.grab(*area)
+        if frame is None:
+            return JigsawGridResult(False, None, [], 0, 0.0)   # nothing captured: nothing to read
+        if frame.shape[:2] != (area[3], area[2]):
+            # Not the rectangle asked for (the window render was smaller than
+            # its rectangle): read the whole window as before.
+            return self.detector.detect_grid(self.capture_full_window())
+        return self.detector.detect_grid(frame, origin=(area[0], area[1]), window_size=(win_w, win_h))
 
     def _confirm_placement(self, before: int, expected: int, decision: JigsawActionResult,
                            cursor_rel: Optional[Tuple[int, int]]) -> bool:
@@ -1733,14 +1758,19 @@ class JigsawBot:
         result_pt = self._result_point()
         baseline = self._result_baseline
         changed_polls = 0
+        # Without a shipped template there is no button to search the whole
+        # window for: grabbing it every poll (up to 13 s at 10 Hz) was wasted.
+        use_template = self.detector.has_confirm_template()
         with diag.loop("poll result confirm", tag=self.diag_tag, budget=total_budget, at=result_pt,
-                       baseline=baseline is not None) as lp:
+                       baseline=baseline is not None, template=use_template) as lp:
             while self.running and time.perf_counter() < deadline:
-                frame = self.capture_full_window()
                 lp.frame()
                 target = None
                 # A shipped template finds the button itself...
-                ok_pos = self.detector.detect_confirm_button(frame)
+                ok_pos = None
+                if use_template:
+                    frame = self.capture_full_window()
+                    ok_pos = self.detector.detect_confirm_button(frame)
                 if ok_pos is not None:
                     target = (ok_pos[0] + offset_x, ok_pos[1])
                     lp.set("result", f"OK template at {ok_pos}, click {target}")
@@ -1765,8 +1795,9 @@ class JigsawBot:
                     return
                 time.sleep(poll_interval)
             lp.set("result", "not found")
-        if diag.ENABLED and frame is not None:
-            diag.image("jigsaw_result_confirm_not_found", frame, tag=self.diag_tag)
+        if diag.ENABLED and self.running:
+            diag.image("jigsaw_result_confirm_not_found", frame if frame is not None
+                       else self.capture_full_window(), tag=self.diag_tag)
 
         if DEBUG_PRINTS or diag.ENABLED:
             self._dbg(f"[JigsawBot W{self.bot_id + 1}] result dialog not seen within {total_budget}s")
@@ -1818,11 +1849,18 @@ class JigsawBot:
             dialog_up = self._wait_for_dialog(baseline, between_click_delay)
             if not self.running:
                 return parked   # stopped while waiting: leave the dialog alone
-            if baseline is not None and not dialog_up:
-                # No dialog came: a confirm click would land in the game
-                # world. The round finds no new piece and tries again.
-                diag.log("DECISION", "open crate: no dialog seen -> confirm not clicked", tag=self.diag_tag)
-                self._status("No dialog appeared after clicking the crate; not clicking Confirm")
+            if not dialog_up:
+                # No dialog came — or the confirm area could not be read
+                # (no baseline), so there is no telling: a confirm click
+                # would land in the game world. The round finds no new
+                # piece and tries again (and pauses after a few in a row).
+                if baseline is None:
+                    diag.log("DECISION", "open crate: confirm area unreadable -> confirm not clicked",
+                             tag=self.diag_tag)
+                    self._status("Could not read the Confirm area after clicking the crate; not clicking Confirm")
+                else:
+                    diag.log("DECISION", "open crate: no dialog seen -> confirm not clicked", tag=self.diag_tag)
+                    self._status("No dialog appeared after clicking the crate; not clicking Confirm")
                 self.human.move_to(parked_x, parked_y)
                 return parked
             self.human.move_to(confirm_x, confirm_y)

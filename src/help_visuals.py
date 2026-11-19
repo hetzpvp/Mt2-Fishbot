@@ -17,7 +17,7 @@ STOP_REASON_TOPIC.
 from typing import Callable, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPainterPath, QPen
+from PySide6.QtGui import QBrush, QColor, QFont, QGuiApplication, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (QDialog, QFrame, QHBoxLayout, QLabel, QListWidget, QPushButton,
                                QSizePolicy, QStackedWidget, QVBoxLayout, QWidget)
 
@@ -418,7 +418,7 @@ def draw_armor_slot(c: Canvas) -> None:
            "Armor mode right-clicks a spare armor in the inventory: the game puts it on and moves the "
            "worn one into the same two slots. The next right-click swaps them back. That swap ends the "
            "fishing animation sooner.\n\nSo set the position of a spare armor in the inventory, never the "
-           "armor you wear.\n\nHorse mode needs no position: it uses the mount hotkey.",
+           "armor you wear.\n\nHorse mode needs no position: it presses Ctrl + the mount key.",
            size=6.9, color=QColor(THEME["text_dim"]), align=Qt.AlignLeft | Qt.AlignTop)
 
 
@@ -567,7 +567,7 @@ def draw_jigsaw_confirm(c: Canvas) -> None:
     c.point_at(x, y + 8, "1", "below")
     c.text(345, 20, 165, 270,
            "Open a crate by hand once: the game asks whether to use it. While that dialog is on screen, "
-           "press Set Confirm Coords and click its Yes button.\n\nThe bot clicks this point to confirm "
+           "press Set Confirm and click its Yes button.\n\nThe bot clicks this point to confirm "
            "every crate and every discard.",
            size=7.2, color=QColor(THEME["text_dim"]), align=Qt.AlignLeft | Qt.AlignTop)
 
@@ -591,7 +591,7 @@ def draw_jigsaw_layout(c: Canvas) -> None:
            size=6.6, color=QColor(THEME["text_dim"]))
     c.text(10, 246, 500, 54,
            "Move the puzzle window away from the centre of the game screen, then press Define Grid and "
-           "Set Confirm Coords again. The window stays where you put it.",
+           "Set Confirm again. The window stays where you put it.",
            size=7.2, align=Qt.AlignLeft | Qt.AlignTop)
 
 
@@ -648,7 +648,8 @@ TOPICS: Dict[str, dict] = {
         steps=["Drop one fish on the ground by hand and see which dialogs your client shows.",
                "Only if a drop / sell dialog comes first: click Drop / Sell in the bot, then that button. "
                "Clients without this dialog skip this step and leave Drop / Sell empty.",
-               "On the yes/no dialog: click Confirm in the bot, then its Yes button. Always needed."],
+               "On the yes/no dialog: click Confirm in the bot, then its Yes button. Needed when a fish "
+               "is set to drop, and always for Jigsaw."],
         draw=draw_drop_confirm),
     "set_position": dict(
         title="How to set a position",
@@ -667,7 +668,7 @@ TOPICS: Dict[str, dict] = {
     "quick_skip": dict(
         title="Quick skip (horse or armor)",
         steps=["FISHING tab: turn on Quick Skip and pick Horse or Armor.",
-               "Horse: have a horse to mount; the bot presses Ctrl + the mount key (G).",
+               "Horse: have a horse to mount; the bot presses Ctrl + the mount key (G by default; the FISHING tab changes it).",
                "Armor: put a second armor in the inventory and set Spare Armor (next topic)."],
         draw=draw_quick_skip),
     "armor_slot": dict(
@@ -682,7 +683,7 @@ TOPICS: Dict[str, dict] = {
     "fish_handling": dict(
         title="What happens to each fish",
         steps=["Turn on Automatic Fish Handling and press Configure Fish and Items.",
-               "Choose keep, open or drop for each fish and item.",
+               "Choose keep, drop or open for each fish, and keep or drop for each item.",
                "Drop needs the Confirm coordinate (and Drop / Sell if your client asks drop or sell first)."],
         draw=draw_fish_handling),
     "jigsaw_grid": dict(
@@ -693,13 +694,13 @@ TOPICS: Dict[str, dict] = {
     "jigsaw_confirm": dict(
         title="Jigsaw: the Confirm point",
         steps=["Open a crate by hand so the game asks to confirm.",
-               "Press Set Confirm Coords and click the dialog's Yes button."],
+               "Press Set Confirm and click the dialog's Yes button."],
         draw=draw_jigsaw_confirm),
     "jigsaw_layout": dict(
         title="Jigsaw: window placement",
         steps=["Move the Fish Puzzle window away from the middle of the screen (top left works well).",
                "Press Define Grid again.",
-               "Open a crate by hand and press Set Confirm Coords again."],
+               "Open a crate by hand and press Set Confirm again."],
         draw=draw_jigsaw_layout),
     "jigsaw_crates": dict(
         title="Jigsaw: crates",
@@ -732,6 +733,27 @@ STOP_REASON_TOPIC: Dict[str, str] = {
 
 
 # ---------------------------------------------------------------- widgets
+
+def fit_to_screen(dialog: QWidget, frame_w: int = 16, frame_h: int = 48) -> None:
+    """Caps a dialog's size, and its minimum size, to the free area of the
+    screen it opens on (its parent's), leaving room for the title bar. On a
+    very short screen (the 0.7 interface scale floor) the main window is
+    already shortened; without this its dialogs open with their Next, Save
+    or Close buttons below the screen. The bodies scroll or shrink."""
+    parent = dialog.parentWidget()
+    screen = ((parent.screen() if parent is not None else None) or dialog.screen()
+              or QGuiApplication.primaryScreen())
+    if screen is None:
+        return
+    avail = screen.availableGeometry()
+    max_w = max(320, avail.width() - frame_w)
+    max_h = max(320, avail.height() - frame_h)
+    mn = dialog.minimumSize()
+    if mn.width() > max_w or mn.height() > max_h:
+        dialog.setMinimumSize(min(mn.width(), max_w), min(mn.height(), max_h))
+    size = dialog.size()
+    if size.width() > max_w or size.height() > max_h:
+        dialog.resize(min(size.width(), max_w), min(size.height(), max_h))
 
 class Illustration(QWidget):
     """Draws one topic's picture, scaled to the widget, keeping its aspect."""
@@ -837,6 +859,7 @@ class HelpDialog(QDialog):
         fl.addWidget(close)
         outer.addWidget(footer)
         self.show_topic(start or self.topics[0])
+        fit_to_screen(self)
 
     def show_topic(self, key: str) -> None:
         idx = self.topics.index(key) if key in self.topics else 0

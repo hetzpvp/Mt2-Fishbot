@@ -94,8 +94,10 @@ Run it with `run_in_background` (it takes several minutes). It builds:
 - the Linux binary (`packaging/build_linux.spec`, `.venv` PyInstaller).
 
 It then smoke-tests both on a private Xvfb display. Each one must still be
-running after a few seconds; this never touches the user's desktop. The
-assets go to `dist/release-X.Y.Z/`:
+running after a few seconds; this never touches the user's desktop. Each
+asset that passed is recorded with its SHA-256 in `VERIFIED.json`; `publish`
+refuses an asset that is missing from it (built with `--no-smoke`, smoke
+failed, or rebuilt since). The assets go to `dist/release-X.Y.Z/`:
 `Fishing-Puzzle-Player-vX.Y.Z-windows.exe`,
 `Fishing-Puzzle-Player-vX.Y.Z-linux.tar.gz` and `SHA256SUMS.txt`. A copy of
 the exe also goes to `releases/windows/` (the local archive, gitignored).
@@ -133,9 +135,12 @@ End the message with the attribution lines from the session's system reminder.
 .venv/bin/python tools/release.py publish --notes-file <scratchpad>/release-notes-X.Y.Z.md   # add --draft if chosen
 ```
 
-This checks that HEAD carries the version, the release files are committed,
-the branch is `main`, and that the tag and release don't exist yet. Then it
-creates the annotated tag `Mt2-Fishbot-vX.Y.Z`, pushes `main` and the tag,
+This checks that HEAD carries the version, the work tree is clean (no
+changes to tracked files, no untracked files under `src/`, `packaging/` or
+`assets/`), both assets passed their smoke test, the branch is `main`, and
+that the tag and release don't exist yet. It then runs the unit tests on the
+committed tree (about 3 minutes, so use `run_in_background`) and stops if
+they fail. Then it creates the annotated tag `Mt2-Fishbot-vX.Y.Z`, pushes `main` and the tag,
 and creates the GitHub release (title `vX.Y.Z`, marked latest) with the three
 assets.
 
