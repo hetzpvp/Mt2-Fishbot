@@ -26,6 +26,15 @@ Release helper for MT2 Fishing Bot. The full flow is in CLAUDE.md
         the work tree has changes that would not be in the tag, an asset is
         missing or did not pass its smoke test (VERIFIED.json), the tests
         fail, or the tag exists.
+
+    python tools/release.py announce --notes-file FILE [--mediafire URL]
+            [--virustotal URL] [--date DD/MM/YYYY]
+        Writes the Discord and elitepvpers posts for the current version to
+        dist/release-X.Y.Z/announce-discord.md and announce-elitepvpers.txt,
+        from the templates in tools/announce/. The "What's new" bullets come
+        from the release notes file. Downloads point at the GitHub release
+        assets (plus MediaFire if given). Run it again after adding a
+        MediaFire or VirusTotal link. Nothing is posted anywhere.
 """
 
 import argparse
@@ -34,6 +43,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -313,46 +323,119 @@ def cmd_status(args):
 
 # ---------------------------------------------------------------- build
 
+def processes_of(path):
+    """{pid: command line} of the running processes whose executable is
+    `path` (Linux /proc; empty elsewhere)."""
+    found = {}
+    real = os.path.realpath(path)
+    for pid in os.listdir("/proc") if os.path.isdir("/proc") else ():
+        if not pid.isdigit():
+            continue
+        try:
+            if os.path.realpath(os.readlink(f"/proc/{pid}/exe")) != real:
+                continue
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                found[int(pid)] = f.read().replace(b"\0", b" ").decode(errors="replace").strip()
+        except OSError:
+            continue
+    return found
+
+
+def leftover_processes(path, grace=8.0):
+    """Waits up to `grace` seconds for every process running `path` to exit
+    (a multiprocessing resource tracker quits once its parent is gone), then
+    kills and returns {pid: command line} of the ones still there."""
+    deadline = time.time() + grace
+    left = processes_of(path)
+    while left and time.time() < deadline:
+        time.sleep(0.25)
+        left = processes_of(path)
+    for pid in left:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    return left
+
+
+# A helper started by multiprocessing re-runs the program with "-c <code>".
+MP_HELPER_MARK = " -c from multiprocessing."
+# A onefile helper is two processes (bootloader + Python): one tracker may be
+# up to this many. More means helpers are starting helpers.
+MAX_MP_HELPER_PROCS = 2
+MP_RELAUNCH_WARNING = "resource_tracker: process died unexpectedly"
+
+
 def smoke(cmd, env, seconds=25, windows=False):
     """Starts the program on a private X display; ok if it is still running
     after `seconds` (the GUI came up and did not crash).
 
-    windows: `cmd` is ["wine", exe]. Being alive is not enough there: a fatal
-    Qt error ("no Qt platform plugin could be initialized") is a message box
-    that keeps the process running. So the exe is copied into a fresh folder
-    with a config that opens jigsaw mode, and the solver-cache folder it then
-    creates next to itself (only after the main window is set up) must exist."""
+    Being alive is not enough: a fatal Qt error ("no Qt platform plugin could
+    be initialized") is a message box that keeps the process running. So the
+    program is copied into a fresh folder with a config that opens jigsaw
+    mode, and the solver-cache folder it then creates next to itself (only
+    after the main window is set up) must exist. With no cached table, the
+    solver also starts Numba, whose multiprocessing lock starts a resource
+    tracker by re-running the program.
+
+    windows: `cmd` is ["wine", exe]. Linux: `cmd` is [binary], and no copy of
+    it may be left running afterwards. A frozen program without
+    multiprocessing.freeze_support() turns that tracker into a second,
+    orphaned GUI that timeout never kills."""
     env = dict(env)
     env.pop("WAYLAND_DISPLAY", None)       # never the real desktop
-    proof = None
+    env.pop("JIGSAW_SOLVER_CACHE_DIR", None)
+    env.pop("FISHBOT_CONFIG_DIR", None)
     if windows:
         env.pop("QT_QPA_PLATFORM", None)   # a Windows Qt only has the "windows" plugin
-        box = os.path.join(release_tmp, "win")
-        shutil.rmtree(box, ignore_errors=True)
-        os.makedirs(box)
-        exe = os.path.join(box, os.path.basename(cmd[-1]))
-        shutil.copy2(cmd[-1], exe)
-        write(os.path.join(box, "bot_config.json"), json.dumps({"ui_mode": "jigsaw"}))
-        cmd = cmd[:-1] + [exe]
-        proof = os.path.join(box, "data", "cache", "jigsaw")
     else:
         env["QT_QPA_PLATFORM"] = "xcb"
+    box = os.path.join(release_tmp, "win" if windows else "linux")
+    shutil.rmtree(box, ignore_errors=True)
+    os.makedirs(box)
+    exe = os.path.join(box, os.path.basename(cmd[-1]))
+    shutil.copy2(cmd[-1], exe)
+    write(os.path.join(box, "bot_config.json"), json.dumps({"ui_mode": "jigsaw"}))
+    cmd = cmd[:-1] + [exe]
+    proof = os.path.join(box, "data", "cache", "jigsaw")
     full = ["xvfb-run", "-a", "-s", "-screen 0 1920x1080x24", "timeout", "-s", "TERM", str(seconds)] + cmd
     print("$", " ".join(full), flush=True)
     t = time.time()
-    r = subprocess.run(full, cwd=release_tmp, env=env, capture_output=True, text=True)
-    if r.returncode == 124 and (proof is None or os.path.isdir(proof)):
+    log_path = os.path.join(release_tmp, f"smoke-{os.path.basename(box)}.log")
+    # Sampled while it runs: an orphaned copy dies with the private display,
+    # so after the run there is nothing left to see.
+    helpers = {}
+    with open(log_path, "w+", encoding="utf-8", errors="replace") as log:
+        p = subprocess.Popen(full, cwd=box, env=env, stdout=log, stderr=subprocess.STDOUT, text=True)
+        while p.poll() is None:
+            if not windows:
+                now = {pid: line for pid, line in processes_of(exe).items() if MP_HELPER_MARK in line}
+                if len(now) > len(helpers):
+                    helpers = now
+            time.sleep(0.5)
+        log.seek(0)
+        output = log.read()
+    left = {} if windows else leftover_processes(exe)
+    copies = len(helpers) > MAX_MP_HELPER_PROCS or MP_RELAUNCH_WARNING in output
+    if p.returncode == 124 and os.path.isdir(proof) and not left and not copies:
         print(f"smoke ok: still running after {seconds}s")
-        if proof:
-            shutil.rmtree(os.path.dirname(os.path.dirname(os.path.dirname(proof))), ignore_errors=True)
+        shutil.rmtree(box, ignore_errors=True)
         return True
-    if r.returncode == 124:
+    if copies or left:
+        print("smoke FAILED: a multiprocessing helper started the whole program again "
+              f"({len(helpers)} helper processes at once, {len(left)} left after the stop and killed now"
+              f"{', resource tracker relaunched' if MP_RELAUNCH_WARNING in output else ''}). "
+              "Is multiprocessing.freeze_support() called first in the entry script?")
+        for pid, line in sorted({**helpers, **left}.items()):
+            print(f"  {pid}: <program>{line[len(exe):][:120]}")
+    elif p.returncode == 124:
         print(f"smoke FAILED: still running after {seconds}s, but the main window never set up "
               f"jigsaw mode (no {os.path.relpath(proof, ROOT)}): probably a startup error box. "
               "Under Wine, Qt 6.12 also needs mscms.dll (Fedora: sudo dnf install wine-cms).")
     else:
-        print(f"smoke FAILED: exited with {r.returncode} after {time.time() - t:.1f}s")
-    print((r.stdout + r.stderr)[-4000:])
+        print(f"smoke FAILED: exited with {p.returncode} after {time.time() - t:.1f}s")
+    print(output[-4000:])
+    print(f"full output: {log_path}")
     return False
 
 
@@ -533,6 +616,79 @@ def cmd_publish(args):
     print(f"\nreleased: https://github.com/{REPO}/releases/tag/{tag}")
 
 
+# ---------------------------------------------------------------- announce
+
+ANNOUNCE_DIR = os.path.join(ROOT, "tools", "announce")
+ANNOUNCE_TEMPLATES = {"discord": "discord.md", "elitepvpers": "elitepvpers.txt"}
+
+
+def notes_highlights(notes):
+    """The bullets of the '## What's new' section of the release notes."""
+    m = re.search(r"^## What's new\s*\n(.*?)(?=^## |\Z)", notes, re.M | re.S)
+    if not m:
+        raise ValueError("release notes have no '## What's new' section")
+    items, cur = [], None
+    for line in m.group(1).splitlines():
+        if re.match(r"^\s*[-*] ", line):
+            cur = re.sub(r"^\s*[-*] ", "", line).strip()
+            items.append(cur)
+        elif line.strip() and cur is not None:
+            items[-1] += " " + line.strip()      # wrapped bullet
+    if not items:
+        raise ValueError("release notes '## What's new' has no bullets")
+    return items
+
+
+def _plain(item):
+    """Markdown -> text for BBCode: drop **bold** and `code` marks."""
+    return re.sub(r"\*\*(.+?)\*\*|`(.+?)`", lambda m: m.group(1) or m.group(2), item)
+
+
+def render_announcement(kind, v, highlights, date, mediafire=None, virustotal=None, template=None):
+    if template is None:
+        template = read(os.path.join(ANNOUNCE_DIR, ANNOUNCE_TEMPLATES[kind]))
+    win, lin = asset_url(v, win_asset(v)), asset_url(v, linux_asset(v))
+    release_url = f"https://github.com/{REPO}/releases/tag/{tag_name(v)}"
+    if kind == "discord":
+        hl = "\n".join(f"• {h}" for h in highlights)
+        dl = [f"Windows (run as administrator):\n{win}",
+              f"Linux (game under Wine):\n{lin}"]
+        if mediafire:
+            dl.append(f"Windows mirror (MediaFire):\n{mediafire}")
+        downloads = "\n\n".join(dl)
+        vt = f"View VirusTotal Results\n{virustotal}" if virustotal else "VirusTotal scan coming soon."
+    else:
+        hl = "[LIST]\n" + "\n".join(f"[*]{_plain(h)}" for h in highlights) + "\n[/LIST]"
+        dl = [f'[URL="{win}"]Windows .exe[/URL] (run as administrator)',
+              f'[URL="{lin}"]Linux binary[/URL] (game under Wine)']
+        if mediafire:
+            dl.append(f'[URL="{mediafire}"]Windows mirror (MediaFire)[/URL]')
+        downloads = "[LIST]\n" + "\n".join(f"[*]{d}" for d in dl) + "\n[/LIST]"
+        vt = f'[URL="{virustotal}"]VirusTotal results[/URL]' if virustotal else "VirusTotal scan coming soon."
+    fields = {"version": v, "date": date, "highlights": hl, "downloads": downloads,
+              "virustotal": vt, "release_url": release_url}
+    text = re.sub(r"\{\{(\w+)\}\}", lambda m: fields[m.group(1)], template)
+    return text.rstrip() + "\n"
+
+
+def cmd_announce(args):
+    v = current_version()
+    if not os.path.exists(args.notes_file):
+        sys.exit(f"notes file not found: {args.notes_file}")
+    try:
+        highlights = notes_highlights(read(args.notes_file))
+    except ValueError as e:
+        sys.exit(str(e))
+    date = args.date or time.strftime("%d/%m/%Y")
+    rd = release_dir(v)
+    os.makedirs(rd, exist_ok=True)
+    for kind, tpl in ANNOUNCE_TEMPLATES.items():
+        ext = os.path.splitext(tpl)[1]
+        path = os.path.join(rd, f"announce-{kind}{ext}")
+        write(path, render_announcement(kind, v, highlights, date, args.mediafire, args.virustotal))
+        print(f"wrote {os.path.relpath(path, ROOT)}")
+
+
 # ---------------------------------------------------------------- main
 
 def main():
@@ -553,6 +709,12 @@ def main():
     pb.add_argument("--notes-file", required=True)
     pb.add_argument("--draft", action="store_true")
     pb.set_defaults(fn=cmd_publish)
+    an = sub.add_parser("announce")
+    an.add_argument("--notes-file", required=True, help="release notes; its '## What's new' bullets are used")
+    an.add_argument("--mediafire", help="MediaFire mirror URL of the Windows exe")
+    an.add_argument("--virustotal", help="VirusTotal URL")
+    an.add_argument("--date", help="release date, DD/MM/YYYY (default: today)")
+    an.set_defaults(fn=cmd_announce)
     args = p.parse_args()
     args.fn(args)
 

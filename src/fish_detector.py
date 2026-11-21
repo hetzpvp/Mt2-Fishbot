@@ -306,6 +306,57 @@ def find_click_circle(panel: np.ndarray) -> Optional[Tuple[int, int, int]]:
     return best
 
 
+RING_RED = "red"
+RING_WHITE = "white"
+RING_UNKNOWN = "?"
+
+_RING_BAND_IN, _RING_BAND_OUT = 15, 3   # px inside / outside the radius that are looked at
+_RING_MIN_SHARE = 0.04                  # of the band's pixels, for either color
+_RING_FISH_CLEAR = 14                   # px around the fish left out (it covers the ring)
+_ring_bands: dict = {}
+
+
+def ring_color(panel: np.ndarray, center, radius: float, fish=None) -> str:
+    """Color of the click ring: RING_RED, RING_WHITE or RING_UNKNOWN.
+
+    The official client draws the ring red while the game counts the fish as
+    inside (about one frame late; a fish touching the ring counts), and white
+    otherwise, also for a while after a hit even with the fish inside.
+    Measured on lossless captures (2026-11-19) and the real-client video: a
+    red ring has 700-810 red pixels and none white in this band, a white one
+    400-610 white and none red. Clients with another ring color read as
+    RING_UNKNOWN."""
+    if panel is None or center is None or panel.ndim != 3:
+        return RING_UNKNOWN
+    h, w = panel.shape[:2]
+    key = (h, w, int(round(center[0])), int(round(center[1])), int(round(radius)))
+    band = _ring_bands.get(key)
+    if band is None:
+        yy, xx = np.mgrid[0:h, 0:w]
+        d = np.hypot(xx - key[2], yy - key[3])
+        band = np.nonzero((d > radius - _RING_BAND_IN) & (d < radius + _RING_BAND_OUT))
+        if len(_ring_bands) > 16:
+            _ring_bands.clear()
+        _ring_bands[key] = band
+    ys, xs = band
+    if not len(ys):
+        return RING_UNKNOWN
+    if fish is not None:
+        keep = (xs - fish[0]) ** 2 + (ys - fish[1]) ** 2 > _RING_FISH_CLEAR ** 2
+        ys, xs = ys[keep], xs[keep]
+    hsv = cv2.cvtColor(np.ascontiguousarray(panel[ys, xs]).reshape(-1, 1, 3),
+                       cv2.COLOR_BGR2HSV).reshape(-1, 3)
+    hh, ss, vv = hsv[:, 0], hsv[:, 1], hsv[:, 2]
+    red = int(np.count_nonzero(((hh < 15) | (hh > 140)) & (ss > 35) & (vv > 150)))
+    white = int(np.count_nonzero((ss < 30) & (vv > 200)))
+    need = _RING_MIN_SHARE * len(band[0])
+    if red >= need and red > white:
+        return RING_RED
+    if white >= need and white > red:
+        return RING_WHITE
+    return RING_UNKNOWN
+
+
 class FishDetector:
     """Detects the minigame panel and the fish with HSV thresholds.
     Optimized with cached function references and minimal allocations."""
@@ -572,6 +623,7 @@ class WindowLearner:
     MAX_W_FRAC, MAX_H_FRAC = 0.7, 0.8
     MIN_FILL = 0.6        # changed pixels / bounding box
     MIN_COVERAGE = 0.35   # dominant color / bounding box
+    MAX_OUTSIDE = 0.5     # pixels of that color outside the box / inside it
 
     def learn(self, reference: np.ndarray, current: np.ndarray):
         """Returns (region_bounds, window_lower, window_upper, pixel_count) or None."""
@@ -623,6 +675,15 @@ class WindowLearner:
         # cast, this is scenery, not a panel that just opened.
         ref_hsv = cv2.cvtColor(reference[y:y + h, x:x + w], cv2.COLOR_BGR2HSV)
         if cv2.countNonZero(_hsv_mask(ref_hsv, lower_a, upper_a)) > coverage * 0.5:
+            return None
+
+        # A panel's color is the panel's: when the rest of the window shows
+        # more of it than the box, it is the scene (water around the boat).
+        # A panel that was open before the cast and closed since leaves
+        # exactly such a box of scenery (2026-11-20: water learned as the
+        # panel, a pet's flame as the fish).
+        whole = cv2.countNonZero(_hsv_mask(cv2.cvtColor(current, cv2.COLOR_BGR2HSV), lower_a, upper_a))
+        if whole - coverage > coverage * self.MAX_OUTSIDE:
             return None
 
         closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _CLOSE_KERNEL)

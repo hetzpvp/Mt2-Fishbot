@@ -78,12 +78,14 @@ class InventoryTests(unittest.TestCase):
                     self.assertEqual(occupied, (row, col) not in empty, (t, row, col))
 
     def test_new_catches_are_identified_through_their_glow(self):
-        # A freshly caught item is drawn with a glowing frame.
+        # A freshly caught item is drawn with a glowing frame. The catch path
+        # looks with fresh=True: a caught fish is alive, and the glow spoils
+        # the living / dead / grilled check.
         for t, lab, _frame, bot, rect, strip in self.each_frame():
             for col, name in lab["row1"].items():
                 x, y = self.slot(1, int(col))
                 x, y = x - rect[0], y - rect[1]
-                match = bot.identify_item_in_inventory(strip, roi=(x - 22, y - 22, x + 22, y + 22))
+                match = bot.identify_item_in_inventory(strip, roi=(x - 22, y - 22, x + 22, y + 22), fresh=True)
                 self.assertIsNotNone(match, (t, col))
                 self.assertEqual(match[0], name, (t, col))
                 self.assertLessEqual(max(abs(match[1][0] - x), abs(match[1][1] - y)), 2, (t, col, match))
@@ -120,7 +122,9 @@ class PageWithoutFishTests(unittest.TestCase):
             x, y = x0 + (col - 1) * 32 - self.rect[0], y0 + 4 * 32 - self.rect[1]
             roi = (x - 22, y - 22, x + 22, y + 22)
             self.bot.config["item_color_max_de"] = 0           # check off: the old behavior
-            self.assertEqual(self.bot.identify_item_in_inventory(self.strip, roi=roi)[0], "Large_zander_living.jpg")
+            # (fresh: without the living / dead / grilled check, which also rejects them)
+            match = self.bot.identify_item_in_inventory(self.strip, roi=roi, fresh=True)
+            self.assertTrue(match and match[0].endswith("_living.jpg"), (col, match))   # a fish shape
             self.bot.config.pop("item_color_max_de")
             self.assertIsNone(self.bot.identify_item_in_inventory(self.strip, roi=roi), col)
 

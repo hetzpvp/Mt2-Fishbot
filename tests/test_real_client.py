@@ -156,13 +156,21 @@ class InventoryTests(unittest.TestCase):
                 self.assertIsNone(match, f"slot row {row} col {col} taken for {match}")
 
     def test_recolored_fish_are_not_their_living_kind(self):
-        # Brown (dead?) fish with the shape of a living one, gray 0.91 and
-        # 0.82, in clearly other colors. (Fish only a little browner than
-        # their living kind still pass: the check is for other items.)
+        # Brown fish with the shape of a living one: grilled fish (they match
+        # the game's grilled icons, 2026-11-20). Never living or dead.
         for row, col in ((2, 2), (4, 1)):
             cx, cy = self.slot_center(row, col)
             roi = (max(0, cx - 22), max(0, cy - 22), cx + 22, cy + 22)
-            self.assertIsNone(self.bot.identify_item_in_inventory(self.strip, roi=roi), (row, col))
+            match = self.bot.identify_item_in_inventory(self.strip, roi=roi)
+            self.assertTrue(match is None or match[0].endswith("_grilled.png"), ((row, col), match))
+
+    def test_grilled_fish_are_not_taken_for_living_or_dead(self):
+        for row, col in self.INV["fish"]:
+            cx, cy = self.slot_center(row, col)
+            roi = (max(0, cx - 22), max(0, cy - 22), cx + 22, cy + 22)
+            match = self.bot.identify_item_in_inventory(self.strip, roi=roi)
+            self.assertTrue(match is None or match[0].endswith(("_grilled.png", "_unsure")),
+                            ((row, col), match))
 
     def test_gold_is_identified(self):
         (row, col), = self.INV["gold"]

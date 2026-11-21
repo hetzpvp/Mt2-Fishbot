@@ -68,6 +68,26 @@ class ActionScore:
     is_skip: bool = False
 
 
+# Optional progress hook for a build from scratch: called with (fraction 0..1,
+# text) from the building thread. The GUI shows it as a progress bar.
+_progress_callback = None
+
+
+def set_progress_callback(callback) -> None:
+    global _progress_callback
+    _progress_callback = callback
+
+
+def _report_progress(fraction: float, text: str) -> None:
+    callback = _progress_callback
+    if callback is None:
+        return
+    try:
+        callback(max(0.0, min(1.0, float(fraction))), text)
+    except Exception:
+        pass    # a display problem must never break the build
+
+
 def _default_cache_path(create: bool = False) -> str:
     """See cache_location.py: next to the program, or a per-user folder
     when that cannot be written to."""
@@ -425,8 +445,16 @@ class Deterministic(Solver):
 
         fig_sizes_i64 = _FIG_SIZES.astype(np.int64)
 
+        # Progress: each height weighs about as much as the boards it can
+        # hold (C(24, height)); the first one also compiles the JIT code.
+        weights = [comb(TOTAL_CELLS, h) for h in range(TOTAL_CELLS)]
+        total_weight = float(sum(weights))
+        done_weight = 0
+        _report_progress(0.05, "Compiling the solver (first build only)")
+
         for height in range(TOTAL_CELLS):
             size = int(next_sizes[height])
+            done_weight += weights[height]
             if size == 0:
                 continue
             t0 = time.perf_counter()
@@ -447,8 +475,11 @@ class Deterministic(Solver):
 
             dt = time.perf_counter() - t0
             print(f"  Height {height:>2}/{TOTAL_CELLS}: {size:>9} states  ({dt*1000:7.1f} ms)")
+            _report_progress(0.05 + 0.90 * done_weight / total_weight,
+                             f"Computing the moves: step {height + 1} of {TOTAL_CELLS}")
 
         print(f"Strategy computation complete in {time.perf_counter()-t_total:.2f}s")
+        _report_progress(0.96, "Saving the move table")
         self.save_cache()
         self.in_stack = None   # only needed while computing
 

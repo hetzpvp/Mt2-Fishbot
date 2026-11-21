@@ -190,7 +190,9 @@ class SlowServerTests(Base):
         wait instead of in front of it."""
         times = {}
         for action in ("keep", "drop"):
-            game = bench.quick_game("official", recast_cooldown=0.3, dead_fish_chance=1.0, bite_delay=(0.3, 0.3))
+            # The bite after the time a drop takes: the drop happens between
+            # the cast and the bite (a faster bite puts it off to the game end)
+            game = bench.quick_game("official", recast_cooldown=0.3, dead_fish_chance=1.0, bite_delay=(1.5, 1.5))
             ends, casts = [], []
 
             def on_event(kind, detail, ends=ends, casts=casts):
@@ -317,7 +319,11 @@ class SeveralClientsTests(Base):
             own_aborts = sum(1 for m in desktop.logs if m.startswith(f"[W{i + 1}] Drop of ") and " stopped: " in m)
             self.assertLessEqual(game.stats["drop_cancelled"], own_aborts,
                                  "a drop was cancelled by a click other than the bot's own put-back")
-            self.assertEqual(game.stats["stray_clicks"], 0)
+            # A bite during a drop (items are handled between cast and bite):
+            # the put-back click(s) land while the minigame runs. No others.
+            bitten = sum(1 for m in desktop.logs
+                         if m.startswith(f"[W{i + 1}] Drop of ") and "the minigame opened" in m)
+            self.assertLessEqual(game.stats["stray_clicks"], 2 * bitten)
             self.assertIsNone(game.carrying)
 
     def test_os_that_sometimes_refuses_to_switch_windows(self):

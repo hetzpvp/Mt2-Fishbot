@@ -471,3 +471,20 @@ class SolverSingletonTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class JigsawInventoryFullTests(unittest.TestCase):
+    """Every inventory page full: the board's reward would be lost, so the
+    solver pauses before opening a crate instead of playing."""
+
+    def test_full_inventory_pauses_before_a_board(self):
+        game = JigsawGame(seed=3, full_pages={1, 2, 3, 4})
+        rig = Rig([game])
+        rig.run(lambda: any("every inventory page is full" in m for m in rig.logs), timeout=20)
+        self.assertTrue(any("every inventory page is full" in m for m in rig.logs), rig.logs[-8:])
+        self.assertEqual(game.opened, 0)
+
+    def test_room_on_a_later_page_plays(self):
+        game = JigsawGame(seed=3, full_pages={1})
+        rig = Rig([game])
+        self.assertTrue(rig.run(lambda: game.placed >= 3, timeout=60), rig.logs[-12:])

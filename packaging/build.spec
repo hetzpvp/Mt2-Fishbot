@@ -115,7 +115,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='Fishing Puzzle Player v2.0.2',
+    name='Fishing Puzzle Player v2.0.3',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,  # strip is Linux-only, doesn't work on Windows

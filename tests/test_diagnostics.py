@@ -98,14 +98,14 @@ BOT_CONFIG = {
 }
 
 
-def run_startup_session(exe: FrozenExe, enabled: bool, verbose: bool = False):
+def run_startup_session(exe: FrozenExe, enabled: bool):
     """GUI-like flow: switch diagnostics, open a session, run one bot until it
     stops (the simulated inventory has no free slot: "inventory full at
     startup"), end the session and wait for the zip."""
     config_path = os.path.join(exe.cwd, "bot_config.json")
     with open(config_path, "w") as f:
         json.dump(BOT_CONFIG, f)
-    diag.configure(enabled, verbose)
+    diag.configure(enabled)
     diag.log("GUI", "START pressed")
     folder = diag.start_session({"game windows:": ["W1: 'Metin2' (simulated)"]}, dict(BOT_CONFIG),
                                 config_path, reason="test")
@@ -159,7 +159,8 @@ class DiagSessionTests(unittest.TestCase):
             names, files, log, _ = self._read_zip(zip_path)
             stamp = os.path.basename(folder)
             self.assertTrue(all(n.startswith(stamp + "/") for n in names))
-            for required in ("session.log", "bot_config.json", "config_effective.json", "config_gui.json"):
+            for required in ("session.log", "summary.txt", "bot_config.json", "config_effective.json",
+                             "config_gui.json"):
                 self.assertIn(required, files)
             pngs = [n for n in files if n.endswith(".png")]
             self.assertTrue(any("startup_full_window" in n for n in pngs), pngs)
@@ -223,6 +224,25 @@ class DiagSessionTests(unittest.TestCase):
             self.assertIn("bot loop ended: stop_reason=inventory_full", log)
             self.assertIn("===== session end (all bots stopped)", log)
 
+            # One line per capture; no traced plumbing
+            self.assertNotIn("_note_frame", log)
+            self.assertNotIn("→ FishingBot.capture_inventory_area", log)
+            self.assertNotIn("_load_template_cache", log)
+
+            # summary.txt: the stop and the images, each with its line in session.log
+            with zipfile.ZipFile(zip_path) as zf:
+                summary = zf.read(files["summary.txt"]).decode("utf-8")
+            self.assertIn("Index of session.log", summary)
+            lines = log.splitlines()
+            stop = re.search(r"L(\d+) +[\d:.]+ \[W1\] stop: STOP reason=inventory_full", summary)
+            self.assertIsNotNone(stop, summary)
+            self.assertIn("STOP reason=inventory_full", lines[int(stop.group(1)) - 1])
+            img = re.search(r"L(\d+) +[\d:.]+ \[W1\] image: saved (\S+_no_empty_slots\.png)", summary)
+            self.assertIsNotNone(img, summary)
+            self.assertIn(img.group(2), lines[int(img.group(1)) - 1])
+            self.assertIn(img.group(2), files)
+            self.assertRegex(summary, r"Logging: \d+ lines")
+
     def test_crashed_session_is_packed_at_next_start(self):
         with FrozenExe() as exe:
             leftover = os.path.join(exe.diag_dir, "20200101_000000")
@@ -260,43 +280,63 @@ class DiagSessionTests(unittest.TestCase):
             self.assertIs(bot.on_status_update, bot.__dict__["_on_status_update"])
             self.assertFalse(any(getattr(f, "_diag_traced", False) for f in vars(FishingBot).values()))
 
-    def test_minigame_wait_writes_loop_summary_and_verbose_frames(self):
+    def test_minigame_wait_writes_loop_summary_and_frame_tables(self):
         with FrozenExe():
-            for verbose in (False, True):
-                diag.reset_for_tests()
-                diag.configure(True, verbose)
-                diag.start_session(reason="loop test")
-                screen = SimScreen(OFFICIAL_PANEL, OFFICIAL_FISH)
-                bot, mouse, _ = make_bot(screen, {})
-                bot.running = True
-                self.assertFalse(bot.wait_for_minigame_window(timeout=0.3))
-                screen.panel_open = True
-                self.assertTrue(bot.wait_for_minigame_window(timeout=1.0))
-                bot._TRACK_MIN_SPAN = float("inf")
-                with diag.loop("minigame", tag="W1"):
-                    for _ in range(60):
-                        screen.t += 0.02
-                        bot.atomic_capture_and_click()   # counts its frame into the loop
-                path = diag.current_log_path()
-                diag.end_session("done", wait=True)
-                with zipfile.ZipFile(diag.last_zip_path()) as zf:
-                    log = zf.read(next(n for n in zf.namelist() if n.endswith("session.log"))).decode()
-                self.assertIn("LOOP     ", log)
-                self.assertRegex(log, r"LOOP +fishing_bot\.py:\d+ wait_for_minigame_window \| .*end wait for "
-                                      r"minigame frames=\d+ .*result='timeout'")
-                self.assertRegex(log, r"end wait for minigame .*result='found\+calibrated")
-                self.assertIn("calibrated: region=GameRegion(left=260, top=150, width=280, height=220)", log)
-                self.assertRegex(log, r"end minigame frames=60 .*fish_seen=\d+")
-                self.assertRegex(log, r"DECISION .*click fish seen at \(\d+, \d+\), aimed at")
-                self.assertIn("no_minigame", log)            # negative image of the timed-out wait
-                self.assertIn("first_minigame_calibrated", log)
-                frame_lines = re.findall(r"frame: fish \(\d+, \d+\) (?:INSIDE|outside)", log)
-                if verbose:
-                    self.assertTrue(frame_lines, "verbose must log every frame")
-                else:
-                    self.assertFalse(frame_lines, "per-frame lines only with verbose")
-                    self.assertNotIn("→ FishDetector.detect_window_and_fish", log)
-                self.assertIsNotNone(path)
+            diag.configure(True)
+            diag.start_session(reason="loop test")
+            screen = SimScreen(OFFICIAL_PANEL, OFFICIAL_FISH)
+            bot, mouse, _ = make_bot(screen, {})
+            bot.running = True
+            self.assertFalse(bot.wait_for_minigame_window(timeout=0.3))
+            screen.panel_open = True
+            self.assertTrue(bot.wait_for_minigame_window(timeout=1.0))
+            bot._TRACK_MIN_SPAN = float("inf")
+            bot._ring_turns_red = False   # simulated ring is never red: the circle decides (see test_ring_gate.py)
+            with diag.loop("minigame", tag="W1", columns=("panel", "fish_x", "fish_y", "dist", "action")):
+                for _ in range(60):
+                    screen.t += 0.02
+                    bot.atomic_capture_and_click()   # counts its frame into the loop
+            diag.end_session("done", wait=True)
+            with zipfile.ZipFile(diag.last_zip_path()) as zf:
+                names = {n.split("/", 1)[1]: n for n in zf.namelist()}
+                log = zf.read(names["session.log"]).decode()
+                summary = zf.read(names["summary.txt"]).decode()
+                minigame = zf.read(names["frames_minigame.csv"]).decode().splitlines()
+                waits = zf.read(names["frames_wait_for_minigame.csv"]).decode().splitlines()
+            self.assertRegex(log, r"LOOP +fishing_bot\.py:\d+ wait_for_minigame_window \| .*end wait for "
+                                  r"minigame #\d+ .*frames=\d+ .*result='timeout'")
+            self.assertRegex(log, r"end wait for minigame #\d+ .*result='found\+calibrated")
+            self.assertIn("calibrated: region=GameRegion(left=260, top=150, width=280, height=220)", log)
+            self.assertRegex(log, r"end minigame #\d+ frames=60 .*fish_seen=\d+")
+            self.assertRegex(log, r"DECISION .*click fish seen at \(\d+, \d+\), aimed at")
+            self.assertIn("no_minigame", log)            # negative image of the timed-out wait
+            self.assertIn("first_minigame_calibrated", log)
+
+            # Per-frame detail only inside a recent-detail block (before the no_minigame image)
+            self.assertIn("▼ recent per-frame detail", log)
+            for ln in log.splitlines():
+                if " frame " in ln and re.search(r"(minigame|wait for minigame) #\d+ frame \d+", ln):
+                    self.assertIn("| » ", ln)
+                if "→ FishDetector.detect_window_and_fish" in ln:
+                    self.assertIn("| » ", ln)
+
+            # Frame tables: header with the declared columns, one row per frame
+            self.assertEqual(minigame[0], "time,t,tag,loop,frame,dt_ms,panel,fish_x,fish_y,dist,action,extra,note")
+            self.assertEqual(len(minigame), 61)
+            rows = [r.split(",") for r in minigame[1:]]
+            self.assertTrue(all(r[2] == "W1" for r in rows))
+            self.assertEqual([int(r[4]) for r in rows], list(range(1, 61)))
+            self.assertTrue(any(r[7] for r in rows), "fish positions recorded")
+            self.assertTrue(any(r[10] == "click" for r in rows), "clicks recorded")
+            self.assertTrue(waits[0].startswith("time,t,tag,loop,frame,dt_ms,elapsed,calibrated,pending,scan"))
+            self.assertGreater(len(waits), 2)
+
+            # summary.txt: loop statistics and the image index
+            self.assertRegex(summary, r"minigame: 1x, 60 frames")
+            self.assertRegex(summary, r"wait for minigame: 2x, \d+ frames")
+            self.assertRegex(summary, r"results: .*timeout=1")
+            self.assertRegex(summary, r"frame interval: p50 [\d.]+ ms p95")
+            self.assertRegex(summary, r"\[W1\] image: saved \S+_no_minigame\.png")
 
 
 class DiagLoggerTests(unittest.TestCase):
@@ -422,6 +462,101 @@ class DiagLoggerTests(unittest.TestCase):
             self.assertIn("per-label cap reached for 'same'", open(diag.current_log_path()).read())
             diag.end_session("done", wait=True)
 
+    def _session_files(self):
+        diag.end_session("done", wait=True)
+        with zipfile.ZipFile(diag.last_zip_path()) as zf:
+            return {n.split("/", 1)[1]: zf.read(n).decode("utf-8") for n in zf.namelist()
+                    if not n.endswith(".png")}
+
+    def test_detail_inside_loops_is_written_only_before_a_problem(self):
+        import numpy as np
+        with FrozenExe():
+            diag.configure(True)
+            diag.start_session(reason="ring test")
+            with diag.loop("poll", tag="W1") as lp:
+                for i in range(5):
+                    lp.frame(value=i)
+                    diag.trace("ANALYSIS", f"quiet detail {i}", tag="W1")
+            diag.first("reference", np.zeros((4, 4, 3), np.uint8), tag="W1")   # no dump for a reference
+            log = open(diag.current_log_path(), encoding="utf-8").read()
+            self.assertNotIn("quiet detail", log)
+            self.assertNotIn("▼ recent", log)
+            diag.image("something_wrong", np.zeros((4, 4, 3), np.uint8), tag="W1")
+            log = open(diag.current_log_path(), encoding="utf-8").read()
+            block = log[log.index("▼ recent per-frame detail"):log.index("▲ end of recent detail")]
+            self.assertIn("before: image something_wrong", block)
+            for i in range(5):
+                self.assertIn(f"» quiet detail {i}", block)
+            self.assertRegex(block, r"» poll #\d+ frame 5 \+\d+ms: value=4")
+            self.assertLess(log.index("▲ end of recent detail"), log.index("_something_wrong.png"))
+            # The ring was emptied: a second problem does not repeat it
+            diag.image("again", np.zeros((4, 4, 3), np.uint8), tag="W1")
+            log = open(diag.current_log_path(), encoding="utf-8").read()
+            self.assertEqual(log.count("▼ recent per-frame detail"), 1)
+            # Detail older than RECENT_SECONDS is not written
+            with diag.loop("poll", tag="W1"):
+                diag.trace("ANALYSIS", "old detail", tag="W1")
+            diag._tls.ring[-1] = (time.time() - diag.RECENT_SECONDS - 1,) + diag._tls.ring[-1][1:]
+            try:
+                raise RuntimeError("boom")
+            except RuntimeError:
+                diag.exc("handled", tag="W1")
+            files = self._session_files()
+            self.assertNotIn("old detail", files["session.log"])
+            self.assertRegex(files["summary.txt"], r"\[W1\] exception: handled: RuntimeError")
+
+    def test_quiet_loop_is_one_line_and_a_noisy_one_gets_its_start(self):
+        with FrozenExe():
+            diag.configure(True)
+            diag.start_session(reason="loop lines")
+            with diag.loop("quiet", tag="W1", seconds=0.5) as lp:
+                lp.frame()
+                lp.set("result", "no change")
+            t_before = time.time()
+            with diag.loop("outer", tag="W1") as outer:
+                time.sleep(0.01)
+                with diag.loop("inner", tag="W1") as inner:
+                    inner.note("something happened")
+                outer.set("result", "ok")
+            log = self._session_files()["session.log"]
+            self.assertNotIn("start quiet", log)
+            self.assertRegex(log, r"end quiet #\d+ \(seconds=0\.5\) frames=1 .*result='no change'")
+            lines = log.splitlines()
+            i_outer = next(i for i, ln in enumerate(lines) if "start outer #" in ln)
+            i_inner = next(i for i, ln in enumerate(lines) if "start inner #" in ln)
+            i_note = next(i for i, ln in enumerate(lines) if "something happened" in ln)
+            self.assertLess(i_outer, i_inner)
+            self.assertLess(i_inner, i_note)
+            # the start line carries the time the loop started, not the time of the note
+            stamp = lines[i_outer][:12]
+            self.assertEqual(stamp, time.strftime("%H:%M:%S", time.localtime(t_before)) + stamp[8:])
+            self.assertRegex(log, r"end outer #\d+ frames=0")
+            self.assertNotRegex(log, r"end outer #\d+ \(")
+
+    def test_frame_table_columns_extra_and_quoting(self):
+        with FrozenExe():
+            diag.configure(True)
+            diag.start_session(reason="table")
+            with diag.loop("scan things", tag="W2", columns=("a", "pos")) as lp:
+                lp.frame(a=1.23456, pos=(3, 4))
+                lp.add(surprise="x,y")
+                lp.frame("a note", a=True, pos=None)
+            diag.tally("games", tag="W2")
+            diag.tally("games", tag="W2")
+            for v in range(1, 101):
+                diag.sample("capture_ms", float(v), tag="W2")
+            files = self._session_files()
+            rows = files["frames_scan_things.csv"].splitlines()
+            self.assertEqual(rows[0], "time,t,tag,loop,frame,dt_ms,a,pos,extra,note")
+            self.assertRegex(rows[1], r"^[\d:.]+,[\d.]+,W2,\d+,1,,1\.235,3 4,\"surprise=x,y\",$")
+            self.assertRegex(rows[2], r",W2,\d+,2,[\d.]+,1,,,a note$")
+            summary = files["summary.txt"]
+            self.assertIn("[W2]", summary)
+            self.assertIn("totals: games=2", summary)
+            self.assertRegex(summary, r"capture_ms: p50 5\d\.0 p95 9\d\.0 max 100\.0 \(n=100\)")
+            self.assertRegex(summary, r"scan things: 1x, 2 frames")
+            self.assertRegex(summary, r"2 frame rows")
+
     def test_disabled_logger_is_a_no_op(self):
         calls = []
 
@@ -481,18 +616,18 @@ class DiagGuiTests(unittest.TestCase):
             w = self._window()
             s = w.settings
             self.assertFalse(s.diag_check.isChecked())
-            self.assertFalse(s.diag_verbose_check.isEnabled())
+            self.assertFalse(hasattr(s, "diag_verbose_check"))
             self.assertIn(exe.diag_dir, s.diag_path_label.text())
             self.assertFalse(diag.ENABLED)
 
             s.diag_check.setChecked(True)
-            self.assertTrue(s.diag_verbose_check.isEnabled())
-            s.diag_verbose_check.setChecked(True)
             with open(w.config_path) as f:
                 saved = json.load(f)
             self.assertTrue(saved["diagnostics_enabled"])
-            self.assertTrue(saved["diagnostics_verbose"])
-            self.assertTrue(diag.ENABLED and diag.VERBOSE)
+            self.assertNotIn("diagnostics_verbose", saved)
+            self.assertTrue(diag.ENABLED)
+            human = s.human_check.isChecked()
+            s.human_check.setChecked(not human)          # a settings change while recording
 
             # A run: session opens, a bot stops, its row keeps the reason
             w._begin_diag_session("fishing", [(0, "Metin2")], {}, dict(w.config))
@@ -527,7 +662,7 @@ class DiagGuiTests(unittest.TestCase):
             self.assertIn("config file:", log)
             self.assertIn("screens (as Qt sees them", log)
             self.assertIn("W1: 'Metin2' NOT OPEN", log)
-            self.assertIn("setting diagnostics_verbose: False -> True", log)
+            self.assertIn(f"setting human_like_clicking: {human} -> {not human}", log)
             self.assertIn("W1 stopped: reason=inventory_full", log)
 
             # The next start clears the reason
@@ -547,6 +682,61 @@ class DiagGuiTests(unittest.TestCase):
             self.assertFalse(diag.ENABLED)
             w._begin_diag_session("fishing", [], {}, dict(w.config))
             self.assertFalse(diag.session_active())
+
+    def test_record_game_windows_option(self):
+        """'Record game windows' needs the log, is saved, and puts a video
+        of each game window into the session zip."""
+        import screen_capture
+        from test_screen_recorder import FakeCapture, FakeWM
+
+        class WM(FakeWM):
+            def __init__(self):
+                super().__init__((320, 240))
+                self.selected_window = None
+
+        with FrozenExe() as exe:
+            w = self._window()
+            s = w.settings
+            self.assertIn("know what you are doing", s.diag_warning.text())
+            self.assertFalse(s.diag_record_check.isChecked())
+            self.assertFalse(s.diag_record_check.isEnabled())    # log off: no recording
+            s.diag_check.setChecked(True)
+            self.assertTrue(s.diag_record_check.isEnabled())
+            s.diag_record_check.setChecked(True)
+            with open(w.config_path) as f:
+                self.assertTrue(json.load(f)["diagnostics_record_screens"])
+            s.setConfigEnabled(False)                            # running: settings locked
+            self.assertFalse(s.diag_record_check.isEnabled())
+            s.setConfigEnabled(True)
+
+            orig_capture, orig_wm = screen_capture.WindowCapture, self.qt_gui.WindowManager
+            screen_capture.WindowCapture, self.qt_gui.WindowManager = FakeCapture, WM
+            try:
+                w._begin_diag_session("fishing", [(0, "Metin2 (1)"), (1, "Metin2 (2)")],
+                                      {"Metin2 (1)": object(), "Metin2 (2)": object()}, dict(w.config))
+                time.sleep(0.4)
+                recorders = list(w._screen_recorder.recorders)
+                self.assertEqual([r.tag for r in recorders], ["W1", "W2"])
+                done = threading.Event()
+                w._sig_diag_done.connect(lambda *_a: done.set())
+                w._end_diag_session("stopped by user")
+                self.assertIsNone(w._screen_recorder)
+                diag.wait_for_background()
+                deadline = time.time() + 10
+                while not done.is_set() and time.time() < deadline:
+                    self.app.processEvents()
+                    time.sleep(0.01)
+            finally:
+                screen_capture.WindowCapture, self.qt_gui.WindowManager = orig_capture, orig_wm
+            self.assertTrue(all(not r.is_alive() and r.frames > 0 for r in recorders))
+            zips = [n for n in os.listdir(exe.diag_dir) if n.endswith(".zip")]
+            with zipfile.ZipFile(os.path.join(exe.diag_dir, zips[0])) as zf:
+                names = zf.namelist()
+                log = zf.read(next(n for n in names if n.endswith("session.log"))).decode()
+            for tag in ("W1", "W2"):
+                self.assertTrue(any(n.endswith(f"screen_{tag}_001.mjpg") for n in names), names)
+                self.assertTrue(any(n.endswith(f"screen_{tag}_001.csv") for n in names), names)
+            self.assertIn("recording ended:", log)
 
 
 if __name__ == "__main__":

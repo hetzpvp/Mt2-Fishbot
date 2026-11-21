@@ -5,6 +5,7 @@
     python tools/minigame_sim --mode jigsaw         the jigsaw event window
     python tools/minigame_sim --windows 3           three windows side by side
     python tools/minigame_sim --demo --cycle 2      watch the bot play every skin in turn
+    python tools/minigame_sim --demo --realistic    the bot on the real client's textures and timings
 
 The window is an ordinary 800x600 window titled "Metin2 Sim", so it shows up
 first in the bot's window list. Start the bot, pick it, press Start: the bot
@@ -166,6 +167,9 @@ class Demo:
             else:
                 config = {"timing_recast_wait": 2.0, "timing_minigame_timeout": 6.0,
                           "human_like_clicking": window.args.human}
+                if window.args.realistic:
+                    # set up like the player's bot: quick skip, auto handling
+                    config = self.bench.realistic_config(game, human_like_clicking=window.args.human)
                 bot, _logs = self.bench.make_bot(game, config)
                 bot.bot_id = window.index
                 bot.on_status_update = self._log
@@ -239,11 +243,19 @@ class SimWindow(QWidget):
         else:
             skin = getattr(self, "_skin", a.skin)
             self._skin = skin
-            self.game = FishingGame(
-                skin=skin, size=tuple(a.size), seed=a.seed + self.index, bite_delay=tuple(a.bite_delay),
-                duration=a.duration, miss_penalty=a.miss_penalty, fish_speed=tuple(a.speed),
-                catch_chance=a.catch_chance, dead_fish_chance=a.dead_fish_chance,
-                click_cooldown=a.click_cooldown, require_bait=not a.no_bait, inventory=not a.no_inventory, feedback_text=not a.no_text)
+            if a.realistic:
+                # The client as measured on a real session (bench.REALISTIC)
+                from minigame_sim import bench
+                opts = dict(bench.REALISTIC, skin=skin, size=tuple(a.size), seed=a.seed + self.index,
+                            feedback_text=not a.no_text)
+                self.game = FishingGame(**opts)
+            else:
+                self.game = FishingGame(
+                    skin=skin, size=tuple(a.size), seed=a.seed + self.index, bite_delay=tuple(a.bite_delay),
+                    duration=a.duration, miss_penalty=a.miss_penalty, fish_speed=tuple(a.speed),
+                    catch_chance=a.catch_chance, dead_fish_chance=a.dead_fish_chance,
+                    click_cooldown=a.click_cooldown, require_bait=not a.no_bait, inventory=not a.no_inventory,
+                    feedback_text=not a.no_text)
             self.game.on_event = lambda kind, detail: self._events.append((kind, detail))
         self.setFixedSize(self.game.W, self.game.H)
         self.log("mode", self.mode if self.mode == "jigsaw" else f"fishing skin={self._skin}")
@@ -329,7 +341,8 @@ class SimWindow(QWidget):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mode", choices=("fishing", "jigsaw"), default="fishing")
-    ap.add_argument("--skin", choices=list(SKINS), default="official")
+    ap.add_argument("--skin", choices=list(SKINS), default=None,
+                    help="default: official, or real-mt2 with --realistic")
     ap.add_argument("--title", default="Metin2 Sim")
     ap.add_argument("--windows", type=int, default=1, help="number of simulator windows")
     ap.add_argument("--size", type=int, nargs=2, default=(800, 600), metavar=("W", "H"),
@@ -359,6 +372,9 @@ def main(argv=None):
     f.add_argument("--no-bait", action="store_true", help="space casts without a bait key first")
     f.add_argument("--no-inventory", action="store_true")
     f.add_argument("--no-text", action="store_true", help="no HIT / MISS text in the panel")
+    f.add_argument("--realistic", action="store_true",
+                   help="the client as measured on a real session (timings, diagonal fish, items, mount); "
+                        "with --demo the bot is set up like the player's")
     f.add_argument("--click-cooldown", type=float, default=0.5,
                    help="seconds after a click in which the panel takes no further click")
     j = ap.add_argument_group("jigsaw")
@@ -372,6 +388,8 @@ def main(argv=None):
                    choices=("normal_first", "special_first", "special_when_better"),
                    help="demo: the bot's jigsaw_crate_priority")
     args = ap.parse_args(argv)
+    if args.skin is None:
+        args.skin = "real-mt2" if args.realistic else "official"
 
     app = QApplication(sys.argv[:1])
     windows = [SimWindow(args, i) for i in range(max(1, args.windows))]

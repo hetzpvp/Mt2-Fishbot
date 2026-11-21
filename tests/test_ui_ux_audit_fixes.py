@@ -72,7 +72,9 @@ class FishModalTests(GuiFixture):
         self.assertEqual(actions["Carp_living.jpg"], "keep")
         self.assertEqual(actions["Gold_item.jpg"], "keep")      # items cannot be opened
         self.assertEqual(actions["Zebra_living.jpg"], "keep")
-        self.assertTrue(set(actions.values()) <= {"keep", "drop", "open"})
+        self.assertEqual(actions["Shrimp_living.jpg"], "use")    # bait fish default
+        self.assertTrue(set(v for a, v in actions.items() if a not in ("Shrimp_living.jpg", "Vai_living.jpg"))
+                        <= {"keep", "drop", "open"})
 
     def test_start_repairs_an_empty_saved_action(self):
         w = self._window()
@@ -90,18 +92,25 @@ class FishModalTests(GuiFixture):
             w.bots.clear()
             qt_gui.FishingBot = orig
 
-    def test_items_button_scrolls_to_the_items(self):
+    def test_tabs_bait_fish_first(self):
         modal = qt_gui.FishModal({})
-        modal.resize(720, 660)
-        modal.show()
-        self.app.processEvents()
-        modal.items_btn.click()
-        self.app.processEvents()
-        bar = modal.scroll.verticalScrollBar()
-        self.assertGreater(bar.value(), 0)
-        top = modal.items_anchor.mapTo(modal.scroll.viewport(), modal.items_anchor.rect().topLeft()).y()
-        self.assertGreaterEqual(top, 0)
-        self.assertLess(top, modal.scroll.viewport().height())
+        self.assertEqual(list(modal.tabs._buttons), ["bait", "fish", "items"])
+        self.assertEqual(modal.tabs.active(), "bait")
+        self.assertEqual(modal._actions["Shrimp_living.jpg"], "use")    # bait default
+        self.assertEqual(modal._actions["Carp_living.jpg"], "keep")
+        self.assertEqual(list(modal._tiles["Gold_item.jpg"].seg._buttons), ["keep", "drop"])
+        self.assertNotIn("Vai_living.jpg", modal._tab_assets["fish"])
+        # The bulk buttons act on the tab shown
+        modal.tabs.setActive("items")
+        self.assertTrue(modal.third_all_btn.isHidden())
+        modal.drop_all_btn.click()
+        self.assertEqual(modal._actions["Gold_item.jpg"], "drop")
+        self.assertEqual(modal._actions["Carp_living.jpg"], "keep")
+        self.assertEqual(modal._actions["Shrimp_living.jpg"], "use")
+        modal.tabs.setActive("fish")
+        modal.third_all_btn.click()
+        self.assertEqual(modal._actions["Carp_living.jpg"], "open")
+        self.assertEqual(modal._actions["Shrimp_living.jpg"], "use")
         modal.close()
 
 
@@ -264,11 +273,11 @@ class TextTests(GuiFixture):
         self.assertNotIn("Always needed", steps)
         self.assertIn("always for Jigsaw", steps)
 
-    def test_page_one_is_optional_for_jigsaw(self):
+    def test_page_one_is_required_for_both(self):
         w = self._window()
         w.inventory.setMode(qt_gui.MODE_JIGSAW)
-        self.assertTrue(w.inventory.coord_pills["page1"].isOptional())
-        self.assertNotIn("required", w.inventory.pages_hint.text())
+        self.assertFalse(w.inventory.coord_pills["page1"].isOptional())
+        self.assertIn("Page 1 is required", w.inventory.pages_hint.text())
         w.inventory.setMode(qt_gui.MODE_FISHING)
         self.assertFalse(w.inventory.coord_pills["page1"].isOptional())
         self.assertIn("Page 1 is required", w.inventory.pages_hint.text())
@@ -420,7 +429,7 @@ class SecondPassUiTests(GuiFixture):
         self.assertNotIn("each fish and item", steps)
         self.assertIn("keep or drop for each item", steps)
         from PySide6.QtWidgets import QLabel
-        texts = " ".join(l.text() for l in w.inventory.findChildren(QLabel))
+        texts = " ".join(l.text() for l in w.settings.fishing_page.findChildren(QLabel))
         self.assertIn("keep or drop each item", texts)
         from PySide6.QtWidgets import QPushButton
         tips = " ".join(b.toolTip() for b in w.header.findChildren(QPushButton))
@@ -504,18 +513,6 @@ class SecondPassUiTests(GuiFixture):
             self.assertEqual(w.dashboard.kpi_active._value.text(), "1/1")
         finally:
             w.bots = {}
-
-    def test_forget_learned_colors_asks(self):                  # 5.10
-        w = self._window()
-        w._on_profile_learned_ui({"name": "learned", "window_lower": [50, 100, 100],
-                                  "window_upper": [70, 255, 255], "learned": True})
-        orig = QMessageBox.question
-        QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.No)
-        try:
-            w.settings.forget_profile.emit()
-        finally:
-            QMessageBox.question = orig
-        self.assertEqual(self._saved()["detection_profile"]["name"], "learned")
 
     def test_hint_text_contrast(self):                          # 5.11
         def lum(h):

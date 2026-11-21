@@ -36,6 +36,7 @@ CONFIRM = (400, 380)
 SLOTS = {"special": (414, 218), "normal": (414, 273)}   # the detector's default layout
 PAGES = {1: (640, 180), 2: (680, 180), 3: (720, 180), 4: (760, 180)}
 INV_ORIGIN = (W - 200, 200)                              # the bot's inventory strip
+FREE_SLOT = (INV_ORIGIN[0] + 150, INV_ORIGIN[1] + 230)   # the empty slot of a page that has room
 FIGURE_FILES = ["Jigsaw_piece6.png", "Jigsaw_piece4.png", "Jigsaw_piece1.png",
                 "Jigsaw_piece2.png", "Jigsaw_piece3.png", "Jigsaw_piece5.png"]
 
@@ -62,7 +63,7 @@ class JigsawGame:
     def __init__(self, left=0, seed=1, normal=10 ** 6, special=0, inventory=None,
                  lose_clicks=0.0, dialog_delay=0.0, piece_delay=0.02, pieces=None,
                  gives_pieces=True, top=0, lose_confirms=0.0, lose_slot_clicks=0, shows_result=True,
-                 dialog_shade=190):
+                 dialog_shade=190, full_pages=()):
         self.left, self.top = left, top
         self.rng = random.Random(seed)
         self.board = set()                 # (col, row)
@@ -73,6 +74,8 @@ class JigsawGame:
         self.inventory = {page: (list(items) if isinstance(items, list) else [items])
                           for page, items in (inventory or {}).items()}
         self.page = 1
+        # Pages with no empty slot (the bot checks for room before a board)
+        self.full_pages = set(full_pages)
         self.carrying = None
         self.cursor = (10, 10)
         self.held = None
@@ -116,6 +119,8 @@ class JigsawGame:
         self.grid_img = cv2.resize(_load("jigsaw_empty_grid.png", cv2.IMREAD_COLOR), GRID[2:])
         self.crate_img = {s: _load(f"jigsaw_{s}_crate.png", cv2.IMREAD_COLOR) for s in ("normal", "special")}
         self.piece_img = [_load(f) for f in FIGURE_FILES] + [_load(SPECIAL_FILE)]
+        self.empty_slot_img = cv2.imread(os.path.join(ROOT, "assets", "fishing", "empty_slot.jpg"),
+                                         cv2.IMREAD_COLOR)
 
     # ------------------------------------------------------------------ state
 
@@ -288,6 +293,8 @@ class JigsawGame:
         for page, (px, py) in PAGES.items():
             shade = 120 if page == self.page else 62
             cv2.rectangle(frame, (px - 12, py - 9), (px + 12, py + 9), (shade, shade, shade), -1)
+        if self.page not in self.full_pages and self.empty_slot_img is not None:
+            self._paste(frame, self.empty_slot_img, FREE_SLOT)
         for section, (ix, iy), _ in self.inventory.get(self.page, []):
             self._paste(frame, self.crate_img[section], (INV_ORIGIN[0] + ix, INV_ORIGIN[1] + iy))
         if self.carrying is not None:

@@ -1,0 +1,21 @@
+[CENTER][SIZE="5"][B]Fishing Bot v{{version}} — new release[/B][/SIZE]
+
+Free fishing-minigame and jigsaw bot for Metin2. No subscriptions, no licenses.[/CENTER]
+
+[B]What's new in v{{version}}[/B]
+{{highlights}}
+
+[B]Download[/B]
+{{downloads}}
+
+[B]Virus scan[/B]
+{{virustotal}}
+
+[B]Release information[/B]
+Version: {{version}}
+Release date: {{date}}
+Release page and checksums: [URL="{{release_url}}"]{{release_url}}[/URL]
+Source code: [URL="https://github.com/hetzpvp/Mt2-Fishbot"]GitHub[/URL]
+Linux setup: [URL="https://github.com/hetzpvp/Mt2-Fishbot/blob/main/docs/LINUX.md"]docs/LINUX.md[/URL]
+
+Bugs and questions: [URL="https://discord.gg/vZaHCRFqW7"]Discord server[/URL]

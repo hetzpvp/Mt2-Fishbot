@@ -101,6 +101,11 @@ class PriorityInputLock:
         """True when at least one other thread is waiting for the lock."""
         return bool(self._waiters)
 
+    def urgent_waiting(self) -> bool:
+        """True when a time-critical (urgent) request is waiting."""
+        with self._cond:
+            return bool(self._waiters) and self._waiters[0][0] == self.URGENT
+
     def __enter__(self):
         self.acquire(self.NORMAL)
         return self
@@ -121,6 +126,66 @@ class PriorityInputLock:
 # Thread synchronization for mouse/keyboard - prevents race conditions
 input_lock = PriorityInputLock()
 
+
+# ---------------- Keyboard vs. focus switches ----------------
+# Keys go to whichever window has the keyboard focus when the desktop
+# delivers them, not when they were sent. With several clients that is a
+# race (seen on KDE Wayland + XWayland + Wine, 2026-11-19): a Ctrl+G whose
+# release went out 0-1 ms before another bot switched the focus, and a bait
+# key sent 56 ms after the switch back, never reached their window. The
+# cast was lost and the bot waited out the bite timeout. So:
+#   - no focus switch until the last key event has had KEY_FLUSH to arrive;
+#   - no key until the last switch has had KEY_AFTER_SWITCH to settle (the
+#     game handles its activation on its own frame, which is slow for a
+#     client that was in the background).
+# Mouse clicks go to the window under the cursor, but the game still loses
+# one when it loses the focus right after it: in diagnostics 20261120_195925
+# (two clients, Wine) 37 of 63 minigame clicks were not counted when the
+# other bot switched the focus 20-30 ms after the click, and none of 16 when
+# the switch came 30 ms or later. So a focus switch also waits until the
+# last click is CLICK_FLUSH old.
+KEY_FLUSH = 0.06
+KEY_AFTER_SWITCH = 0.15
+CLICK_FLUSH = 0.05
+
+_key_focus = {"key": 0.0, "switch": 0.0, "click": 0.0}
+
+
+def note_key_event() -> None:
+    """A key event was just sent (call after each press / release)."""
+    _key_focus["key"] = time.perf_counter()
+
+
+def note_click_event() -> None:
+    """A mouse button event was just sent (call after each button release)."""
+    _key_focus["click"] = time.perf_counter()
+
+
+def note_focus_switch() -> None:
+    """The foreground window just changed."""
+    _key_focus["switch"] = time.perf_counter()
+
+
+def _wait_since(stamp: str, gap: float) -> float:
+    left = _key_focus[stamp] + gap - time.perf_counter()
+    if left > 0:
+        time.sleep(left)
+        return left
+    return 0.0
+
+
+def wait_keys_delivered() -> float:
+    """Before a focus switch: waits until the last key event is KEY_FLUSH old
+    and the last click CLICK_FLUSH old. Returns the seconds waited."""
+    waited = _wait_since("key", KEY_FLUSH)
+    return waited + _wait_since("click", CLICK_FLUSH)
+
+
+def wait_focus_settled_for_keys() -> float:
+    """Before a key: waits until the last focus switch is KEY_AFTER_SWITCH
+    old. Returns the seconds waited."""
+    return _wait_since("switch", KEY_AFTER_SWITCH)
+
 # Max simultaneous game windows
 MAX_WINDOWS = 8
 
@@ -136,11 +201,62 @@ DEBUG_PRINTS = False
 FISH_ACTIONS = ("keep", "drop", "open")
 
 
-def normalize_fish_action(action) -> str:
-    """A configured fish / item action as the bot acts on it. Only "drop" and
-    "open" do anything; every other value (missing, empty, a typo in a
-    hand-edited config) keeps the item, so a broken entry never drops one."""
+# Fish the game takes as bait: a right-click puts one on the rod (it does not
+# open). Their "use" action fishes with them instead of the bait key.
+BAIT_FISH = ("Shrimp_living.jpg", "Vai_living.jpg")
+
+
+def is_bait_fish(filename) -> bool:
+    return filename in BAIT_FISH
+
+
+def normalize_fish_action(action, filename=None) -> str:
+    """A configured fish / item action as the bot acts on it. Only "drop",
+    "open" and, for a bait fish, "use" do anything; every other value
+    (missing, empty, a typo in a hand-edited config) keeps the item, so a
+    broken entry never drops one. With ``filename`` given, a bait fish set
+    to "open" (a right-click, which puts it on the rod) means "use", and
+    any other item set to "use" is kept."""
+    if action == "use" or (action == "open" and is_bait_fish(filename)):
+        if filename is None or is_bait_fish(filename):
+            return "use"
+        return "keep"
     return action if action in ("drop", "open") else "keep"
+
+
+def dead_fish_action(living_action) -> str:
+    """What the dead kind of a fish does, given its living fish's action. A
+    dead fish cannot be opened or used as bait, so it follows its living
+    fish only for drop; every other choice keeps it."""
+    return "drop" if living_action == "drop" else "keep"
+
+
+def with_dead_fish_actions(actions) -> dict:
+    """``actions`` with every ``<Fish>_dead.png`` set from its
+    ``<Fish>_living.jpg`` (see dead_fish_action). The dead kinds have no
+    choice of their own: whoever keeps a fish keeps it dead too. Dead
+    entries without a living one stay as they are."""
+    out = dict(actions or {})
+    for name, action in list(out.items()):
+        if isinstance(name, str) and name.endswith("_living.jpg"):
+            out[name[:-len("_living.jpg")] + "_dead.png"] = dead_fish_action(
+                normalize_fish_action(action, name))
+    return out
+
+
+# What a fish / item template's name ends with, and how it is shown.
+# A fish comes in three states, each its own item with its own icon.
+_ITEM_SUFFIXES = (("_living", ""), ("_item", ""), ("_dead", " (dead)"),
+                  ("_grilled", " (grilled)"), ("_unsure", " (dead or alive?)"))
+
+
+def item_display_name(filename: str) -> str:
+    """'Zander_dead.png' -> 'Zander (dead)', 'Carp_living.jpg' -> 'Carp'."""
+    stem = os.path.splitext(filename)[0]
+    for suffix, label in _ITEM_SUFFIXES:
+        if stem.endswith(suffix):
+            return stem[:-len(suffix)] + label
+    return stem
 
 
 def get_project_root() -> str:

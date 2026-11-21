@@ -53,6 +53,72 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "windows: runs only on Windows")
     config.addinivalue_line("markers", "linux: runs only on Linux")
     config.addinivalue_line("markers", "live: drives the real desktop; needs --live or FISHBOT_LIVE=1")
+    config.pluginmanager.register(SlowestFirst(config), "fishbot-slowest-first")
+
+
+class SlowestFirst:
+    """Parallel runs start the slowest tests first, spread over the workers.
+
+    A few simulations take 30-80 s of real time each (whole fishing sessions
+    against the simulator); most tests take milliseconds. pytest-xdist's
+    worksteal splits the test list into equal contiguous chunks, one per
+    worker, and then balances by queue length, not by time: if several slow
+    simulations land on one worker, or one starts near the end, the run
+    waits for them while the other workers sit idle.
+
+    So each run records how long every test took (in pytest's cache,
+    .pytest_cache/) and the next parallel run sorts the tests slowest first
+    and deals them round-robin into the chunks xdist will hand out: every
+    worker starts on its share of the slow tests and fills in with fast ones.
+    Tests without a recorded time count as 1 s. Serial runs keep the file
+    order. ``--ff`` / ``--nf`` (their own order) turn it off."""
+
+    KEY = "fishbot/durations"
+
+    def __init__(self, config):
+        self.config = config
+        self.cache = getattr(config, "cache", None)       # None with -p no:cacheprovider
+        self.seen = {}
+
+    @pytest.hookimpl(trylast=True)        # after -k/-m deselection: the list xdist will split
+    def pytest_collection_modifyitems(self, config, items):
+        workers = int(os.environ.get("PYTEST_XDIST_WORKER_COUNT", "0") or 0)
+        if self.cache is None or workers < 2 or len(items) < 2:
+            return
+        if config.getoption("failedfirst", False) or config.getoption("newfirst", False):
+            return
+        known = self.cache.get(self.KEY, {})
+        if not known:
+            return
+        ranked = sorted(items, key=lambda it: -known.get(it.nodeid, 1.0))   # stable: ties keep file order
+        # The chunk sizes WorkStealingScheduling.schedule() sends: len // nodes_remaining each
+        sizes, left = [], len(ranked)
+        for k in range(workers):
+            sizes.append(left // (workers - k))
+            left -= sizes[-1]
+        chunks = [[] for _ in sizes]
+        k = 0
+        for item in ranked:
+            while len(chunks[k]) >= sizes[k]:
+                k = (k + 1) % workers
+            chunks[k].append(item)
+            k = (k + 1) % workers
+        items[:] = [it for chunk in chunks for it in chunk]
+
+    def pytest_runtest_logreport(self, report):
+        # On the controller this sees every worker's reports too
+        if self.cache is None or hasattr(self.config, "workerinput") or report.skipped:
+            return
+        phases = self.seen.setdefault(report.nodeid, {})
+        # Subtest reports are part of their test's "call": keep the longest per phase
+        phases[report.when] = max(phases.get(report.when, 0.0), report.duration)
+
+    def pytest_sessionfinish(self, session):
+        if self.cache is None or hasattr(self.config, "workerinput") or not self.seen:
+            return
+        known = self.cache.get(self.KEY, {})
+        known.update({nodeid: round(sum(p.values()), 3) for nodeid, p in self.seen.items()})
+        self.cache.set(self.KEY, known)
 
 
 def pytest_collection_modifyitems(config, items):

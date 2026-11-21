@@ -86,7 +86,7 @@ class StatusLogWindow(DebugWindow):
         self.window.configure(bg="#1a1a1a")
         self.window.resizable(True, True)
         self._apply_icon()
-        self._create_header("📋 Status Log")
+        self._create_header("Status Log")
 
         content_frame = tk.Frame(self.window, bg="#1a1a1a")
         content_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -105,7 +105,7 @@ class StatusLogWindow(DebugWindow):
         button_frame = tk.Frame(self.window, bg="#1a1a1a")
         button_frame.pack(fill=tk.X, padx=5, pady=5)
 
-        tk.Button(button_frame, text="🗑️ Clear Log",
+        tk.Button(button_frame, text="Clear Log",
                   command=self.clear_log,
                   bg="#e74c3c", fg="white",
                   font=("Courier New", 9, "bold"),
@@ -157,7 +157,7 @@ class IgnoredPositionsWindow(DebugWindow):
         self.window.configure(bg="#1a1a1a")
         self.window.resizable(False, False)
         self._apply_icon()
-        self._create_header("🎯 Inventory State")
+        self._create_header("Inventory State")
 
         self.counter_label = tk.Label(self.window, text="Ignored: 0 | Empty: 0",
                                       font=("Courier New", 10),
@@ -357,7 +357,7 @@ class FishDetectorDebugWindow(DebugWindow):
         self.window.configure(bg="#1a1a1a")
         self.window.resizable(False, False)
         self._apply_icon()
-        self._create_header("🎣 Fish Detector Debug")
+        self._create_header("Fish Detector Debug")
 
         info_frame = tk.Frame(self.window, bg="#2a2a2a")
         info_frame.pack(fill=tk.X, padx=5, pady=3)
@@ -887,7 +887,7 @@ class JigsawSolverDebugWindow(DebugWindow):
         ctrl.pack(fill=tk.X, padx=8, pady=(0, 2))
 
         self._step_btn = tk.Button(
-            ctrl, text="▶ Step", width=10,
+            ctrl, text="Step", width=10,
             command=self._on_step,
             bg="#2a2a2a", fg="#FFD700", activebackground="#444444",
             font=("Courier New", 9, "bold"), relief=tk.FLAT,
@@ -895,7 +895,7 @@ class JigsawSolverDebugWindow(DebugWindow):
         self._step_btn.pack(side=tk.LEFT, padx=(0, 6))
 
         self._run_pause_btn = tk.Button(
-            ctrl, text="⏸ Pause", width=10,
+            ctrl, text="Pause", width=10,
             command=self._on_toggle_step_mode,
             bg="#2a2a2a", fg="#00ff88", activebackground="#444444",
             font=("Courier New", 9, "bold"), relief=tk.FLAT,
@@ -957,10 +957,10 @@ class JigsawSolverDebugWindow(DebugWindow):
         self._step_mode = not self._step_mode
         getattr(self.bot, "set_step_mode", lambda _: None)(self._step_mode)
         if self._step_mode:
-            self._run_pause_btn.config(text="▶ Run", fg="#FFD700")
+            self._run_pause_btn.config(text="Run", fg="#FFD700")
             self._step_label.config(text="Step mode — click Step to advance")
         else:
-            self._run_pause_btn.config(text="⏸ Pause", fg="#00ff88")
+            self._run_pause_btn.config(text="Pause", fg="#00ff88")
             self._step_label.config(text="Running")
 
     def _schedule_update(self):

@@ -64,7 +64,6 @@ class StartRobustnessTests(GuiFixture):
         self.assertTrue(w.settings.human_check.isEnabled())          # settings not locked
         self.assertFalse(w.inventory.coord_pills["page1"].isLocked())
         self.assertTrue(w.mode_bar._buttons[qt_gui.MODE_JIGSAW].isEnabled())
-        self.assertIn("IDLE", w.header.statusText())
         self.assertIn("NOT OPEN", w.dashboard.window_rows[0].pill.text())
         self.assertIn("START FISHING", w.dashboard.start_btn.text())
 

@@ -150,6 +150,163 @@ class ClassicMountToggleTests(unittest.TestCase):
         self.assertFalse(bot._mount_toggled)
 
 
+def _minigame_bot(quick_skip=True, mode="horse"):
+    _, bot, _ = quiet_bot({"classic_fishing": False, "quick_skip": quick_skip,
+                           "quick_skip_mode": mode})
+    bot.running = False
+    bot._startup_scan_and_process_all_pages = lambda: None
+    bot._verify_capture = lambda: None
+    bot._refuse_overlapping_windows = lambda: True
+    bot._game_screen_still_there = lambda: True
+    bot._handle_quest_dialog = lambda *a, **k: False
+    bot._bite_ever_seen = True
+    bot._MOUNT_SETTLE = 0.0
+    bot.bait_and_cast = lambda: True
+    return bot
+
+
+class MinigameMountRecoveryTests(unittest.TestCase):
+    """2026-11-20 session: the quick skip's second CTRL+G was lost (the game
+    mounted late), the character stayed on the horse, and five casts without
+    a minigame wrote off the bait key with 88 bait left. A miss with the
+    horse quick skip on now toggles the mount, as classic mode does."""
+
+    def _run(self, bot, results):
+        casts, ctrl, drops = [], [], []
+        results = iter(results)
+
+        def wait(timeout=None):
+            casts.append(1)
+            r = next(results, None)
+            if r is None:
+                bot.running = False
+                return False
+            return r
+        bot.wait_for_minigame_window = wait
+        bot.press_ctrl_key = lambda key: ctrl.append(key) or True
+
+        def drop():
+            drops.append(len(casts))
+            bot.running = False
+        bot.adjust_bait_tier = drop
+        bot._play_minigame = lambda: (bot.stop() or (False, 0))
+        bot.running = True
+        thread = threading.Thread(target=bot.play_game, daemon=True)
+        thread.start()
+        thread.join(timeout=20)
+        self.assertFalse(thread.is_alive())
+        return casts, ctrl, drops
+
+    def test_miss_presses_ctrl_g_and_the_next_cast_works(self):
+        bot = _minigame_bot()
+        bot._quickskip_unchecked = True   # a quick skip came before the cast
+        casts, ctrl, drops = self._run(bot, [False, True])
+        self.assertEqual(len(casts), 2)
+        self.assertEqual(ctrl, ["g"])
+        self.assertEqual(drops, [])
+        self.assertFalse(bot._mount_toggled)
+        self.assertFalse(bot._quickskip_unchecked)
+        self.assertEqual(bot.consecutive_failures, 0)
+
+    def test_miss_after_own_ctrl_g_is_not_counted(self):
+        bot = _minigame_bot()
+        bot._quickskip_unchecked = True
+        casts, ctrl, drops = self._run(bot, [False] * 20)
+        # counted + toggle / not counted, toggled back / then no more
+        # toggles (no quick skip since): 4 more counted misses
+        self.assertEqual(drops, [6])
+        self.assertEqual(len(ctrl), 2)
+
+    def test_no_ctrl_g_without_a_quick_skip_before_the_miss(self):
+        """Diag 20261121_122030: the first cast of a session missed (a game
+        left open from before the start ran out) and the recovery CTRL+G
+        mounted a character the bot had never put on the horse."""
+        bot = _minigame_bot()
+        casts, ctrl, drops = self._run(bot, [False] * 20)
+        self.assertEqual(ctrl, [])
+        self.assertEqual(drops, [5])
+
+    def test_no_ctrl_g_without_the_horse_quick_skip(self):
+        for qs, mode in ((False, "horse"), (True, "armor")):
+            bot = _minigame_bot(quick_skip=qs, mode=mode)
+            casts, ctrl, drops = self._run(bot, [False] * 20)
+            self.assertEqual(ctrl, [], (qs, mode))
+            self.assertEqual(drops, [5], (qs, mode))
+
+
+class OpenMinigameAtStartTests(unittest.TestCase):
+    """Diag 20261121_122030: started with a minigame running. The startup
+    scan let its timer run out and the bot cast over it."""
+
+    def test_open_game_is_played_before_the_startup_scan(self):
+        bot = _minigame_bot()
+        order = []
+        bot._game_running_at_start = lambda: (277, 213, 247, 195)
+        bot._known_panel_in = lambda frame: (277, 213, 247, 195)
+        bot.capture_full_window = lambda *a, **k: None
+        bot._startup_scan_and_process_all_pages = lambda: order.append("scan")
+        bot.bait_and_cast = lambda: order.append("cast") or True
+        bot.press_ctrl_key = lambda key: order.append("ctrl") or True
+
+        def wait(timeout=None):
+            order.append("wait")
+            return True
+        bot.wait_for_minigame_window = wait
+
+        def play():
+            order.append("play")
+            if order.count("play") >= 2:
+                bot.stop()
+            return False, 1
+        bot._play_minigame = play
+        bot.quickskip = lambda: order.append("skip")
+        bot._note_fishless_game = lambda: True
+        bot.running = True
+        thread = threading.Thread(target=bot.play_game, daemon=True)
+        thread.start()
+        thread.join(timeout=20)
+        self.assertFalse(thread.is_alive())
+        # no cast before the open game, the scan right after it
+        self.assertEqual(order[:4], ["wait", "play", "skip", "scan"])
+        self.assertIn("cast", order[4:])
+        self.assertNotIn("ctrl", order)
+        self.assertFalse(bot._startup_scan_after_game)
+
+    def test_no_open_game_scans_at_once(self):
+        bot = _minigame_bot()
+        bot._game_running_at_start = lambda: None
+        scans = []
+        bot._startup_scan_and_process_all_pages = lambda: scans.append(1) or bot.stop()
+        bot.running = True
+        bot.play_game()
+        self.assertEqual(scans, [1])
+        self.assertFalse(bot._line_out)
+
+
+class GameRunningAtStartTests(unittest.TestCase):
+    """A panel-colored thing at the start counts as a running game only
+    when it changes between two looks."""
+
+    def _bot(self, frames):
+        bot = _minigame_bot()
+        frames = iter(frames)
+        bot.capture_full_window = lambda *a, **k: next(frames)
+        bot._known_panel_in = lambda frame: (10, 10, 50, 40)
+        bot._OPEN_GAME_LOOK_GAP = 0.0
+        bot.running = True
+        return bot
+
+    def test_still_block_is_scenery(self):
+        frame = np.full((100, 100, 3), 120, np.uint8)
+        self.assertIsNone(self._bot([frame, frame.copy()])._game_running_at_start())
+
+    def test_moving_fish_is_a_running_game(self):
+        a = np.full((100, 100, 3), 120, np.uint8)
+        b = a.copy()
+        b[20:30, 20:30] = 30   # the fish moved
+        self.assertEqual(self._bot([a, b])._game_running_at_start(), (10, 10, 50, 40))
+
+
 class ClassicTemplateMissingTests(unittest.TestCase):
     """F3: without the bite picture the bot stops instead of reeling in after
     every cast and counting each as a catch."""

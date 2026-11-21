@@ -27,6 +27,8 @@ env/
 
 # Config files with user data
 bot_config.json
+# Diagnostic logs and screen recordings (GBs, may show character names)
+diagnostics/
 
 # OS files
 Thumbs.db

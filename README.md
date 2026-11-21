@@ -1,11 +1,11 @@
-# MT2 Fishing Bot — v2.0.2
+# MT2 Fishing Bot — v2.0.3
 
 Free fishing-minigame bot for Metin2. No subscriptions, no licenses.
 **Built for educational and learning purposes only.**
 
-[Video tutorial](https://youtu.be/M0THxnio894) · [Download v2.0.1](https://www.mediafire.com/file/krsxje62vlvt2e0/Fishing_Puzzle_Player_v2.0.1.exe/file) · [Discord server support](https://discord.gg/vZaHCRFqW7)
+[Video tutorial](https://youtu.be/M0THxnio894) · [Download v2.0.3](https://github.com/hetzpvp/Mt2-Fishbot/releases/latest) · [Discord server support](https://discord.gg/vZaHCRFqW7)
 
-**Download v2.0.1 (Windows .exe):** [MediaFire](https://www.mediafire.com/file/krsxje62vlvt2e0/Fishing_Puzzle_Player_v2.0.1.exe/file) · [VirusTotal scan](https://www.virustotal.com/gui/url/83eec99981cce231faf64ecd89b88359f5d598da6bb95e0ff1e9b1f6a60e3c58?nocache=1)
+**Download v2.0.3:** [Windows .exe](https://github.com/hetzpvp/Mt2-Fishbot/releases/download/Mt2-Fishbot-v2.0.3/Fishing-Puzzle-Player-v2.0.3-windows.exe) · [Linux binary](https://github.com/hetzpvp/Mt2-Fishbot/releases/download/Mt2-Fishbot-v2.0.3/Fishing-Puzzle-Player-v2.0.3-linux.tar.gz) · [All releases](https://github.com/hetzpvp/Mt2-Fishbot/releases)
 
 ![GUI](docs/gui_demo.png)
 
@@ -21,12 +21,14 @@ Free fishing-minigame bot for Metin2. No subscriptions, no licenses.
 
 - Up to 8 Metin2 clients at once, new minigame and classic fishing
 - Reads the screen only; it never touches game memory
-- Auto fish handling per fish type (keep / open / drop), across up to 8 inventory pages
+- Auto fish handling per fish type (keep / open / drop, or use bait fish like Vai and Shrimp as bait), dead fish included, across up to 8 inventory pages
+- Handles the Golden Tuna dialog with the choice you set
 - Built-in jigsaw solver for the fishing puzzle
 - Up to 8 bait hotkeys (1–4, F1–F4), quick skip (horse or armor), adjustable timings, human-like clicking
 - Adapts to re-skinned minigames, saves and loads profiles
 - **F5** pauses and resumes every bot, with a short chime you hear while the game is in front
 - Runs on Windows, and on Linux with the game under Wine ([docs/LINUX.md](docs/LINUX.md))
+- Optional **Disguise in Task Manager** (Settings → Detection bypass): a new random, ordinary name at every start (see below)
 
 ## Quick start
 
@@ -50,19 +52,30 @@ Quick skip needs a horse (Horse mode), or a spare armor in the inventory with it
 
 The game window can sit in the background but must not be minimized.
 
+### Disguise in Task Manager
+
+**Settings → Detection bypass → Disguise in Task Manager** gives the bot a new random name at every start, for example "Pixel Studio" or "Cedar Journal". Task Manager, System Monitor, `ps` and htop show that name, and so does the window title. Restart the bot after turning it on (the **Restart now** button next to the option does that).
+
+At every start the bot copies its own file to your temp folder (`~/.cache` on Linux) under the new name, starts the copy and closes itself. The next start deletes the copies that are no longer running. Settings and diagnostic logs stay next to the original .exe. Starting takes a little longer, and the copy needs as much free disk space as the bot's file. It only works in the downloaded program, not when run from source.
+
+This is one extra layer of privacy, not a way to become invisible. It only changes the name. The monkey icon in Task Manager, the file size, the memory use, the libraries it loads (Qt, Python) and the bot's window look the same as always to anyone who looks closely, for example with Process Explorer. It doesn't hide anything from the game either.
+
 ### Sending a diagnostic log
 
 If something goes wrong and the table above does not help, send a diagnostic log:
 
-1. **Settings** tab → tick **Diagnostic log** (leave **Verbose** off unless asked for it).
-2. Press **START FISHING** (or **START JIGSAW**) and do what triggers the problem, then stop the bot (or let it stop by itself).
+1. **Settings** tab → tick **Diagnostic log**.
+2. Press **START FISHING** (or **START JIGSAW**) and do what triggers the problem, then stop the bot (or let it stop by itself). A short run is best. Note roughly what time it went wrong and what you saw.
 3. A file like `diagnostics/20261115_143022.zip` is written **next to the bot's .exe**. The Settings tab shows its path and **Open log folder** opens the folder with it selected.
 4. Send that one `.zip` (the newest one) in the [Discord support server](https://discord.gg/vZaHCRFqW7).
 
 It contains what the bot did, what it saw (screenshots of the game window only, never of the rest of the desktop) and the settings it used. If the bot's folder cannot be written to (for example under Program Files), the log goes to a per-user folder instead and the Settings tab shows where. Turn **Diagnostic log** off again afterwards; when it is off, nothing is recorded. Only the last 10 logs are kept.
 
+**Record game windows** (below the Diagnostic log box) also puts a video of each game window into the same `.zip`. Turn it on only when support asks for it. The files are large: about 60 MB per minute per 800x600 window, at most 2 GB per run. The video shows everything in the game windows, including chat and character names, but never the rest of the desktop.
+
 ## Version history
 
+- **2.0.3** — Golden Tuna dialog, dead and bait fish handling, fish selection tabs, Task Manager disguise, faster catches, drop fixes, smaller Windows exe
 - **2.0.2** — Lighter and faster with several clients, fishing and jigsaw loop fixes, diagnostic log, setup wizards and help pages
 - **2.0.1** — Clickable Discord server support button
 - **2.0.0** — Linux port (X11/Wine), OS abstraction layer, adaptive detection, profiles

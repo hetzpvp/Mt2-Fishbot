@@ -21,6 +21,7 @@ from typing import Optional
 
 import diag
 from input_backend import PyAutoGuiMouseBackend
+from utils import note_click_event, note_key_event, wait_focus_settled_for_keys
 
 
 def _key_label(key) -> str:
@@ -88,7 +89,10 @@ class Humanizer:
             self._act(f"click {button} hold={'instant' if hold is None and not self.enabled else hold} "
                       f"humanized={self.enabled} last_move {at}")
         if not self.enabled and hold is None:
-            self.mouse.click(button=button)
+            try:
+                self.mouse.click(button=button)
+            finally:
+                note_click_event()
             return
 
         if not self.enabled:
@@ -99,9 +103,14 @@ class Humanizer:
             duration = hold * random.uniform(0.6, 1.4)
 
         self.mouse.mouse_down(button=button)
-        if duration and duration > 0:
-            time.sleep(duration)
-        self.mouse.mouse_up(button=button)
+        try:
+            if duration and duration > 0:
+                time.sleep(duration)
+        finally:
+            try:
+                self.mouse.mouse_up(button=button)
+            finally:
+                note_click_event()
 
     def mouse_down(self, button: str = "left") -> None:
         if diag.ENABLED:
@@ -111,7 +120,10 @@ class Humanizer:
     def mouse_up(self, button: str = "left") -> None:
         if diag.ENABLED:
             self._act(f"mouse_up {button}")
-        self.mouse.mouse_up(button=button)
+        try:
+            self.mouse.mouse_up(button=button)
+        finally:
+            note_click_event()
 
     # ---------------- Sleeps ----------------
 
@@ -136,16 +148,31 @@ class Humanizer:
         if self.keyboard_controller is None:
             diag.log("ACTION", f"key_press {_key_label(key)} NOT SENT: no keyboard", tag=self.diag_tag, depth=1)
             return
+        self._settle_for_keys()
         if diag.ENABLED:
             diag.log("ACTION", f"key_press {_key_label(key)}", tag=self.diag_tag, depth=1)
-        self.keyboard_controller.press(key)
+        try:
+            self.keyboard_controller.press(key)
+        finally:
+            note_key_event()
 
     def key_release(self, key) -> None:
         if self.keyboard_controller is None:
             return
         if diag.ENABLED:
             diag.log("ACTION", f"key_release {_key_label(key)}", tag=self.diag_tag, depth=1)
-        self.keyboard_controller.release(key)
+        try:
+            self.keyboard_controller.release(key)
+        finally:
+            note_key_event()
+
+    def _settle_for_keys(self) -> None:
+        """A key sent right after a focus switch can reach the window that
+        had the focus before (see utils.KEY_AFTER_SWITCH)."""
+        waited = wait_focus_settled_for_keys()
+        if waited and diag.ENABLED:
+            diag.log("ACTION", f"waited {waited * 1000:.0f} ms after the focus switch before the key",
+                     tag=self.diag_tag, depth=2)
 
     def tap_key(self, key, hold: float = 0.025) -> None:
         """Press + release a key with a humanized hold duration when enabled."""
@@ -153,13 +180,17 @@ class Humanizer:
             diag.log("ACTION", f"tap_key {_key_label(key)} NOT SENT: no keyboard", tag=self.diag_tag, depth=1)
             return
         held = random.uniform(hold * 0.7, hold * 1.6) if self.enabled else hold
-        self.keyboard_controller.press(key)
+        self._settle_for_keys()
         try:
+            self.keyboard_controller.press(key)
             time.sleep(held)
         finally:
             # Released whatever happened in between: a key left down keeps
             # repeating into the game.
-            self.keyboard_controller.release(key)
+            try:
+                self.keyboard_controller.release(key)
+            finally:
+                note_key_event()
         if diag.ENABLED:
             diag.log("ACTION", f"tap_key {_key_label(key)} held {held * 1000:.0f} ms via "
                                f"{type(self.keyboard_controller).__name__}", tag=self.diag_tag, depth=1)

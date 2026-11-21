@@ -300,7 +300,8 @@ def render_window(hwnd, width: int, height: int) -> Optional[np.ndarray]:
         _user32.ReleaseDC(None, hdc_screen)
 
 
-# Diagnostic log: the requests that change the desktop are traced.
+# Diagnostic log: the requests that change the desktop are traced
+# (set_foreground: the FOCUS lines of window_manager say what it did).
 import diag  # noqa: E402
 
-diag.trace_module(sys.modules[__name__], ("list_windows", "set_foreground", "force_foreground", "restore"))
+diag.trace_module(sys.modules[__name__], ("list_windows", "force_foreground", "restore"))

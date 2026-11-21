@@ -341,8 +341,8 @@ def evdev_code_for_char(ch: str) -> Optional[int]:
     return keycode - 8 if keycode and keycode > 8 else None
 
 
-# Diagnostic log: the requests that change the desktop are traced.
+# Diagnostic log: the requests that change the desktop are traced
+# (set_foreground: the FOCUS lines of window_manager say what it did).
 import diag  # noqa: E402
 
-diag.trace_module(sys.modules[__name__], ("list_windows", "set_foreground", "force_foreground", "restore",
-                                          "screen_capture_reliable", "desktop_size"))
+diag.trace_module(sys.modules[__name__], ("list_windows", "force_foreground", "restore", "desktop_size"))

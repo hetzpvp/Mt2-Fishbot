@@ -6,6 +6,23 @@ Author: boristei
 Main entry point - imports all modules and starts the GUI
 """
 
+import sys
+
+if getattr(sys, "frozen", False):
+    # Must run before any heavy import. multiprocessing starts its helpers
+    # (resource tracker, forkserver) by re-running this executable with
+    # "-c from multiprocessing... import main". Numba creates a multiprocessing
+    # RLock under Python 3.14's default "forkserver" start method, which starts
+    # the resource tracker. Without freeze_support() the frozen binary ignores
+    # those arguments and starts a second, orphaned copy of the whole GUI.
+    import multiprocessing
+    multiprocessing.freeze_support()
+    if __name__ == "__main__":
+        # "Disguise in Task Manager": start a renamed copy and quit, before
+        # the heavy imports make this start slow (see disguise.py).
+        import disguise
+        disguise.maybe_relaunch()
+
 import ctypes
 
 import diag
@@ -21,7 +38,8 @@ import sys
 import threading
 import time
 from collections import deque
-from typing import Optional, Tuple, Dict
+from contextlib import contextmanager
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -48,7 +66,8 @@ except ImportError:
     # Key names as strings: the Linux uinput keyboard accepts them directly.
     Key = SimpleNamespace(ctrl="ctrl", space="space", f1="f1", f2="f2", f3="f3", f4="f4", f5="f5")
 
-from utils import get_resource_path, input_lock, normalize_fish_action, DEBUG_PRINTS
+from utils import (get_resource_path, input_lock, is_bait_fish, item_display_name, normalize_fish_action,
+                   with_dead_fish_actions, DEBUG_PRINTS)
 
 
 def game_key(name: str):
@@ -67,12 +86,14 @@ def game_key(name: str):
     return name
 from window_manager import WindowManager, GameRegion
 from fish_detector import FishDetector, DetectionProfile, WindowLearner, abs_diff_max
+from fish_detector import RING_RED, RING_WHITE, ring_color
 from humanize import Humanizer
 from input_backend import create_keyboard_controller, create_mouse_backend
 import screen_capture
 from screen_capture import WindowCapture, frame_usable
 import inventory_layout
 import dialog_watch
+import quest_dialog
 
 
 class RecastWaitTuner:
@@ -151,8 +172,9 @@ def _diag_callback(attr: str, kind: str):
                 if kind == "status":
                     diag.log("STAT", str(args[0]) if args else "", tag=self.diag_tag, depth=1)
                 elif kind == "stats":
-                    diag.log("STAT", f"stats hits={args[1]} games={args[2]} bait={args[3]}",
-                             tag=self.diag_tag, depth=1)
+                    # Every hit: detail (inside the minigame only in the recent-detail ring)
+                    diag.trace("STAT", f"stats hits={args[1]} games={args[2]} bait={args[3]}",
+                               tag=self.diag_tag, depth=1)
                 elif kind == "bait":
                     diag.log("STAT", f"bait counter -> {args[1]}", tag=self.diag_tag, depth=1)
                 else:
@@ -186,6 +208,7 @@ class FishingBot:
     STOP_DROP_FAILING = "drop_failing"         # drops failed several times in a row: Drop / Confirm points?
     STOP_CATCH_NOT_RECOGNIZED = "catch_not_recognized"   # catches land but none was ever recognized
     STOP_CURSOR_ITEM = "cursor_item"           # a failed drop may have left an item on the (shared) cursor
+    STOP_QUEST_DIALOG = "quest_dialog"         # a quest dialog (Golden Tuna) the bot could not answer
 
     # Set (window number, item name) when a drop failed and the item could
     # not be put back: it may still be on the cursor, which every window
@@ -219,6 +242,41 @@ class FishingBot:
         'Black_Dye_item.jpg',
         'Bleach_item.jpg',
     }
+    # File names the item templates end with. A fish is three items in the
+    # game, each with its own icon: living (caught), dead and grilled.
+    _ITEM_TEMPLATE_ENDINGS = tuple(f"_{kind}.{ext}" for kind in ("living", "item", "dead", "grilled")
+                                   for ext in ("jpg", "png"))
+    # Living, dead and grilled icons of a fish have the same shape and often
+    # nearly the same colors (a dead Carp is a slightly paler Carp), so the
+    # gray match and the color check cannot tell them apart. After either
+    # of them matched, the slot is compared with the exact game icons of all
+    # three states (assets/fishing/fish_states/<Fish>_living.png and the
+    # <Fish>_dead.png / <Fish>_grilled.png templates): Lab colors smoothed
+    # 5x5 (blur, rescale and JPEG cost a living fish its fine detail, which
+    # made it look dead) with the lightness evened out (a fresh catch is
+    # drawn darker for a moment). Measured on every fish under darkening to
+    # 75 %, brightness +8 %, gamma 0.9, 3x3 blur, rescale 1.25/1.5x and
+    # JPEG 70: the right state is nearest in all but one case (Carp at
+    # JPEG 70, ratio 0.90); right answers have a ratio of at most 0.81, real
+    # captures (dead Zander and Mandarinfish, 2026-11-20; grilled fish of
+    # the real-client recording) 0.01-0.57, a living Carp on a rescaled
+    # client 0.77 (living and dead Carp differ least). Above
+    # _STATE_SURE_RATIO (nearest / second nearest) the two nearest states
+    # count as one when their actions are the same, otherwise the slot is
+    # "<Fish>_unsure" and kept: a living fish set to keep is never dropped
+    # as its dead kind.
+    _FISH_STATE_DIR = "fish_states"
+    _STATE_SURE_RATIO = 0.75
+    # Nearest distance above which the slot is not this fish at all. Fish in
+    # any state score at most 4.4 (real captures, also H.264 and a rescaled
+    # client) and 4.0 (the distortions above); jigsaw puzzle arrows, which
+    # have a fish's shape, 7.7 and more.
+    _STATE_MAX_DIST = 6.0
+    # Fish whose icons have the same shape in another fish's colors: their
+    # states are told apart together (a dead Goldfish is a Large zander at
+    # gray 0.98 and in the color check).
+    _STATE_LOOKALIKES = ({"Goldfish", "Large_zander"},)
+    _fish_state_cache: Optional[Dict[str, Dict[str, tuple]]] = None
     _color_template_cache = None  # Cache for colored versions of confusable fish
     _empty_slot_template = None   # Cache for empty_slot.jpg template
     # Guards the lazy class-level caches: all bots start at the same moment,
@@ -258,6 +316,7 @@ class FishingBot:
     _PANEL_MIN_SIZE = (120, 100)  # first calibration: a panel candidate smaller than this is scenery
     _PANEL_MAX_SHARE = 0.70       # ... and so is one wider or taller than this share of the window
     _MAX_BITE_FAILURES = 5        # casts without a minigame before the bait key is assumed empty
+    _MOUNT_SETTLE = 0.5           # s after a recovery CTRL+G: the (dis)mount must finish before the cast
     _NO_FISH_GAMES = 3            # games in a row with the panel open and no fish seen before acting
     _FOCUS_GIVE_UP = 60.0         # seconds the window cannot be brought to the front before stopping
     _CAST_ERROR_LIMIT = 3         # casts in a row whose keys could not be sent before stopping
@@ -266,6 +325,12 @@ class FishingBot:
     _TRACK_WINDOW = 0.15          # seconds of fish positions kept for the speed estimate
     _TRACK_MIN_SPAN = 0.03        # shortest time base for a usable speed estimate
     _CLICK_OVERHEAD = 0.004       # seconds from "decided" to the button going down, besides the cursor settle
+    # Ring-gated clicks (see _ring_allows_click). The official client draws the
+    # click ring red while it counts the fish as inside, white otherwise and
+    # for a while after a hit. Clicking on a white ring cannot hit.
+    _RING_DEEP = 12               # px inside the radius: the ring must be red by now if it ever turns red
+    _RING_PROOF = 0.5             # s of a deep-inside fish on a white ring that never turned red: client without a red ring
+    _RING_RETRY = 0.35            # s after a click with the ring still red before clicking again (click did not count)
     _CAPTURE_WAIT_AFTER = 5.0     # seconds without a usable frame before casting is put on hold
     _CAPTURE_STOP_AFTER = 30.0    # ... before the bot stops (capture_unavailable)
 
@@ -280,6 +345,10 @@ class FishingBot:
         # Core components
         self.region = region
         self.config = config
+        # A dead fish does what its living fish does (keep or drop): it has
+        # no choice of its own, also in a hand-edited config.
+        if config.get("fish_actions"):
+            config["fish_actions"] = with_dead_fish_actions(config["fish_actions"])
         self.window_manager = window_manager
         # Window tag for the diagnostic log ("W1"); also given to the window
         # manager and capture so their lines carry it.
@@ -293,10 +362,22 @@ class FishingBot:
         self._diag_inv_rect = None        # window-relative rect of the last inventory capture
         self._diag_cap_fail_time = 0.0
         self._diag_paused = False
-        self.detector = FishDetector(DetectionProfile.from_dict(config.get('detection_profile')))
+        # Every run calibrates on its first cast: it starts with the stock
+        # look. A look learned in an earlier run is only a candidate, tried
+        # when the stock look finds no panel and checked like a new find
+        # (a bad one saved once would otherwise steer every later run).
+        saved = DetectionProfile.from_dict(config.get('detection_profile'))
+        if saved is not None and saved.learned:
+            self.detector = FishDetector(DetectionProfile())
+            with FishingBot._profile_lock:
+                if all(k.to_dict() != saved.to_dict() for k in FishingBot._known_profiles):
+                    FishingBot._known_profiles = (FishingBot._known_profiles + [saved])[:self._MAX_KNOWN_PROFILES]
+        else:
+            self.detector = FishDetector(saved)
         # Screen/window capture. Created here, first used on the bot thread.
         self.capture = WindowCapture(
             window_manager, config.get('capture_backend', 'auto'), log=self._log)
+        self.capture.diag_log_grabs = False   # _diag_capture writes the one line per capture
         
         # State tracking
         self.running = False
@@ -320,6 +401,43 @@ class FishingBot:
         self._adaptive = bool(config.get('adaptive_detection', True))
         self._window_learner = WindowLearner()
         self._reference_frame = None      # full window just before the cast
+        # The last game's catch, handled after the next cast (see _defer_catch):
+        # (inventory strip when the game ended, whether anything was hit)
+        self._pending_catch: Optional[Tuple[np.ndarray, bool]] = None
+        # Between a cast and the bite: item handling stops once the minigame shows
+        self._in_cast_window = False
+        # Items whose open / drop was not started because the minigame showed
+        # or there was no time before the bite: (template name, strip x,
+        # strip y), handled after the next quick skip, before the cast
+        self._postponed_items: List[Tuple[str, int, int]] = []
+        # Golden Tuna dialog: when to look again after an inventory overlay
+        # that was not the dialog (see _find_new_item)
+        self._quest_next_check = 0.0
+        # Bait fish set to "use", in the order found: (page index, strip x,
+        # strip y, template name). Each cast puts the first one on the rod
+        # instead of pressing the bait key (_use_fish_bait).
+        self._bait_queue: List[Tuple[int, int, int, str]] = []
+        self._bait_tries: Dict[Tuple[int, int, int], int] = {}
+        # While Ctrl is down the game draws every stack count bigger: no
+        # inventory picture is taken then, nor right after the release.
+        self._ctrl_down = False
+        self._ctrl_up_at = 0.0
+        self._fish_bait_cast = False       # the last cast fished with a bait fish
+        self._drop_filename: Optional[str] = None   # template name of the item being dropped
+        # A drop the bite cut short with the item seen still on the cursor:
+        # puts it back once the minigame is over (see put_back)
+        self._finish_put_back = None
+        # How soon bites come after a cast and how long drops take: a drop is
+        # only started between cast and bite when it is done before the bite
+        self._bite_delays: deque = deque(maxlen=20)
+        self._drop_durations: deque = deque(maxlen=10)
+        self._cast_time: Optional[float] = None
+        # A cast was sent and neither its minigame nor a missed bite was seen
+        # (a pause ended the wait): its minigame may be open at the next cast
+        self._line_out = False
+        # The inventory while the minigame runs (nothing lands meanwhile):
+        # what the strip looked like before the catch
+        self._catch_baseline: Optional[np.ndarray] = None
         self._pending_bounds = None       # panel bounds awaiting a confirming frame
         self._longest_bite = 0.0          # longest cast->minigame delay seen (s)
         self._games_without_fish = 0      # learned profile sanity check
@@ -329,6 +447,16 @@ class FishingBot:
         self._recast_tuner = None         # RecastWaitTuner, created in _load_timings
         self._last_cast_wait = None       # recast wait that preceded the current cast
         self._game_end_time = None        # when the last game ended (recast wait is counted from here)
+        # Seconds from a game's end until its item was seen appearing
+        # (newest last) and the end of the game whose catch is pending
+        self._landing_seen = []
+        self._pending_catch_end = None
+        # A catch not seen by the end of the look before the cast is watched
+        # for after the cast, screen only: (strip before it landed, game
+        # end, watch until). ``_late_until`` is set while that watch runs.
+        self._late_watch: Optional[Tuple[np.ndarray, Optional[float], float]] = None
+        self._late_until: Optional[float] = None
+        self._page_switch_wanted = False  # page filled during the cast window: switched before the next cast
         self._wait_interrupted = False    # the wait for the bite was cut short by a pause
         self._classic_scale_cursor = 0    # next classic icon scale tried besides the known one
         self._classic_scale = None        # icon scale this window's last bite was found at
@@ -338,6 +466,15 @@ class FishingBot:
         self._loop_errors: list = []      # times of recent exceptions in the main loop
         self._was_paused = False          # a pause happened: re-read the inventory before going on
         self._game_fish_seen = False      # a fish was detected in the current game
+        # Ring gate: None = not known yet whether this client turns the ring
+        # red, True = it does (clicks wait for red), False = it does not.
+        self._ring_turns_red: Optional[bool] = None
+        self._ring_white_deep_total = 0.0  # s a deep-inside fish was seen on a white ring (gate unknown)
+        self._ring_white_deep_last: Optional[float] = None
+        self._ring_profile = None         # detection profile the ring gate was learned with
+        self._ring_last_click = 0.0       # time of the last ring-gated click in this game
+        self._ring_cleared = True         # the ring was seen not red since that click
+        self._last_panel_frame = None     # last frame with the panel open (diagnostics at game end)
         self._panel_moves = 0             # times the panel was found somewhere else than before
         self._stuck_games = 0             # "games" in a row whose panel never closed
         self._no_fish_games = 0           # games in a row in which no fish was seen
@@ -345,6 +482,13 @@ class FishingBot:
         self._bite_ever_seen = False      # a minigame (or classic bite) was seen this session
         self._focus_fail_since = None     # first of the casts in a row that could not be sent
         self._mount_toggled = False       # classic: the bot pressed CTRL+G after the last miss
+        # A horse quick skip was sent and no minigame came since: a lost
+        # second CTRL+G can have left the character mounted. Without one
+        # the bot never mounted it, and a recovery CTRL+G would mount it.
+        self._quickskip_unchecked = False
+        # Started with a minigame running: it is played first, the startup
+        # inventory scan comes after it
+        self._startup_scan_after_game = False
         self._last_focus_log = 0.0
         # Capture health: a frame that shows nothing (black, flat, failed) is
         # not evidence of anything. These track how long that has lasted.
@@ -388,6 +532,9 @@ class FishingBot:
         self._tab_check_off = False       # this client's tabs cannot be read: fixed wait
         self._fill_page_pending = False   # armor quick skip left another page on screen
         self._drop_failures = 0           # drops in a row that failed at a dialog step
+        # The held-item probe saw an item that a drop dialog then proved was
+        # on the cursor: from then on its "nothing held" is trusted too.
+        self._held_probe_proven = False
         self._catches_recognized = 0      # catches identified this run
         self._unrecognized_in_a_row = 0   # catches that filled a slot but were not identified
         self._armor_refusal = None        # last reason the armor quick skip was not sent
@@ -452,7 +599,7 @@ class FishingBot:
         self._t_open_wait   = get('timing_open_wait',         0.100)
         self._t_dead_check  = get('timing_dead_fish_check',   0.100)
         self._t_drop_settle = get('timing_drop_settle',       0.120)
-        self._t_drop_dialog = get('timing_drop_dialog_timeout', 1.0)   # longest wait for a drop/confirm dialog
+        self._t_drop_dialog = get('timing_drop_dialog_timeout', 1.5)   # longest wait for a drop/confirm dialog (server lag)
         self._t_qs_between  = get('timing_quickskip_between', 0.100)
         self._t_qs_after    = get('timing_quickskip_after',   0.100)
         # Server-dependent waits
@@ -492,8 +639,8 @@ class FishingBot:
         self._set_stop_reason(reason)
         if status and self.stop_message is None:
             self.stop_message = status.split("] ", 1)[1] if status.startswith("[W") and "] " in status else status
-        diag.log("DECISION", f"STOP reason={reason} (recorded: {self.stop_reason}) message={status!r}",
-                 tag=self.diag_tag)
+        diag.event("DECISION", f"STOP reason={reason} (recorded: {self.stop_reason}) message={status!r}",
+                   kind="stop", tag=self.diag_tag, recent=reason != self.STOP_MANUAL)
         self.running = False
         if status and self.on_status_update:
             self.on_status_update(status)
@@ -573,8 +720,7 @@ class FishingBot:
         border = FishingBot._template_border_crop
         
         for f in os.listdir(assets_path):
-            if f.endswith('_living.jpg') or f.endswith('_living.png') or \
-               f.endswith('_item.jpg') or f.endswith('_item.png'):
+            if f.endswith(self._ITEM_TEMPLATE_ENDINGS):
                 try:
                     img_path = os.path.join(assets_path, f)
                     template = cv2.imread(img_path)
@@ -828,25 +974,30 @@ class FishingBot:
             diag.exc("saving negative frame", tag=self.diag_tag)
 
     def _diag_capture(self, what: str, rel, frame) -> None:
-        """Logs a capture: window-relative and screen rectangle, window rect,
-        frame summary. Failures and black/flat frames always (throttled to
-        one line per 2 s inside per-frame loops), the rest as detail."""
+        """Logs a capture in one line: window-relative rectangle, capture
+        method and time, frame summary (window rect changes have their own
+        line). Failures and black/flat frames always, with the screen and
+        window rectangles (throttled to one line per 2 s inside per-frame
+        loops); the rest as per-frame detail."""
         try:
-            win = self.window_manager.get_window_rect()
-            screen = (win[0] + rel[0], win[1] + rel[1], rel[2], rel[3])
+            grab = getattr(self.capture, "diag_last_grab", None)
+            how = f" via {grab[0]} {grab[1]:.1f} ms" if grab else ""
             st = diag.frame_stats(frame) if frame is not None else None
             bad = "FAILED (blank frame substituted)" if frame is None else (
                 "BLACK" if st and st["black"] else ("FLAT" if st and st["flat"] else ""))
-            text = (f"{what} rel={tuple(rel)} screen={screen} window={win} -> "
-                    f"{bad + ' ' if bad else ''}{'' if frame is None else diag.array_summary(frame)}")
             if not bad:
-                diag.trace("CAPTURE", text, tag=self.diag_tag, depth=1)
+                diag.trace("CAPTURE", f"{what} rel={tuple(rel)}{how} -> {diag.array_summary(frame)}",
+                           tag=self.diag_tag, depth=1)
                 return
             diag.current_loop().count(f"capture_{bad.split()[0].lower()}")
             now = time.perf_counter()
-            if diag.VERBOSE or not diag.in_loop() or now - self._diag_cap_fail_time >= 2.0:
+            if not diag.in_loop() or now - self._diag_cap_fail_time >= 2.0:
                 self._diag_cap_fail_time = now
-                diag.log("CAPTURE", text, tag=self.diag_tag, depth=1)
+                win = self.window_manager.get_window_rect()
+                screen = (win[0] + rel[0], win[1] + rel[1], rel[2], rel[3])
+                diag.event("CAPTURE", f"{what} rel={tuple(rel)}{how} screen={screen} window={win} -> {bad}"
+                                      f"{'' if frame is None else ' ' + diag.array_summary(frame)}",
+                           kind="capture problem", tag=self.diag_tag, depth=1)
         except Exception:
             diag.exc("capture log", tag=self.diag_tag)
 
@@ -999,8 +1150,25 @@ class FishingBot:
         rect = self._inv_rect or self._inventory_rect()
         return rect[0], rect[1]
 
+    # The game redraws the stack counts small within a frame or two of the
+    # Ctrl release (seen < 70 ms in diag 20261121_114409); a margin on top.
+    _CTRL_REDRAW = 0.15
+
+    def _wait_ctrl_redrawn(self) -> None:
+        """Waits until the stack counts are drawn small again after a
+        Ctrl press of this bot (Ctrl+G quick skip / mount)."""
+        while self._ctrl_down and self.running:
+            time.sleep(0.01)
+        left = self._ctrl_up_at + self._CTRL_REDRAW - time.perf_counter()
+        if left > 0:
+            diag.log("ANALYSIS", f"inventory picture waits {left * 1000:.0f} ms: Ctrl just released "
+                                 f"(stack counts drawn big)", tag=self.diag_tag)
+            time.sleep(left)
+
     def capture_inventory_area(self) -> np.ndarray:
-        """Captures the inventory strip (see _inventory_rect)."""
+        """Captures the inventory strip (see _inventory_rect). Never while
+        Ctrl is down: the stack counts are drawn bigger then."""
+        self._wait_ctrl_redrawn()
         if not self._stop_if_window_unavailable():
             rel = self._inventory_rect()
             frame = self._grab(*rel)
@@ -1015,18 +1183,21 @@ class FishingBot:
         return np.zeros(self._EMPTY_FRAME_SHAPE, dtype=np.uint8)
 
     def identify_item_in_inventory(self, inventory_frame: np.ndarray, ignore_positions: set = None,
-                                   roi: Optional[Tuple[int, int, int, int]] = None) -> Optional[Tuple[str, Tuple[int, int]]]:
+                                   roi: Optional[Tuple[int, int, int, int]] = None,
+                                   fresh: bool = False) -> Optional[Tuple[str, Tuple[int, int]]]:
         """Identifies an item in the inventory using template matching with high precision.
         Returns (filename, (x, y)) of best match or None if no match found.
         Coordinates are relative to inventory area.
         ignore_positions: set of (x, y) tuples to skip (dead fish locations).
         If first match is ignored, tries to find another match within same template.
         
-        For confusable fish (Goldfish vs Large_zander), uses color-based disambiguation."""
+        For confusable fish (Goldfish vs Large_zander), uses color-based disambiguation.
+        fresh: the item was just caught. A caught fish is alive, and the glow
+        a new catch is drawn with spoils the living / dead / grilled check."""
         if not diag.ENABLED:
-            return self._identify_item(inventory_frame, ignore_positions, roi, None)
+            return self._identify_item(inventory_frame, ignore_positions, roi, None, fresh)
         scores = []
-        match = self._identify_item(inventory_frame, ignore_positions, roi, scores)
+        match = self._identify_item(inventory_frame, ignore_positions, roi, scores, fresh)
         try:
             ranked = sorted(scores, key=lambda x: -x[1])
             where = f"roi={roi}" if roi is not None else "whole strip"
@@ -1041,7 +1212,7 @@ class FishingBot:
             diag.exc("identify log", tag=self.diag_tag)
         return match
 
-    def _identify_item(self, inventory_frame, ignore_positions, roi, scores):
+    def _identify_item(self, inventory_frame, ignore_positions, roi, scores, fresh=False):
         templates = self._load_template_cache()
         if not templates:
             return None
@@ -1052,7 +1223,7 @@ class FishingBot:
             x1, y1, x2, y2 = roi
             sub_ignore = {(ix - x1, iy - y1) for ix, iy in ignore_positions} if ignore_positions else None
             sub_scores = [] if scores is not None else None
-            match = self._identify_item(inventory_frame[y1:y2, x1:x2], sub_ignore, None, sub_scores)
+            match = self._identify_item(inventory_frame[y1:y2, x1:x2], sub_ignore, None, sub_scores, fresh)
             if sub_scores:
                 scores.extend((n, v, (p[0] + x1, p[1] + y1), ig) for n, v, p, ig in sub_scores)
             if match is None:
@@ -1119,9 +1290,12 @@ class FishingBot:
                         matched_filename = self._disambiguate_confusable_fish(
                             inventory_frame, center_x, center_y, filename
                         )
-                    if self._colors_match(inventory_frame, pt_x, pt_y, matched_filename, peak_val):
+                    resolved = (self._resolve_fish_state(inventory_frame, center_x, center_y, matched_filename, fresh)
+                                if self._colors_match(inventory_frame, pt_x, pt_y, matched_filename, peak_val)
+                                else None)
+                    if resolved is not None:
                         best_confidence = peak_val
-                        best_match = (matched_filename, (center_x, center_y))
+                        best_match = (resolved, (center_x, center_y))
                         if best_confidence >= EARLY_EXIT_THRESHOLD and filename not in confusable_fish:
                             return best_match
                         continue  # Move to next template
@@ -1160,9 +1334,13 @@ class FishingBot:
                             matched_filename = self._disambiguate_confusable_fish(
                                 inventory_frame, center_x, center_y, filename
                             )
-                        if self._colors_match(inventory_frame, pt_x, pt_y, matched_filename, max_val):
+                        resolved = (self._resolve_fish_state(inventory_frame, center_x, center_y,
+                                                             matched_filename, fresh)
+                                    if self._colors_match(inventory_frame, pt_x, pt_y, matched_filename, max_val)
+                                    else None)
+                        if resolved is not None:
                             best_confidence = max_val
-                            best_match = (matched_filename, (center_x, center_y))
+                            best_match = (resolved, (center_x, center_y))
                             if best_confidence >= EARLY_EXIT_THRESHOLD and filename not in confusable_fish:
                                 return best_match
                             break
@@ -1192,21 +1370,37 @@ class FishingBot:
     _ICON_COLOR_MAX_DE = 10.0
     _icon_color_cache: Optional[Dict[str, tuple]] = None
 
-    def _icon_color(self, filename: str) -> Optional[tuple]:
+    @staticmethod
+    def _chroma_subsampled(img: np.ndarray) -> np.ndarray:
+        """``img`` with its color at half resolution, as a video or JPEG
+        encoder stores it (4:2:0): small, strongly colored icons lose color
+        to it (Shiri: dE 11 at JPEG 60 against the exact game icon)."""
+        ycc = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
+        h, w = img.shape[:2]
+        for c in (1, 2):
+            half = cv2.resize(ycc[:, :, c], (max(1, w // 2), max(1, h // 2)), interpolation=cv2.INTER_AREA)
+            ycc[:, :, c] = cv2.resize(half, (w, h), interpolation=cv2.INTER_LINEAR)
+        return cv2.cvtColor(ycc, cv2.COLOR_YCrCb2BGR)
+
+    def _icon_color(self, filename: str, subsampled: bool = False) -> Optional[tuple]:
         """(icon mask, average Lab color of the icon) of a template, cropped
-        like the gray templates. None when the file cannot be read."""
+        like the gray templates. None when the file cannot be read.
+        ``subsampled``: the color after 4:2:0 chroma subsampling (same mask)."""
         cache = FishingBot._icon_color_cache
         if cache is None:
             cache = FishingBot._icon_color_cache = {}
-        if filename not in cache:
+        key = (filename, subsampled) if subsampled else filename
+        if key not in cache:
             entry = None
             try:
                 img = cv2.imread(os.path.join(get_resource_path("assets"), filename))
                 if img is not None:
+                    colors = self._chroma_subsampled(img) if subsampled else img
                     border = FishingBot._template_border_crop
                     h, w = img.shape[:2]
                     if h > border * 2 and w > border * 2:
                         img = img[border:h - border, border:w - border]
+                        colors = colors[border:h - border, border:w - border]
                     # The icon: pixels clearly brighter than the dark slot
                     # behind it, without its outline (blur mixes the
                     # background into it).
@@ -1214,12 +1408,12 @@ class FishingBot:
                     inner = cv2.erode(mask, np.ones((3, 3), np.uint8))
                     mask = (inner if inner.sum() >= 12 else mask).astype(bool)
                     if mask.sum() >= 12:
-                        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+                        lab = cv2.cvtColor(colors, cv2.COLOR_BGR2LAB)
                         entry = (mask, lab[mask].mean(axis=0))
             except Exception:
                 diag.exc(f"icon color of {filename}", tag=self.diag_tag)
-            cache[filename] = entry
-        return cache[filename]
+            cache[key] = entry
+        return cache[key]
 
     def _colors_match(self, frame: np.ndarray, x: int, y: int, filename: str, score: float) -> bool:
         """Is the icon whose template-sized area starts at (x, y) in ``frame``
@@ -1228,23 +1422,166 @@ class FishingBot:
         limit = float(self.config.get("item_color_max_de", self._ICON_COLOR_MAX_DE) or 0)
         if limit <= 0:
             return True                      # check switched off in the config
-        sig = self._icon_color(filename)
-        if sig is None:
-            return True                      # nothing to compare with: the gray match decides
-        mask, want = sig
-        patch = frame[y:y + mask.shape[0], x:x + mask.shape[1]]
-        if patch.shape[:2] != mask.shape:
-            mask = mask[:patch.shape[0], :patch.shape[1]]
-        if patch.size == 0 or mask.sum() < 12:
-            return True
-        got = cv2.cvtColor(np.ascontiguousarray(patch), cv2.COLOR_BGR2LAB)[mask].mean(axis=0)
-        de = float(np.linalg.norm(got[1:] - want[1:]))
-        if de <= limit:
-            return True
+        # A living fish: also its fish_states icon (the same game icon since
+        # the templates are the game's; a custom template may differ). Each
+        # also as a video / JPEG encoder leaves it (chroma at half
+        # resolution): the templates are lossless game icons, and small,
+        # strongly colored ones lose up to dE 11 of color to JPEG 60 (with
+        # this reference at most 6.2; same-shape items stay 11.4+ apart).
+        names = [filename]
+        if filename.endswith("_living.jpg"):
+            names.append(f"{self._FISH_STATE_DIR}/{filename[:-len('.jpg')]}.png")
+        de = None
+        for name, subsampled in [(n, sub) for n in names for sub in (False, True)]:
+            sig = self._icon_color(name, subsampled)
+            if sig is None:
+                if name == filename and not subsampled:
+                    return True              # nothing to compare with: the gray match decides
+                continue
+            mask, want = sig
+            patch = frame[y:y + mask.shape[0], x:x + mask.shape[1]]
+            if patch.shape[:2] != mask.shape:
+                mask = mask[:patch.shape[0], :patch.shape[1]]
+            if patch.size == 0 or mask.sum() < 12:
+                return True
+            got = cv2.cvtColor(np.ascontiguousarray(patch), cv2.COLOR_BGR2LAB)[mask].mean(axis=0)
+            d = float(np.linalg.norm(got[1:] - want[1:]))
+            if d <= limit:
+                return True
+            de = d if de is None else min(de, d)
         diag.log("ANALYSIS", f"{filename} gray {score:.3f} at ({x},{y}) rejected: icon colors differ "
                              f"(dE {de:.1f} > {limit:g}) -> another item of the same shape",
                  tag=self.diag_tag)
         return False
+
+    def _item_in_slot(self, inv_x: int, inv_y: int) -> Optional[str]:
+        """The template name of what the slot at (inv_x, inv_y) holds now, or None."""
+        match = self.identify_item_in_inventory(
+            self.capture_inventory_area(), roi=(max(0, inv_x - 22), max(0, inv_y - 22), inv_x + 22, inv_y + 22))
+        if match and abs(match[1][0] - inv_x) < 10 and abs(match[1][1] - inv_y) < 10:
+            return match[0]
+        return None
+
+    @staticmethod
+    def _state_feature(patch: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """Smoothed Lab colors of the icon pixels of an 18x18 patch, with the
+        lightness scaled to a mean of 128 (see _STATE_SURE_RATIO)."""
+        lab = cv2.blur(cv2.cvtColor(np.ascontiguousarray(patch), cv2.COLOR_BGR2LAB).astype(np.float32), (5, 5))
+        values = lab[mask]
+        mean_l = float(values[:, 0].mean())
+        if mean_l > 0:
+            values[:, 0] *= 128.0 / mean_l
+        return values
+
+    def _load_fish_states(self) -> Dict[str, Dict[str, list]]:
+        """{fish: {state: [(gray 18x18, icon mask, feature), ...]}} of every
+        fish with a dead template. Living has two looks: the exact game icon
+        and the older template (<Fish>_living.jpg), which reads as a dead
+        Carp against the game icons; a fish drawn like either is living.
+        Shared by all bots."""
+        cache = FishingBot._fish_state_cache
+        if cache is not None:
+            return cache
+        with FishingBot._template_lock:
+            if FishingBot._fish_state_cache is not None:
+                return FishingBot._fish_state_cache
+            cache = {}
+            try:
+                folder = get_resource_path("assets")
+                border = FishingBot._template_border_crop
+                for f in sorted(os.listdir(folder)):
+                    if not f.endswith("_dead.png"):
+                        continue
+                    fish = f[:-len("_dead.png")]
+                    paths = {"living": [os.path.join(folder, self._FISH_STATE_DIR, f"{fish}_living.png"),
+                                        os.path.join(folder, f"{fish}_living.jpg")],
+                             "dead": [os.path.join(folder, f)],
+                             "grilled": [os.path.join(folder, f"{fish}_grilled.png")]}
+                    states = {}
+                    for state, state_paths in paths.items():
+                        for path in state_paths:
+                            img = cv2.imread(path)
+                            if img is None or img.shape[0] <= 2 * border or img.shape[1] <= 2 * border:
+                                continue
+                            icon = img[border:-border, border:-border]
+                            gray = cv2.cvtColor(icon, cv2.COLOR_BGR2GRAY)
+                            mask = cv2.erode((gray > 45).astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+                            if mask.sum() < 12:
+                                mask = np.ones(gray.shape, bool)
+                            states.setdefault(state, []).append((gray, mask, self._state_feature(icon, mask)))
+                    if len(states) >= 2:
+                        cache[fish] = states
+            except Exception:
+                diag.exc("fish state icons", tag=self.diag_tag)
+            if diag.ENABLED:
+                diag.log("ANALYSIS", f"fish state icons: {len(cache)} fish: "
+                                     + ", ".join(f"{k} {'/'.join(v)}" for k, v in sorted(cache.items())),
+                         tag=self.diag_tag)
+            FishingBot._fish_state_cache = cache
+            return cache
+
+    def _resolve_fish_state(self, frame: np.ndarray, cx: int, cy: int, filename: str,
+                            fresh: bool = False) -> Optional[str]:
+        """The template name of the state (living / dead / grilled) of the fish
+        that ``filename`` matched at (cx, cy): ``<Fish>_living.jpg``,
+        ``<Fish>_dead.png`` or ``<Fish>_grilled.png``. None when the slot is
+        not that fish in any state (_STATE_MAX_DIST). When no state is
+        clearly nearest, the two nearest are taken as one if they are the
+        living and dead kind of one fish with the same action (the living one, so a drop tries to open it first);
+        with different actions it is ``<Fish>_unsure``, which is kept.
+        Other items come back unchanged. A fresh catch is always the living
+        fish (see identify_item_in_inventory)."""
+        stem = os.path.splitext(filename)[0]
+        fish = next((stem[:-len(s)] for s in ("_living", "_dead", "_grilled") if stem.endswith(s)), None)
+        states = self._load_fish_states()
+        if fish not in states:
+            return filename
+        if fresh:
+            return f"{fish}_living.jpg"
+        group = next((g for g in self._STATE_LOOKALIKES if fish in g), {fish})
+        h, w = frame.shape[:2]
+        region = frame[max(0, cy - 22):min(h, cy + 22), max(0, cx - 22):min(w, cx + 22)]
+        if region.shape[0] < 18 or region.shape[1] < 18:
+            return filename
+        region_gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+        dists = []
+        for name in sorted(group):
+            for state, refs in states.get(name, {}).items():
+                best_ref = None
+                for gray, mask, feature in refs:
+                    if region_gray.shape[0] < gray.shape[0] or region_gray.shape[1] < gray.shape[1]:
+                        continue
+                    _, _, _, (lx, ly) = cv2.minMaxLoc(cv2.matchTemplate(region_gray, gray, cv2.TM_CCOEFF_NORMED))
+                    patch = region[ly:ly + gray.shape[0], lx:lx + gray.shape[1]]
+                    if patch.shape[:2] != mask.shape:
+                        continue
+                    d = float(np.abs(self._state_feature(patch, mask) - feature).mean())
+                    best_ref = d if best_ref is None else min(best_ref, d)
+                if best_ref is not None:
+                    dists.append((best_ref, name, state))
+        if len(dists) < 2:
+            return filename
+        dists.sort()
+        def template(n, st):
+            return f"{n}_living.jpg" if st == "living" else f"{n}_{st}.png"
+
+        (best, name, state), (second, name2, state2) = dists[0], dists[1]
+        ratio = best / second if second > 0 else 0.0
+        if best > self._STATE_MAX_DIST:
+            result = None
+        elif ratio <= self._STATE_SURE_RATIO:
+            result = template(name, state)
+        else:
+            actions = self.config.get("fish_actions") or {}
+            first, other = template(name, state), template(name2, state2)
+            if (name == name2 and {state, state2} == {"living", "dead"}
+                    and normalize_fish_action(actions.get(first), first) == normalize_fish_action(actions.get(other), other)):
+                result = other if state2 == "living" else first
+            else:
+                result = f"{fish}_unsure"
+        diag.log("ANALYSIS", f"state of {filename} at ({cx},{cy}): " + ", ".join(
+            f"{n} {s} {d:.1f}" for d, n, s in dists) + f"; ratio {ratio:.2f} -> {result}", tag=self.diag_tag)
+        return result
 
     def _is_item_at_position(self, inventory_frame: np.ndarray, x: int, y: int, radius: int = 10) -> bool:
         """Checks if a slot at (x, y) is still occupied by an item.
@@ -1288,7 +1625,29 @@ class FishingBot:
             diag.exc("slot check", tag=self.diag_tag)
             return self._is_item_at_position_fallback(inventory_frame, x, y, radius)
 
-    _STACK_CHANGED = 8.0   # mean gray difference of a slot whose stack count changed
+    _STACK_CHANGED = 8.0   # mean gray difference of a slot whose item changed
+    # A stack count going down (14 -> 13) redraws only a digit or two: the
+    # mean moves ~3, but that many pixels change hard.
+    # In the game's small pixel font some counts differ by a single pixel
+    # (9 -> 8: 1 px, 8 -> 7: 5 px, diag 20261121_114409). The capture is
+    # exact (an unchanged slot reads 0 px), so one hard-changed pixel in the
+    # count corner is a count change.
+    _STACK_DIGIT_DIFF = 50
+    _STACK_DIGIT_PIXELS = 6     # anywhere in the slot
+    _STACK_CORNER_PIXELS = 1    # in the corner the count is drawn in
+
+    @classmethod
+    def _patch_change(cls, before: np.ndarray, after: np.ndarray) -> Tuple[float, int, bool]:
+        """(mean difference, strongly changed pixels, changed?) of two
+        pictures of one slot: a new item or a stack count that changed."""
+        diff = cv2.absdiff(before, after)
+        mean = float(diff.mean())
+        hard = diff > cls._STACK_DIGIT_DIFF
+        strong = int(np.count_nonzero(hard))
+        h, w = hard.shape
+        corner = int(np.count_nonzero(hard[h // 2:, w // 3:]))   # bottom right: the count
+        return mean, strong, (mean > cls._STACK_CHANGED or strong >= cls._STACK_DIGIT_PIXELS
+                              or corner >= cls._STACK_CORNER_PIXELS)
 
     @staticmethod
     def _slot_patch(frame: Optional[np.ndarray], x: int, y: int, half: int = 15) -> Optional[np.ndarray]:
@@ -1301,15 +1660,93 @@ class FishingBot:
             return None
         return cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
 
+    # Inventory and dialog clicks on a real client: the cursor rests this long
+    # before the press, and the button is held this long. The game reads
+    # input once per frame and, under Wine/XWayland, the pointer position
+    # can arrive after a click sent right behind the move: an instant click
+    # 50 ms after the move was sometimes missed or landed where the cursor
+    # had been (a drop dialog left open, a pickup that never happened).
+    _UI_SETTLE = 0.10
+    _UI_HOLD = 0.05
+    # Longest wait for the game to answer a right-click on an item (open,
+    # kill, put on the rod). The server answers; 200 ms was not always
+    # enough, and an item that vanished later was then "dropped" as if it
+    # were still there.
+    _SLOT_ANSWER_WAIT = 1.0
+    _SLOT_QUIET = 0.15     # ... and the slot must then stay unchanged this long
+
+    @contextmanager
+    def _input_lock_released(self, why: str, priority: int = input_lock.NORMAL):
+        """Lets other windows use the mouse and keyboard while this one only
+        watches its own screen or waits (no input, no focus needed).
+        input_lock must be held; it is held again when this returns, also
+        after an error, taken back at ``priority``. The focus may have
+        moved meanwhile: the window is brought back to the front before the
+        next click or key."""
+        input_lock.release()
+        released = time.perf_counter()
+        try:
+            yield
+        finally:
+            watched = time.perf_counter() - released
+            input_lock.acquire(priority)
+            if diag.ENABLED:
+                diag.log("LOCK", f"input lock let go for {watched:.2f}s ({why}), back after "
+                                 f"{time.perf_counter() - released - watched:.2f}s more", tag=self.diag_tag)
+
+    def _ui_click(self, x: int, y: int, button: str = 'left') -> None:
+        """Moves to (x, y) on screen, lets the cursor settle, then a held
+        click. Input lock held, window in front."""
+        self.human.move_to(x, y)
+        self.human.sleep(self._UI_SETTLE)
+        self.human.click(button=button, hold=self._UI_HOLD)
+
+    def _wait_slot_answer(self, before: Optional[np.ndarray], x: int, y: int,
+                          wait: Optional[float] = None) -> bool:
+        """After a click on the slot at (x, y): waits until the slot looks
+        different from ``before`` and has stopped changing, or ``wait``
+        seconds passed. True when it changed (item gone, killed, stack
+        down). Needs neither the lock nor the focus."""
+        if before is None:
+            time.sleep(2 * self._t_open_wait)
+            return False
+        wait = self._SLOT_ANSWER_WAIT if wait is None else wait
+        deadline = time.perf_counter() + wait
+        changed_at = None
+        last = None
+        while self.running:
+            self.capture.invalidate()
+            now_patch = self._slot_patch(self.capture_inventory_area(), x, y)
+            now = time.perf_counter()
+            if now_patch is not None and now_patch.shape == before.shape:
+                change, strong, changed = self._patch_change(before, now_patch)
+                if changed:
+                    moving = last is not None and float(cv2.absdiff(last, now_patch).mean()) > 3.0
+                    if changed_at is None or moving:
+                        changed_at = now
+                    elif now - changed_at >= self._SLOT_QUIET:
+                        diag.log("ANALYSIS", f"slot ({x},{y}) answered: change {change:.1f}, {strong} px",
+                                 tag=self.diag_tag)
+                        return True
+                else:
+                    changed_at = None
+                last = now_patch
+            if now >= deadline:
+                break
+            time.sleep(0.03)
+        diag.log("ANALYSIS", f"slot ({x},{y}): {'changed late' if changed_at else 'no change'} within "
+                             f"{wait:.2f}s", tag=self.diag_tag)
+        return changed_at is not None
+
     def _slot_changed(self, before: Optional[np.ndarray], x: int, y: int) -> bool:
         """Does the slot look different from ``before`` (stack count down)?"""
         after = self._slot_patch(self.capture_inventory_area(), x, y)
         if before is None or after is None or before.shape != after.shape:
             return False
-        change = float(cv2.absdiff(before, after).mean())
-        diag.log("ANALYSIS", f"slot ({x},{y}) change after the open: {change:.1f} "
-                             f"(stack threshold {self._STACK_CHANGED})", tag=self.diag_tag)
-        return change > self._STACK_CHANGED
+        change, strong, changed = self._patch_change(before, after)
+        diag.log("ANALYSIS", f"slot ({x},{y}) change after the click: {change:.1f}, {strong} px "
+                             f"(thresholds {self._STACK_CHANGED} / {self._STACK_DIGIT_PIXELS} px)", tag=self.diag_tag)
+        return changed
 
     def _is_item_at_position_fallback(self, inventory_frame: np.ndarray, x: int, y: int, radius: int = 10) -> bool:
         """Fallback heavy check: matches every item template (used only if empty_slot
@@ -1346,94 +1783,264 @@ class FishingBot:
 
     _CATCH_EXTRA_WAIT = 0.6   # extra seconds to wait for a late item (high ping)
 
+    # Share of the strip's pixels that must change for "something covers it"
+    # (a dialog, a page switch). One new item is ~1% of the strip; the moving
+    # world and the animated icons inside it changed ~4.5% on the real
+    # client, which made the old test (a bounding box over 60% of the strip)
+    # call 4302 of 5546 frames an overlay.
+    _OVERLAY_SHARE = 0.25
+
     @staticmethod
-    def _changed_box(base_gray: np.ndarray, frame: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+    def _changed_box(base_gray: np.ndarray, frame: np.ndarray, report: Optional[dict] = None,
+                     watch: Optional[np.ndarray] = None) -> Optional[Tuple[int, int, int, int]]:
         """Bounding box (x1, y1, x2, y2) of what changed versus the baseline,
-        padded so a whole item icon fits. None if nothing (or everything) changed."""
+        padded so a whole item icon fits. None if nothing (or everything)
+        changed; ``report['overlay']`` is then set when everything did.
+        ``watch``: a mask of the slots a new item can land in (free or not
+        known to be taken); changes elsewhere (the world behind the strip,
+        animated icons, stack counts) are not a new item."""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         if gray.shape != base_gray.shape:
             return None
         _, mask = cv2.threshold(cv2.absdiff(base_gray, gray), 30, 255, cv2.THRESH_BINARY)
         changed = cv2.countNonZero(mask)
+        lp = diag.current_loop()
         if changed < 40:
-            diag.current_loop().frame(f"inventory diff: {changed} px changed (<40: no change)")
+            lp.add(changed_px=changed, verdict="no change (<40 px)")
             return None
         x, y, w, h = cv2.boundingRect(mask)
         fh, fw = gray.shape
-        if w * h > fw * fh * 0.6:
-            diag.current_loop().note(f"inventory diff: {changed} px in box {(x, y, w, h)} covers >60% of the "
-                                     f"strip: page switch / overlay, not a new item", "ANALYSIS")
+        if w * h > fw * fh * 0.6 and changed > fw * fh * FishingBot._OVERLAY_SHARE:
+            lp.add(changed_px=changed, box=(x, y, w, h), verdict="overlay (strip covered)")
+            lp.count("overlay")
+            if report is not None:
+                report['overlay'] = True
             return None  # page switch / overlay — not a single new item
-        diag.current_loop().note(f"inventory diff: {changed} px changed in box {(x, y, w, h)}", "ANALYSIS")
+        if watch is not None and watch.shape == mask.shape:
+            mask = cv2.bitwise_and(mask, watch)
+            changed = cv2.countNonZero(mask)
+            if changed < 40:
+                lp.add(changed_px=changed, verdict="no change in the free slots")
+                return None
+            x, y, w, h = cv2.boundingRect(mask)
+        lp.add(changed_px=changed, box=(x, y, w, h), verdict="changed")
         pad = 20
         return (max(0, x - pad), max(0, y - pad), min(fw, x + w + pad), min(fh, y + h + pad))
 
-    def _wait_inventory_change(self, base_gray: np.ndarray, until: float):
+    def _landing_slots_mask(self, shape) -> Optional[np.ndarray]:
+        """Mask of the strip where a caught item shows up: the page's free
+        slots (it lands in the first one, or on a stack of its kind, which
+        the full scan at the end of the wait covers). None when no free slot
+        is known. A slot freed meanwhile and not read yet is also left to
+        that scan."""
+        empty = list(self._empty_slot_positions)
+        if not empty:
+            return None
+        h, w = shape[:2]
+        half = inventory_layout.SLOT // 2
+        mask = np.zeros((h, w), np.uint8)
+        for x, y in empty:
+            x, y = int(round(x)), int(round(y))
+            mask[max(0, y - half):max(0, y + half), max(0, x - half):max(0, x + half)] = 255
+        return mask if mask.any() else None
+
+    def _wait_inventory_change(self, base_gray: np.ndarray, until: float, report: Optional[dict] = None,
+                               looks: Optional[dict] = None):
         """Polls the inventory until it differs from the baseline or ``until``
-        (perf_counter time) passes. Returns (latest_frame, changed_box or None)."""
-        with diag.loop("inventory change wait", tag=self.diag_tag,
+        (perf_counter time) passes. Returns (latest_frame, changed_box or None).
+        With ``report``, it also returns early when the whole strip is covered
+        and a quest dialog may be the cause (``report['overlay']``).
+        ``looks['frames']`` is set to the number of frames read."""
+        watch = self._landing_slots_mask(base_gray.shape)
+        frames = 0
+        with diag.loop("inventory change wait", tag=self.diag_tag, columns=("changed_px", "box", "verdict"),
                        seconds=round(until - time.perf_counter(), 3)) as lp:
             while True:
                 frame = self.capture_inventory_area()
+                frames += 1
+                if looks is not None:
+                    looks['frames'] = frames
                 lp.frame()
-                box = self._changed_box(base_gray, frame)
+                box = self._changed_box(base_gray, frame, report, watch)
                 if box is not None:
                     lp.set("result", f"changed box {box}")
                     return frame, box
+                if (report is not None and report.get('overlay')
+                        and time.perf_counter() >= self._quest_next_check):
+                    lp.set("result", "strip covered: quest dialog?")
+                    return frame, None
                 if not self.running or time.perf_counter() >= until:
                     lp.set("result", "no change" if self.running else "bot stopped")
                     return frame, None
                 time.sleep(0.04)
 
-    def _find_new_item(self, allow_extra: bool):
+    def _find_new_item(self, allow_extra: bool, baseline: Optional[np.ndarray] = None,
+                       defer_late: bool = False):
         """Waits for the caught item to land and identifies it.
 
         Instead of sleeping a fixed time and looking once, the inventory is
         watched for a change: on a fast server the item is handled as soon as
         it appears, on a slow one the wait stretches past the configured time.
         At the configured time a full scan runs regardless (original behavior).
+        ``baseline``: the strip before the item landed (default: now).
+        The wait counts from the game's end when it is known: the quick skip
+        before it already took ~0.4 s, and items land 0.1-0.2 s after the
+        panel closes.
+        ``defer_late``: nothing found at the configured time, the extra wait
+        for a late item is not done here but after the cast
+        (``_late_watch``, see ``_watch_late_catch``).
         Returns (match or None, last_frame)."""
-        baseline = self.capture_inventory_area()
+        if baseline is None:
+            baseline = self.capture_inventory_area()
+        base_frame = baseline
         base_gray = cv2.cvtColor(baseline, cv2.COLOR_BGR2GRAY)
-        deadline = time.perf_counter() + self._t_catch_wait
-        hard_deadline = deadline + self._CATCH_EXTRA_WAIT
+        game_end, self._pending_catch_end = self._pending_catch_end, None
+        late_until, self._late_until = self._late_until, None
+        learned = self._learned_landing() if game_end is not None and late_until is None else None
+        start = time.perf_counter()
+        if late_until is not None:
+            # After the cast: the rest of the wait for a late item
+            deadline = max(start + self._LANDING_MIN_LOOK, late_until)
+            extra = 0.0
+            diag.log("DECISION", f"late catch watch after the cast: {deadline - start:.2f}s",
+                     tag=self.diag_tag)
+        elif learned is not None:
+            # This server's items have always landed within ``learned`` of
+            # the game's end: no need to wait longer than that (two games
+            # in three give nothing, so this wait is mostly for nothing)
+            deadline = max(time.perf_counter() + self._LANDING_MIN_LOOK, game_end + learned)
+            extra = 0.0
+            diag.log("DECISION", f"catch wait follows the landings seen: until {learned:.2f}s after the game end "
+                                 f"({deadline - time.perf_counter():.2f}s from now)", tag=self.diag_tag)
+        elif game_end is not None:
+            deadline = max(start + self._LANDING_MIN_LOOK, game_end + self._t_catch_wait)
+            extra = self._CATCH_EXTRA_WAIT
+        else:
+            deadline = start + self._t_catch_wait
+            extra = self._CATCH_EXTRA_WAIT
+        if game_end is not None and late_until is None and learned is None:
+            hard_deadline = max(deadline, game_end + self._t_catch_wait + extra)
+        else:
+            hard_deadline = deadline + extra
         full_scan_done = False
         frame = baseline
+        # A landing is only learned from an item seen appearing: one already
+        # there at the first look landed some time before it (after a quick
+        # skip, or a wait for another window's input), and that time would
+        # only stretch the learned wait (once to 1.8 s on 2026-11-21).
+        seen_empty = False
 
+        def found(match, frame, appeared=True):
+            if game_end is not None and seen_empty and appeared:
+                self._note_landing(time.perf_counter() - game_end)
+            return match, frame
+
+        # Between the cast and the bite nothing is clicked: a quest dialog
+        # is answered before the next cast instead
+        watch = self._quest_dialog_watch() and not self._in_cast_window
         while self.running:
+            report = {} if watch else None
+            looks = {}
             frame, box = self._wait_inventory_change(
-                base_gray, hard_deadline if full_scan_done else deadline)
+                base_gray, hard_deadline if full_scan_done else deadline, report, looks)
+            if box is None or looks.get('frames', 0) > 1:
+                seen_empty = True
+            if box is None and report and report.get('overlay') \
+                    and time.perf_counter() >= self._quest_next_check:
+                # The whole strip is covered: the Golden Tuna dialog hides
+                # the HUD. Once it is answered the catch wait starts over
+                # against the same baseline (the tuna itself never lands;
+                # what "Cut it open" gives does).
+                if self._handle_quest_dialog():
+                    if not self.running:
+                        break
+                    game_end = None           # what the dialog gives lands on its own time
+                    deadline = time.perf_counter() + self._t_catch_wait
+                    extra = self._CATCH_EXTRA_WAIT
+                    hard_deadline = deadline + extra
+                    full_scan_done = False
+                    continue
             if box is not None:
+                # One new item: fresh. A larger change (an item dropped
+                # meanwhile, too) can hold old dead fish as well.
+                small = box[2] - box[0] <= 2 * 44 and box[3] - box[1] <= 2 * 44
                 match = self.identify_item_in_inventory(
-                    frame, ignore_positions=self._ignored_positions, roi=box)
+                    frame, ignore_positions=self._ignored_positions, roi=box, fresh=small)
                 if match:
-                    return match, frame
+                    return found(match, frame)
                 # Something else changed (stack count, effect) — absorb it and keep waiting
                 diag.log("DECISION", f"inventory changed in {box} but no item recognized there: "
                                      f"taking it as the new baseline", tag=self.diag_tag)
+                base_frame = frame
                 base_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                seen_empty = True
 
             now = time.perf_counter()
             if not full_scan_done:
                 if now >= deadline:
                     full_scan_done = True
-                    diag.log("DECISION", f"catch wait {self._t_catch_wait:.2f}s over: full-strip scan",
-                             tag=self.diag_tag)
+                    diag.log("DECISION", "catch wait over: full-strip scan", tag=self.diag_tag)
                     match = self.identify_item_in_inventory(
                         frame, ignore_positions=self._ignored_positions)
-                    if match or not allow_extra:
-                        if match is None and diag.ENABLED:
+                    if match:
+                        # Not seen appearing (on a stack, outside the free
+                        # slots): when it landed is not known
+                        return found(match, frame, appeared=False)
+                    if not allow_extra or not extra:
+                        if diag.ENABLED:
                             self._diag_negative("expected_item_not_found", frame, self._diag_inv_rect)
-                        return match, frame
-                    diag.log("DECISION", f"nothing found yet: waiting up to {self._CATCH_EXTRA_WAIT}s more "
+                        return None, frame
+                    if defer_late and hard_deadline > now:
+                        # The cast need not wait for a late item: the strip
+                        # is watched after it, while the line is out
+                        self._late_watch = (base_frame, game_end, hard_deadline)
+                        diag.log("DECISION", f"nothing found yet: the cast goes first, a late item is "
+                                             f"watched for {hard_deadline - now:.2f}s after it",
+                                 tag=self.diag_tag)
+                        return None, frame
+                    diag.log("DECISION", f"nothing found yet: waiting up to {hard_deadline - now:.2f}s more "
                                          f"for a late item", tag=self.diag_tag)
             elif now >= hard_deadline:
                 break
         if diag.ENABLED and self.running:
-            diag.log("DECISION", f"no new item identified within {self._t_catch_wait + self._CATCH_EXTRA_WAIT:.2f}s "
+            diag.log("DECISION", f"no new item identified by the end of the catch wait "
                                  f"(allow_extra={allow_extra})", tag=self.diag_tag)
             self._diag_negative("expected_item_not_found", frame, self._diag_inv_rect)
         return None, frame
+
+    # Learning how fast this server's items land. On the 2026-11-20 session
+    # every item showed 0.1-0.2 s after the panel closed, yet each of the
+    # 212 games that gave nothing (two in three) cost the full 1.0 s catch
+    # wait. Once enough catches were seen, the wait ends a margin after the
+    # slowest landing seen, counted from the game's end.
+    _LANDING_SAMPLES = 5       # catches seen before the wait follows them
+    _LANDING_KEEP = 20         # most recent landings remembered
+    _LANDING_MARGIN = 0.15     # s added to the slowest landing seen
+    _LANDING_MIN_LOOK = 0.05   # s the strip is watched at least
+    _LANDING_MAX = 3.0         # s; a "landing" seen later than this is not one
+
+    def _learned_landing(self) -> Optional[float]:
+        """Seconds after a game's end by which its item has always been
+        seen, plus a margin; None until enough catches were seen."""
+        if len(self._landing_seen) < self._LANDING_SAMPLES:
+            return None
+        return min(max(self._landing_seen) + self._LANDING_MARGIN,
+                   self._t_catch_wait + self._CATCH_EXTRA_WAIT + self._LANDING_MAX)
+
+    def _note_landing(self, seconds: float) -> None:
+        """A catch was seen appearing ``seconds`` after its game ended (an
+        upper bound by one frame: it was not there on the look before)."""
+        if not 0.0 <= seconds <= self._LANDING_MAX:
+            return
+        self._landing_seen.append(seconds)
+        del self._landing_seen[:-self._LANDING_KEEP]
+
+    def _forget_landings(self, why: str) -> None:
+        """An item may have landed after the learned wait: back to the
+        configured catch wait until the landings are learned again."""
+        if self._landing_seen:
+            diag.log("DECISION", f"forgetting the learned catch wait: {why}", tag=self.diag_tag)
+        self._landing_seen = []
 
     _UNRECOGNIZED_LIMIT = 6   # catches in a row, none recognized this run, before the bot stops
 
@@ -1444,6 +2051,8 @@ class FishingBot:
         and the player should know rather than think they are."""
         if not filled:
             return
+        # It may also have been a late item the shortened wait did not see
+        self._forget_landings("a slot filled without a recognized catch")
         self._unrecognized_in_a_row += 1
         diag.log("DECISION", f"unrecognized catch took a slot: {self._unrecognized_in_a_row} in a row, "
                              f"{self._catches_recognized} recognized this run", tag=self.diag_tag)
@@ -1523,19 +2132,355 @@ class FishingBot:
         self._release_freed_slots(slots)
         return bool(slots)
 
-    def handle_caught_item(self, may_have_catch: bool = True):
+    # Item handling longer than this between the cast and the bite: a missed
+    # bite then says nothing about the planned recast wait.
+    _DEFERRED_HANDLING_SLOW = 1.0
+
+    def _settle_held_item(self) -> None:
+        """After a minigame that began during a drop: an item seen still on
+        the cursor then goes back to its slot before anything else."""
+        finish, self._finish_put_back = self._finish_put_back, None
+        if finish is None or not self.running:
+            return
+        try:
+            with input_lock:
+                if not self._focus(force=True):
+                    diag.log("DECISION", "held item not put back: window not in front", tag=self.diag_tag)
+                    self._log("An item may still be on the cursor — check the game window")
+                    return
+                back = finish()
+            diag.log("DECISION", f"item held since the bite put back after the game: {back}", tag=self.diag_tag)
+            if back is False:
+                self._log("Could not put the item back after the minigame, check the cursor")
+        except Exception:
+            diag.exc("put back after the game", tag=self.diag_tag)
+
+    def _defer_catch(self, may_have_catch: bool) -> None:
+        """Right after a minigame: remembers the inventory as it is before
+        the item lands. The item is handled after the quick skip, before the
+        next cast (_before_cast): the quick skip comes first, and with no
+        line out no bite can cut into a drop. (Handled while waiting for the
+        bite instead, a drop rarely fit: bites came 1-2 s after the cast, a
+        careful drop takes about as long, so catches were put aside and the
+        order looked random.)"""
+        baseline, self._catch_baseline = self._catch_baseline, None
+        # The landing time only means something for a catch of this game alone
+        self._pending_catch_end = self._game_end_time if self._pending_catch is None else None
+        if self._pending_catch is not None:
+            # The previous catch is not handled yet (a minigame already open
+            # was played first): the older picture shows both as new.
+            baseline = self._pending_catch[0]
+            may_have_catch = may_have_catch or self._pending_catch[1]
+        self._pending_catch = (baseline if baseline is not None else self.capture_inventory_area(),
+                               may_have_catch)
+        diag.log("DECISION", f"catch (may_have_catch={may_have_catch}) handled after the next cast",
+                 tag=self.diag_tag)
+
+    def _before_cast(self) -> None:
+        """After the quick skip, before the next cast: the character is free
+        and no line is out, so no bite can cut in. An item left on the cursor
+        by a bite goes back, the last game's catch is handled, and so are
+        items put aside earlier."""
+        # The Golden Tuna dialog opens right after the won game and hides the
+        # inventory: answered first, so the catch is read off a visible strip
+        self._handle_quest_dialog()
+        if not self.running:
+            return
+        self._settle_held_item()
+        # A late watch the last cast did not get to (a minigame was already
+        # open, the cast was not sent): its time is over, one look ends it
+        if self._late_watch is not None and self.running and not self._line_out:
+            self._watch_late_catch(in_cast_window=False)
+        # Not with a cast still out (paused before its bite was seen): its
+        # minigame may be open already and is played first. The wait for a
+        # late item is done after the cast (_watch_late_catch).
+        if self._pending_catch is not None and self.running and not self._line_out:
+            self._handle_pending_catch(in_cast_window=False, defer_late=True)
+        if self._postponed_items and self.running:
+            postponed, self._postponed_items = self._postponed_items, []
+            diag.log("DECISION", f"{len(postponed)} put-aside item(s) handled before the cast",
+                     tag=self.diag_tag)
+            self._handle_put_aside(postponed)
+        if self._page_switch_wanted and self.running:
+            self._page_switch_wanted = False
+            if not self._page_has_space(None, self._empty_slot_positions) and self.running:
+                diag.log("DECISION", "page filled during the last cast -> switch page", tag=self.diag_tag)
+                self._switch_inventory_page()
+
+    # ------------------------------------------------- Golden Tuna dialog
+
+    # Answers on the Golden Tuna's first page, in the order the game shows
+    # them in every language
+    TUNA_CHOICES = ("Let it go", "Cut it open", "Use it for bait")
+    _QUEST_RECHECK = 0.5       # s before an inventory overlay is looked at again
+    _QUEST_ANSWER_WAIT = 2.5   # s for the game to answer a click on a bar
+    _QUEST_CLOSE_WAIT = 1.5    # s for the black bars to slide away (about 0.4 s)
+    _QUEST_HUD_SETTLE = 0.3    # s for the HUD to be drawn again after that
+    _QUEST_MAX_CLICKS = 6      # clicks on one dialog, all pages, before giving up
+    _QUEST_GIVE_UP = 30.0      # s on one dialog before giving up
+
+    def _quest_dialog_watch(self) -> bool:
+        return bool(self.config.get('golden_tuna', True))
+
+    def _tuna_choice(self) -> int:
+        try:
+            choice = int(self.config.get('golden_tuna_choice', 1))
+        except (TypeError, ValueError):
+            choice = 1
+        return choice if 0 <= choice < len(self.TUNA_CHOICES) else 1
+
+    def _handle_quest_dialog(self, frame: Optional[np.ndarray] = None) -> bool:
+        """Answers the Golden Tuna dialog when it shows in ``frame`` (default:
+        the window now). True when a dialog was there: answered and closed,
+        or the bot was paused/stopped meanwhile. False when none shows (or
+        the setting is off).
+
+        Pages are told apart by their bars, not by their text: three bars
+        are the tuna's choices (the configured one is clicked), one bar is
+        OK, two are a confirmation (the first: yes). Any other count is not
+        the tuna, so the bot stops rather than guess."""
+        if not self.running or not self._quest_dialog_watch():
+            return False
+        if frame is None:
+            frame = self.capture_full_window()
+        dialog = quest_dialog.find(frame)
+        if dialog is None:
+            self._quest_next_check = time.perf_counter() + self._QUEST_RECHECK
+            return False
+
+        choice = self._tuna_choice()
+        self._log(f"Golden Tuna dialog — answering '{self.TUNA_CHOICES[choice]}'")
+        diag.tally("golden tuna dialog", tag=self.diag_tag)
+        if diag.ENABLED:
+            diag.image("golden_tuna_dialog", frame, tag=self.diag_tag,
+                       note=f"board={dialog.board} bars={dialog.bars} letterbox={dialog.letterbox}")
+        start = time.perf_counter()
+        clicks = 0
+        same_page = 0
+        last = None
+        while self.running:
+            if dialog is None:
+                # Between two pages the board is not drawn for a moment, but
+                # the black bars stay: closed only once they are gone.
+                deadline = time.perf_counter() + self._QUEST_CLOSE_WAIT
+                while (self.running and dialog is None and quest_dialog.letterbox_showing(frame)
+                       and time.perf_counter() < deadline):
+                    time.sleep(0.05)
+                    frame = self.capture_full_window()
+                    dialog = quest_dialog.find(frame)
+                if dialog is None:
+                    break
+            if self.paused:
+                # The player has the controls: they answer it, or the next
+                # look after the resume does.
+                self._was_paused = True
+                diag.log("DECISION", "paused with the quest dialog open", tag=self.diag_tag)
+                return True
+            count = len(dialog.bars)
+            if count == 3:
+                index, what = choice, self.TUNA_CHOICES[choice]
+            elif count == 1:
+                index, what = 0, "OK"
+            elif count == 2:
+                index, what = 0, "the first answer (confirm)"
+            else:
+                if diag.ENABLED:
+                    diag.image("quest_dialog_unknown", frame, tag=self.diag_tag, note=f"bars={dialog.bars}")
+                self._stop_bot(
+                    self.STOP_QUEST_DIALOG,
+                    f"[W{self.bot_id+1}] A quest dialog with {count} answers is open — not the Golden Tuna. "
+                    f"Answer it by hand, then start again.")
+                return True
+            same_page = same_page + 1 if dialog.same_page(last) else 0
+            if (same_page >= 2 or clicks >= self._QUEST_MAX_CLICKS
+                    or time.perf_counter() - start > self._QUEST_GIVE_UP):
+                if diag.ENABLED:
+                    diag.image("quest_dialog_stuck", frame, tag=self.diag_tag,
+                               note=f"bars={dialog.bars} clicks={clicks} same_page={same_page}")
+                self._stop_bot(
+                    self.STOP_QUEST_DIALOG,
+                    f"[W{self.bot_id+1}] The Golden Tuna dialog did not react to {clicks} click(s). "
+                    f"Answer it by hand, then start again.")
+                return True
+            x, y = dialog.bar_center(index)
+            with input_lock:
+                # Paused while waiting for the lock: handled at the loop top
+                if self.running and not self.paused and self._focus(force=True):
+                    win_left, win_top, _, _ = self.window_manager.get_window_rect()
+                    diag.log("ACTION", f"quest dialog: {count} bar(s) {dialog.bars}: clicking #{index + 1} "
+                                       f"'{what}' at ({x},{y})", tag=self.diag_tag)
+                    self._ui_click(win_left + x, win_top + y)
+                    clicks += 1
+            last = dialog
+            # Until the page changes or the dialog goes
+            deadline = time.perf_counter() + self._QUEST_ANSWER_WAIT
+            while self.running:
+                time.sleep(0.1)
+                frame = self.capture_full_window()
+                dialog = quest_dialog.find(frame)
+                if not last.same_page(dialog) or time.perf_counter() >= deadline:
+                    break
+        if not self.running:
+            return True
+        # The black bars are gone: the HUD is drawn again a moment later
+        self._sleep_interruptible(self._QUEST_HUD_SETTLE)
+        took = time.perf_counter() - start
+        diag.log("DECISION", f"quest dialog closed after {clicks} click(s) in {took:.2f}s "
+                             f"(choice '{self.TUNA_CHOICES[choice]}')", tag=self.diag_tag)
+        self._log(f"Golden Tuna: '{self.TUNA_CHOICES[choice]}' done")
+        return True
+
+    def _handle_put_aside(self, items: List[Tuple[str, int, int]]) -> None:
+        """Opens or drops items put aside earlier, as what their slot holds
+        now asks. Between a cast and the bite it stops once the minigame
+        shows; the rest stays put aside."""
+        actions = self.config.get('fish_actions') or {}
+        for i, (filename, inv_x, inv_y) in enumerate(items):
+            if not self.running:
+                break
+            if self._in_cast_window and self._minigame_showing():
+                self._postponed_items.extend(items[i:])
+                break
+            now = self._item_in_slot(inv_x, inv_y)
+            action = normalize_fish_action(actions.get(now), now) if now else 'keep'
+            diag.log("DECISION", f"put-aside {filename} at ({inv_x},{inv_y}): slot holds {now} -> {action}",
+                     tag=self.diag_tag)
+            if now and action != 'keep':
+                self._handle_item(now, inv_x, inv_y, action, label="Later: ")
+            elif now:
+                self._mark_occupied(inv_x, inv_y)
+
+    def _minigame_showing(self) -> bool:
+        """One look at the calibrated panel region: is the minigame open?"""
+        if not self.region_auto_calibrated or self.region is None:
+            return False
+        try:
+            frame = self.capture_screen()
+            need = max(1, int(self.detector.profile.window_min_pixels * 0.5))
+            return self.detector.panel_pixels(frame) >= need
+        except Exception:
+            diag.exc("minigame check", tag=self.diag_tag)
+            return False
+
+    # Share of the shortest recent bite a drop may use, and the time a drop
+    # is taken to need before one has been timed
+    _BITE_MARGIN = 0.85
+    _DROP_TIME_GUESS = 1.5
+
+    def _drop_fits_before_bite(self) -> Tuple[bool, str]:
+        """Is there time for a drop before the bite? The item is on the
+        cursor during a drop, and the minigame opens where its dialogs are."""
+        if not self._bite_delays or self._cast_time is None:
+            return False, "no bite timed yet"
+        shortest = min(self._bite_delays)
+        need = max(self._drop_durations) if self._drop_durations else self._DROP_TIME_GUESS
+        elapsed = time.perf_counter() - self._cast_time
+        fits = elapsed + need <= shortest * self._BITE_MARGIN
+        return fits, (f"{elapsed:.2f}s since the cast + {need:.2f}s for a drop "
+                      f"{'<=' if fits else '>'} {self._BITE_MARGIN:.0%} of the shortest bite {shortest:.2f}s")
+
+    def _postpone_if_bitten(self, filename: str, inv_x: int, inv_y: int, action: Optional[str] = None) -> bool:
+        """Between the cast and the bite: True, and the item is put aside,
+        when the minigame is already open, or when it is a drop that would
+        not be done before the bite. Put-aside items are handled after the
+        next quick skip, before the next cast (_before_cast)."""
+        if not self._in_cast_window:
+            return False
+        if self._minigame_showing():
+            why = "minigame open"
+        elif action == 'drop':
+            fits, detail = self._drop_fits_before_bite()
+            if fits:
+                return False
+            why = f"no time to drop before the bite ({detail})"
+        else:
+            return False
+        self._postponed_items.append((filename, inv_x, inv_y))
+        diag.log("DECISION", f"{why}: {filename} at ({inv_x},{inv_y}) put aside", tag=self.diag_tag)
+        return True
+
+    def _handle_pending_catch(self, in_cast_window: bool = False, defer_late: bool = False) -> float:
+        """Handles the last game's catch: normally before the next cast
+        (_before_cast). ``in_cast_window``: between the cast and the bite,
+        where a drop without time before the bite, or anything once the
+        minigame shows, is put aside for _before_cast. Returns the seconds
+        it took."""
+        pending, self._pending_catch = self._pending_catch, None
+        if pending is None or not self.running:
+            return 0.0
+        start = time.perf_counter()
+        self._in_cast_window = in_cast_window
+        try:
+            if self.running:
+                baseline, may_have_catch = pending
+                self.handle_caught_item(may_have_catch=may_have_catch, baseline=baseline,
+                                        defer_late=defer_late)
+        finally:
+            self._in_cast_window = False
+        took = time.perf_counter() - start
+        diag.log("DECISION", f"last catch handled in {took:.2f}s", tag=self.diag_tag)
+        return took
+
+    def _switch_page_when_free(self, why: str) -> None:
+        """Switches to the next page, or, between the cast and the bite,
+        right after the next quick skip (``_before_cast``)."""
+        if self._in_cast_window:
+            self._page_switch_wanted = True
+            diag.log("DECISION", f"{why} -> page switch after the next quick skip (line out)",
+                     tag=self.diag_tag)
+            return
+        diag.log("DECISION", f"{why} -> switch page", tag=self.diag_tag)
+        self._switch_inventory_page()
+
+    def _watch_late_catch(self, in_cast_window: bool) -> float:
+        """The rest of a catch wait left by the look before the cast: the
+        strip is watched until the item could still land (screen only, no
+        input lock, no focus). Normally right after the cast, where the
+        shortest bite (1.0 s) comes after it ends. Returns the seconds it took."""
+        late, self._late_watch = self._late_watch, None
+        if late is None or not self.running:
+            return 0.0
+        baseline, game_end, until = late
+        start = time.perf_counter()
+        self._pending_catch_end = game_end
+        self._late_until = until
+        self._in_cast_window = in_cast_window
+        try:
+            self.handle_caught_item(may_have_catch=True, baseline=baseline)
+        finally:
+            self._in_cast_window = False
+            self._late_until = None
+            self._pending_catch_end = None
+        took = time.perf_counter() - start
+        diag.log("DECISION", f"late catch watch done in {took:.2f}s (in_cast_window={in_cast_window})",
+                 tag=self.diag_tag)
+        return took
+
+    def handle_caught_item(self, may_have_catch: bool = True, baseline: Optional[np.ndarray] = None,
+                           defer_late: bool = False):
         """Identifies the caught item and keeps, opens or drops it as
-        configured in fish_actions. Called after every finished game.
+        configured in fish_actions. Called after every finished game, or
+        after the next cast (_defer_catch).
 
         ``may_have_catch`` is False when the minigame ended without a single
-        hit, in which case no time is spent waiting for a late item."""
-        self._restore_fill_page()
+        hit, in which case no time is spent waiting for a late item.
+        ``baseline``: the inventory strip from before the item landed (when
+        the game ended); without it the strip is read now.
+        ``defer_late``: the wait for a late item is left to the watch after
+        the cast (``_watch_late_catch``).
+
+        Between the cast and the bite (``_in_cast_window``) nothing is
+        clicked: an item to open or drop is put aside for the next quick
+        skip, and a page switch waits for it too."""
+        if not self._in_cast_window:
+            self._restore_fill_page()   # may click a page tab
         if not self.config.get('auto_fish_handling', False):
             if not may_have_catch:
                 return  # nothing was caught: the inventory is as it was
             # Even without auto handling, track inventory fullness so page-switching works
             try:
-                baseline = self.capture_inventory_area()
+                if baseline is None:
+                    baseline = self.capture_inventory_area()
                 inventory_frame, _ = self._wait_inventory_change(
                     cv2.cvtColor(baseline, cv2.COLOR_BGR2GRAY),
                     time.perf_counter() + self._t_catch_wait)
@@ -1554,10 +2499,15 @@ class FishingBot:
         try:
             # Screen capture needs neither focus nor the input lock, so the
             # wait for the item does not block the other windows.
-            match, inventory_frame = self._find_new_item(allow_extra=may_have_catch)
+            match, inventory_frame = self._find_new_item(allow_extra=may_have_catch, baseline=baseline,
+                                                         defer_late=defer_late)
+            if not match and self._late_watch is not None:
+                return   # watched for after the cast: judged there
             if not match or not self.running:
                 diag.log("DECISION", f"no caught item to handle (match={match}, running={self.running})",
                          tag=self.diag_tag)
+                if may_have_catch and self.running:
+                    diag.tally("catch not recognized", tag=self.diag_tag)
                 # An item the bot has no template for still takes a slot:
                 # without this check a page filled with unknown items is
                 # never left and later catches land where nobody looks.
@@ -1566,25 +2516,35 @@ class FishingBot:
                     has_space = self._page_has_space(inventory_frame, self._empty_slot_positions)
                     self._note_unrecognized_catch(len(self._empty_slot_positions) < before)
                     if not has_space and self.running:
-                        diag.log("DECISION", "unrecognized catch, page full -> switch page", tag=self.diag_tag)
-                        self._switch_inventory_page()
+                        self._switch_page_when_free("unrecognized catch, page full")
                 return
 
             self._catches_recognized += 1
             self._unrecognized_in_a_row = 0
 
             filename, (inv_x, inv_y) = match
-            action = normalize_fish_action(fish_actions.get(filename))
-            fish_name = filename.replace('_living.jpg', '').replace('_item.jpg', '')
+            action = normalize_fish_action(fish_actions.get(filename), filename)
+            fish_name = item_display_name(filename)
             diag.log("DECISION", f"caught {filename} at strip ({inv_x},{inv_y}): configured action "
                                  f"{fish_actions.get(filename)!r} -> {action}", tag=self.diag_tag)
+            diag.tally(f"caught {fish_name} ({action})", tag=self.diag_tag)
 
             if action == 'drop' and not self.config.get('confirm_button_pos'):
                 diag.log("DECISION", "drop wanted but confirm_button_pos not set -> keep", tag=self.diag_tag)
                 self._log(f"Confirm button not configured! Keeping: {fish_name}")
                 action = 'keep'
 
-            if action == 'keep':
+            if (self._in_cast_window and action != 'keep'
+                    and not (is_bait_fish(filename) and action in ('use', 'open'))):
+                # The line is out: no click until the next quick skip. The
+                # slot counts as taken until the item is gone.
+                self._mark_occupied(inv_x, inv_y)
+                self._postponed_items.append((filename, inv_x, inv_y))
+                diag.log("DECISION", f"late catch {filename} at ({inv_x},{inv_y}) seen after the cast: "
+                                     f"{action} put aside until the next quick skip", tag=self.diag_tag)
+                action = 'keep'
+                has_space = self._page_has_space(None, self._empty_slot_positions)
+            elif action == 'keep':
                 # Pure bookkeeping — no input, so no lock and no focus switch.
                 self._mark_occupied(inv_x, inv_y)
                 has_space = self._page_has_space(inventory_frame, self._empty_slot_positions)
@@ -1597,8 +2557,7 @@ class FishingBot:
                 has_space = self._page_has_space(None, self._empty_slot_positions)
 
             if not has_space and self.running:
-                diag.log("DECISION", "no empty slot left on this page -> switch page", tag=self.diag_tag)
-                self._switch_inventory_page()
+                self._switch_page_when_free("no empty slot left on this page")
 
         except Exception as e:
             diag.exc("handle_caught_item", tag=self.diag_tag)
@@ -1613,14 +2572,21 @@ class FishingBot:
         One lock hold covers the whole sequence, so no other window can move
         the mouse between its steps. Returns False when nothing could be sent
         (window not in front, bot stopped)."""
-        fish_name = filename.replace('_living.jpg', '').replace('_item.jpg', '')
+        fish_name = item_display_name(filename)
+        if action == 'use' and is_bait_fish(filename):
+            self._queue_bait(filename, inv_x, inv_y, label)
+            return True
+        if action == 'open' and is_bait_fish(filename):
+            # A right-click on a bait fish puts it on the rod: it never opens
+            self._queue_bait(filename, inv_x, inv_y, label)
+            return True
         if action not in ('drop', 'open'):
             # Only an explicit drop may take the drop path (an empty or
             # unknown action once dropped the fish): anything else is kept.
             self._mark_occupied(inv_x, inv_y)
             return True
         if action == 'open':
-            return self._open_item(fish_name, inv_x, inv_y, label)
+            return self._open_item(fish_name, inv_x, inv_y, label, filename=filename)
         try:
             with input_lock:
                 # Paused (F5): the player has the controls. Nothing is picked
@@ -1632,6 +2598,9 @@ class FishingBot:
                         self._was_paused = True
                         diag.log("DECISION", f"paused: {action} of {fish_name} not started", tag=self.diag_tag)
                     return False
+                # With the mouse ours: the bite may have come while waiting for it
+                if self._postpone_if_bitten(filename, inv_x, inv_y, action):
+                    return True
                 win_left, win_top, win_width, win_height = self.window_manager.get_window_rect()
                 strip_x, strip_y = self._inventory_origin()
                 screen_x = win_left + strip_x + inv_x
@@ -1640,13 +2609,13 @@ class FishingBot:
                 win_cy = win_top + win_height // 2
 
                 def right_click_and_check() -> bool:
-                    """Right-clicks the item; True when it is still there."""
-                    self.human.move_to(screen_x, screen_y)
-                    self.human.sleep(0.05)
-                    self.human.click(button='right')
-                    self.human.sleep(self._t_open_wait)
+                    """Right-clicks the item; True when it is still there
+                    once the game has answered."""
+                    before = self._slot_patch(self.capture_inventory_area(), inv_x, inv_y)
+                    self._ui_click(screen_x, screen_y, button='right')
+                    # Off the slot, so a tooltip does not hide what is in it
                     self.human.move_to(win_cx, win_cy)
-                    time.sleep(self._t_open_wait)
+                    self._wait_slot_answer(before, inv_x, inv_y)
                     return self._is_item_at_position(self.capture_inventory_area(), inv_x, inv_y)
 
                 if action == 'drop':
@@ -1657,11 +2626,27 @@ class FishingBot:
                         return True
 
                     self._log(f"{label}Dropping: {fish_name}")
-                    # A living fish is opened instead when the game allows it
-                    still_there = right_click_and_check() if '_living' in filename else True
+                    drop_start = time.perf_counter()
+                    # A living fish is opened instead when the game allows it.
+                    # Not a bait fish: the right-click would put it on the rod.
+                    try_open = '_living' in filename and not is_bait_fish(filename)
+                    still_there = right_click_and_check() if try_open else True
 
                     diag.log("DECISION", f"drop {fish_name}: {'still in slot -> drop sequence' if still_there else 'gone after the right-click (opened instead)'}",
                              tag=self.diag_tag)
+                    if still_there and try_open:
+                        # The right-click may have killed the fish: the slot
+                        # then holds its dead kind, which has its own action.
+                        now = self._item_in_slot(inv_x, inv_y)
+                        if now != filename:
+                            now_action = normalize_fish_action(
+                                (self.config.get('fish_actions') or {}).get(now), now) if now else 'keep'
+                            diag.log("DECISION", f"after the right-click the slot holds {now}: {now_action}",
+                                     tag=self.diag_tag)
+                            if now_action != 'drop':
+                                self._mark_occupied(inv_x, inv_y)
+                                return True
+                            filename, fish_name = now, item_display_name(now)
                     if still_there:
                         sure, why = self._drop_match_sure(filename, inv_x, inv_y)
                         if not sure:
@@ -1676,8 +2661,13 @@ class FishingBot:
                             ground_pos = self.config.get('drop_ground_pos')
                             ground = ((win_left + int(ground_pos[0]), win_top + int(ground_pos[1]))
                                       if ground_pos else (win_cx, win_cy))
-                            self._drop_sequence(fish_name, inv_x, inv_y, (screen_x, screen_y),
-                                                ground, (win_left, win_top), drop_pos, confirm_pos)
+                            self._drop_filename = filename
+                            try:
+                                self._drop_sequence(fish_name, inv_x, inv_y, (screen_x, screen_y),
+                                                    ground, (win_left, win_top), drop_pos, confirm_pos)
+                            finally:
+                                self._drop_filename = None
+                                self._drop_durations.append(time.perf_counter() - drop_start)
             return True
         except Exception as e:
             diag.exc(f"handling {fish_name}", tag=self.diag_tag)
@@ -1685,7 +2675,8 @@ class FishingBot:
             self._mark_occupied(inv_x, inv_y)
             return True
 
-    def _open_item(self, fish_name: str, inv_x: int, inv_y: int, label: str = "") -> bool:
+    def _open_item(self, fish_name: str, inv_x: int, inv_y: int, label: str = "",
+                   filename: Optional[str] = None) -> bool:
         """Right-clicks an item to open it. Only the click holds the input
         lock; waiting for the game and looking at the slot do not (nothing
         is on the cursor), so other windows' fish clicks are not held up.
@@ -1700,18 +2691,20 @@ class FishingBot:
                         self._was_paused = True
                         diag.log("DECISION", f"paused: opening {fish_name} not started", tag=self.diag_tag)
                     return False
+                if filename and self._postpone_if_bitten(filename, inv_x, inv_y, "open"):
+                    return True
                 win_left, win_top, win_width, win_height = self.window_manager.get_window_rect()
                 strip_x, strip_y = self._inventory_origin()
                 self._log(f"{label}Opening: {fish_name}")
                 # The slot before the click: a stack that shrank by one was
                 # opened although its slot still holds an item.
                 before = self._slot_patch(self.capture_inventory_area(), inv_x, inv_y)
-                self.human.move_to(win_left + strip_x + inv_x, win_top + strip_y + inv_y)
-                self.human.sleep(0.05)
-                self.human.click(button='right')
+                self._ui_click(win_left + strip_x + inv_x, win_top + strip_y + inv_y, button='right')
                 # Off the slot, so a tooltip does not hide what is in it
                 self.human.move_to(win_left + win_width // 2, win_top + win_height // 2)
-            time.sleep(2 * self._t_open_wait)
+            # Until the game has answered: read too early, a slow open looked
+            # like a fish that did not open
+            self._wait_slot_answer(before, inv_x, inv_y)
             still_there = self._is_item_at_position(self.capture_inventory_area(), inv_x, inv_y)
             if still_there:
                 diag.log("DECISION", f"{fish_name} still there after opening: checking again in "
@@ -1724,9 +2717,15 @@ class FishingBot:
                 diag.log("DECISION", f"{fish_name} still there but the slot changed: a stack, opened one",
                          tag=self.diag_tag)
             elif still_there:
-                # Dead fish — occupies this slot (released if it empties later)
-                diag.log("DECISION", f"{fish_name} did not open (dead fish?): slot ({inv_x},{inv_y}) "
-                                     f"marked occupied", tag=self.diag_tag)
+                # Dead fish: the right-click may have killed it. Its dead kind
+                # has its own action; anything else occupies this slot
+                # (released if it empties later).
+                now = self._item_in_slot(inv_x, inv_y)
+                now_action = normalize_fish_action((self.config.get('fish_actions') or {}).get(now), now) if now else 'keep'
+                diag.log("DECISION", f"{fish_name} did not open: slot ({inv_x},{inv_y}) holds {now} "
+                                     f"-> {now_action}", tag=self.diag_tag)
+                if now and now.endswith("_dead.png") and now_action == 'drop':
+                    return self._handle_item(now, inv_x, inv_y, 'drop', label)
                 self._mark_occupied(inv_x, inv_y)
             else:
                 diag.log("DECISION", f"{fish_name} opened: slot ({inv_x},{inv_y}) is empty now",
@@ -1751,6 +2750,13 @@ class FishingBot:
         entry = templates.get(filename)
         if entry is None:
             return False, "no template"
+        # A living fish dropped as its dead kind (or the other way round)
+        # cannot be undone: the state must still be the same on a new picture.
+        state = self._resolve_fish_state(frame, inv_x, inv_y, filename)
+        if state != filename:
+            diag.log("DECISION", f"drop of {filename} at ({inv_x},{inv_y}) not sure: the slot now reads "
+                                 f"as {state}", tag=self.diag_tag)
+            return False, f"reads as {item_display_name(state) if state else 'another item'} now"
         template, half_w, half_h = entry
         h, w = frame.shape[:2]
         x1, y1 = max(0, inv_x - half_w - 6), max(0, inv_y - half_h - 6)
@@ -1774,16 +2780,44 @@ class FishingBot:
         diag.log("DECISION", f"drop of {filename} at ({inv_x},{inv_y}) not sure enough: {detail}", tag=self.diag_tag)
         return False, detail
 
+    # Gray levels a pixel must change by, and how many pixels of the probe
+    # slot must change, before an item is taken to be drawn on the cursor.
+    # An empty slot is static UI: with nothing held it does not change at all.
+    _HELD_PIXEL_DIFF = 30
+    _HELD_MIN_PIXELS = 40
+
+    def _held_probe_slot(self, inv_x: int, inv_y: int) -> Optional[Tuple[int, int]]:
+        """An empty slot of the current page, away from the item's own, where
+        an item on the cursor can be seen: the game keeps drawing a picked-up
+        item in its slot until it is put somewhere, and draws a copy at the
+        cursor. None when the page has no empty slot."""
+        slots = [s for s in self._scan_empty_slots(self.capture_inventory_area())
+                 if abs(s[0] - inv_x) >= 20 or abs(s[1] - inv_y) >= 20]
+        if not slots:
+            return None
+        return min(slots, key=lambda s: (s[0] - inv_x) ** 2 + (s[1] - inv_y) ** 2)
+
     def _drop_sequence(self, fish_name: str, inv_x: int, inv_y: int, slot_screen, ground_screen,
                        win_origin, drop_pos, confirm_pos) -> None:
         """Drops the item in a slot, each step confirmed before the next:
-        picked up (slot empty), dialog up after the ground click, confirm
-        dialog up after the drop button, dialog gone and slot still empty
+        picked up (seen on the cursor), dialog up after the ground click,
+        confirm dialog up after the drop button, dialog gone and slot empty
         after the confirm. A step that did not happen puts the item back in
         its slot and sends nothing more. input_lock held, window in front."""
         win_left, win_top = win_origin
         timeout = self._t_drop_dialog
-        keep_going = lambda: self.running  # noqa: E731
+        state = {"picked": False, "dialog": False, "bitten": False}
+
+        def keep_going() -> bool:
+            """Waits go on while the bot runs and, between a cast and the
+            bite, until the minigame opens: it opens where the drop dialogs
+            are, and its panel would read as the dialog coming up."""
+            if not self.running:
+                return False
+            if self._in_cast_window and self._minigame_showing():
+                state["bitten"] = True
+                return False
+            return True
 
         def grab(x, y, w, h):
             self.capture.invalidate()
@@ -1795,47 +2829,136 @@ class FishingBot:
         base_drop = dialog_watch.read_patch(grab, drop_pt) if drop_pt else None
         base_confirm = dialog_watch.read_patch(grab, confirm_pt)
 
+        # The picked-up item stays drawn in its own slot, so the slot cannot
+        # tell whether it is on the cursor. An empty slot with the cursor
+        # resting on it can: it changes only when an item is drawn there.
+        probe = self._held_probe_slot(inv_x, inv_y)
+        probe_screen = ((slot_screen[0] + probe[0] - inv_x, slot_screen[1] + probe[1] - inv_y)
+                        if probe else None)
+
+        def probe_patch():
+            self.human.move_to(*probe_screen)
+            time.sleep(0.03)
+            self.capture.invalidate()
+            return self._slot_patch(self.capture_inventory_area(), probe[0], probe[1])
+
+        probe_base = probe_patch() if probe else None
+        # Whether the pickup click was sent (before it, nothing can be on the
+        # cursor) and whether a drop dialog was seen since
+
+        def item_held(want: bool, wait: float = 0.3) -> Optional[bool]:
+            """Is an item on the cursor? Looks until the answer is ``want``
+            or ``wait`` is over, so a frame drawn before the click cannot
+            give the other answer. None when it cannot be seen."""
+            if probe_base is None:
+                return None
+            deadline = time.perf_counter() + wait
+            while True:
+                patch = probe_patch()
+                if patch is None or patch.shape != probe_base.shape:
+                    return None
+                changed = int(np.count_nonzero(cv2.absdiff(patch, probe_base) > self._HELD_PIXEL_DIFF))
+                held = changed >= self._HELD_MIN_PIXELS
+                if held == want or time.perf_counter() >= deadline or not self.running:
+                    diag.log("ANALYSIS", f"held-item probe at slot {probe}: {changed} px changed "
+                                         f"(min {self._HELD_MIN_PIXELS}) -> {'HELD' if held else 'not held'}",
+                             tag=self.diag_tag)
+                    return held
+                time.sleep(0.03)
+
         class FocusLost(Exception):
             pass
 
-        def click_at(point, settle=True):
+        def refocus() -> None:
+            """After the input lock was let go: this window in front again
+            before the next click, or the sequence stops (FocusLost)."""
+            if not self._focus(force=True):
+                raise FocusLost()
+
+        def click_at(point, settle=True, pickup=False):
             # A pop-up (or the player) that took the focus mid-sequence
             # would get this click: check before every one.
             if not self.window_manager.is_foreground():
                 raise FocusLost()
-            self.human.move_to(*point)
-            self.human.sleep(0.05)
-            self.human.click()
+            if pickup:
+                state["picked"] = True
+            self._ui_click(int(point[0]), int(point[1]))
             if settle:
                 self.human.sleep(self._t_drop_settle)
 
-        def slot_has_item() -> bool:
+        def slot_has_item(wait: float = 0.0, move: bool = True) -> bool:
+            """Is the item in its slot? With ``wait``: looks until the slot
+            reads empty or the time is over (the server takes a moment to
+            take the item away). ``move=False`` when the input lock is let
+            go: the cursor was put off the slot before."""
             # Off the slot first: an item still on the cursor is drawn under
             # it and would look like the item in its slot.
-            self.human.move_to(*ground_screen)
-            time.sleep(0.03)
-            return self._is_item_at_position(self.capture_inventory_area(), inv_x, inv_y)
+            if move:
+                self.human.move_to(*ground_screen)
+                time.sleep(0.03)
+            deadline = time.perf_counter() + wait
+            while True:
+                self.capture.invalidate()
+                there = self._is_item_at_position(self.capture_inventory_area(), inv_x, inv_y)
+                if not there or time.perf_counter() >= deadline or not self.running:
+                    return there
+                time.sleep(0.05)
 
-        def put_back(why: str) -> None:
-            """The item is on the cursor and must not be carried into the next
-            click: back into its slot, which is empty since it was picked up."""
-            for _ in range(2):
-                click_at(slot_screen)
-                if slot_has_item():
-                    break
-            back = slot_has_item()
+        def put_back(why: str, dialog_up: bool = False) -> None:
+            """The item may be on the cursor and must not be carried into the
+            next click: a click on its own slot puts it back. Not clicked when
+            the cursor is seen empty, since that click would pick it up —
+            unless a drop dialog is up: the item waits in it, not on the
+            cursor, and the click cancels it."""
+            held = True if dialog_up else item_held(True, wait=0.15)
+            if held is False and self._held_probe_proven:
+                back = True
+            else:
+                # Held, or cannot tell (no empty slot on this page, or a probe
+                # not proven here yet): click the slot, then look again. A
+                # click that picked the item up shows on the cursor and is
+                # undone by the second one.
+                for _ in range(2):
+                    click_at(slot_screen)
+                    held = item_held(False)
+                    if held is not True:
+                        break
+                back = None if held is None else not held
+            state["picked"] = back is not True
             self._log(f"Drop of {fish_name} stopped: {why} — "
-                      + ("item put back in its slot" if back else "could not put the item back, check the cursor"))
+                      + {True: "item put back in its slot",
+                         None: "clicked the item back into its slot",
+                         False: "could not put the item back, check the cursor"}[back])
             diag.log("DECISION", f"drop of {fish_name} aborted ({why}): put back={back}", tag=self.diag_tag)
             if diag.ENABLED:
                 self._diag_negative("drop_aborted", self.capture_full_window(),
                                     (0, 0) + tuple(self.window_manager.get_window_rect()[2:]), note=why)
+            if state["bitten"] and back is False:
+                # Seen still on the cursor: the game took no inventory click
+                # while the minigame ran. Put back when it is over.
+                def finish_put_back() -> Optional[bool]:
+                    if item_held(True, wait=0.15) is not True:
+                        return True          # not seen held (any more): no click
+                    held = True
+                    for _ in range(2):
+                        click_at(slot_screen)
+                        held = item_held(False)
+                        if held is not True:
+                            break
+                    return None if held is None else not held
+                self._finish_put_back = finish_put_back
+            if state["bitten"] and self._drop_filename:
+                self._postponed_items.append((self._drop_filename, inv_x, inv_y))
+                return   # the bite came during the drop: again before the next cast
+            if back is not False and self._drop_filename and self._postpone_if_bitten(
+                    self._drop_filename, inv_x, inv_y):
+                return
             self._mark_occupied(inv_x, inv_y)
 
         try:
             self._drop_steps(fish_name, inv_x, inv_y, slot_screen, ground_screen, win_left, win_top,
                              drop_pt, confirm_pt, base_drop, base_confirm, timeout, keep_going, grab,
-                             click_at, slot_has_item, put_back)
+                             click_at, slot_has_item, put_back, item_held, state, refocus)
         except Exception as e:
             # Whatever broke the sequence, the item may be on the cursor now
             # (picked up, not dropped): it goes back before the lock is let go,
@@ -1850,8 +2973,8 @@ class FishingBot:
                 # Also after a stop: the item must not be left for the player
                 # (or another window) to drop with the next click.
                 if self._focus(force=True):
-                    if not slot_has_item():
-                        put_back(why)
+                    if state["picked"]:
+                        put_back(why, dialog_up=state["dialog"])
                         return
                 else:
                     # The window cannot be brought back, so the item cannot
@@ -1881,14 +3004,47 @@ class FishingBot:
                 return
             self._mark_occupied(inv_x, inv_y)
 
+    _CONFIRM_RETRIES = 1      # Confirm clicks sent again while the dialog still shows
+    _DROP_EMPTY_WAIT = 1.0    # longest wait for the slot to empty after Confirm
+
     def _drop_steps(self, fish_name, inv_x, inv_y, slot_screen, ground_screen, win_left, win_top,
                     drop_pt, confirm_pt, base_drop, base_confirm, timeout, keep_going, grab,
-                    click_at, slot_has_item, put_back) -> None:
+                    click_at, slot_has_item, put_back, item_held, state, refocus) -> None:
         """The steps of _drop_sequence (see there)."""
-        # 1. Pick the item up
-        click_at(slot_screen)
-        if slot_has_item():
+        # 1. Pick the item up. Its slot keeps showing it; the copy drawn at
+        #    the cursor is what shows the pickup worked. When that cannot be
+        #    seen (no empty slot on the page), the drop dialog shows it.
+        click_at(slot_screen, pickup=True)
+        held = item_held(True)
+        if held is not True:
+            self.capture.invalidate()
+            if not self._is_item_at_position(self.capture_inventory_area(), inv_x, inv_y):
+                # A picked-up item stays drawn in its slot. Empty and nothing
+                # seen on the cursor: the item went away by itself (a late
+                # open, put on the rod, moved by the player). No ground or
+                # Confirm click: with nothing on the cursor they only walk.
+                # One click on the slot puts back anything held after all,
+                # and does nothing on an empty slot with an empty cursor.
+                diag.log("DECISION", f"drop {fish_name}: the slot is empty after the pickup click and nothing "
+                                     f"is seen held -> the item is gone, drop not continued", tag=self.diag_tag)
+                if held is None or not self._held_probe_proven:
+                    click_at(slot_screen)
+                state["picked"] = False
+                self._ignored_positions.discard((inv_x, inv_y))
+                return
+        if held is False and not self._held_probe_proven:
+            # Never seen working in this window yet: perhaps the game draws
+            # the item elsewhere. Not trusted to leave an item on the cursor.
+            diag.log("DECISION", f"drop {fish_name}: probe saw nothing held, but it is unproven here -> "
+                                 f"the drop dialog decides", tag=self.diag_tag)
+            if diag.ENABLED:
+                self._diag_negative("drop_pickup_not_seen", self.capture_inventory_area(), self._diag_inv_rect)
+            held = None
+        if held is False:
+            state["picked"] = False
             self._log(f"{fish_name} could not be picked up — leaving it there")
+            if diag.ENABLED:
+                self._diag_negative("drop_pickup_not_seen", self.capture_inventory_area(), self._diag_inv_rect)
             self._mark_occupied(inv_x, inv_y)
             return
 
@@ -1897,9 +3053,17 @@ class FishingBot:
         click_at(ground_screen, settle=False)
         self.human.move_to(*slot_screen)
         first_pt, first_base = (drop_pt, base_drop) if drop_pt else (confirm_pt, base_confirm)
-        if not dialog_watch.wait(grab, first_pt, first_base, timeout, keep_going,
+        seen = dialog_watch.wait(grab, first_pt, first_base, timeout, keep_going,
                                  minimum=self._t_drop_settle, what="drop dialog", tag=self.diag_tag,
-                                 owner=self.bot_id):
+                                 owner=self.bot_id)
+        if seen and self._in_cast_window and self._minigame_showing():
+            state["bitten"] = True       # the change was the panel opening, not (only) the dialog
+            seen = False
+        if not seen:
+            if state["bitten"]:
+                # Not a failed drop: put back, and again before the next cast
+                put_back("the minigame opened")
+                return
             # Also when stopped meanwhile: the item is on the cursor and
             # must not be left there for the player.
             running = self.running
@@ -1912,27 +3076,69 @@ class FishingBot:
                     "nothing changed at the Confirm point after a fish was dropped on the ground. Check "
                     "Confirm, and set Drop / Sell if your client asks drop or sell first.")
             return
+        state["dialog"] = True
+        if held:
+            self._held_probe_proven = True
 
         # 3. Drop button, then the confirm dialog
         if drop_pt:
             click_at((win_left + drop_pt[0], win_top + drop_pt[1]), settle=False)
             self.human.move_to(*slot_screen)
-            if not dialog_watch.wait(grab, confirm_pt, base_confirm, timeout, keep_going,
+            seen = dialog_watch.wait(grab, confirm_pt, base_confirm, timeout, keep_going,
                                      minimum=self._t_drop_settle, what="confirm dialog", tag=self.diag_tag,
-                                     owner=self.bot_id):
+                                     owner=self.bot_id)
+            if seen and self._in_cast_window and self._minigame_showing():
+                state["bitten"] = True
+                seen = False
+            if not seen:
+                if state["bitten"]:
+                    put_back("the minigame opened", dialog_up=True)
+                    return
                 running = self.running
-                put_back("no confirm dialog after the drop button" if running else "bot stopped")
+                put_back("no confirm dialog after the drop button" if running else "bot stopped", dialog_up=True)
                 if running:
                     self._drop_failed("nothing changed at the Confirm point after the Drop / Sell click. "
                                       "Check Drop / Sell and Confirm.")
                 return
 
-        # 4. Confirm, then check the dialog went away and the slot stayed empty
-        click_at((win_left + confirm_pt[0], win_top + confirm_pt[1]), settle=False)
-        self.human.move_to(*ground_screen)
-        gone = dialog_watch.wait(grab, confirm_pt, base_confirm, timeout, keep_going, want_change=False,
-                                 minimum=self._t_drop_settle, what="confirm dialog", tag=self.diag_tag,
-                                 owner=self.bot_id)
+        # 4. Confirm, then check the dialog went away and the slot stayed
+        #    empty. A Confirm click the game missed leaves the dialog up with
+        #    the item in it: clicked once more while the dialog still shows.
+        #    After the Confirm click nothing is on the cursor (the item is
+        #    dropped or waits in the dialog), so the answer is watched with
+        #    the input lock let go: other windows play meanwhile instead of
+        #    waiting up to 2 s per Confirm (3.3 s once, diag 20261121_110550).
+        #    The lock is taken back, and the window brought to the front
+        #    again, before any further click.
+        confirm_what = "confirm dialog" if drop_pt else "drop dialog"
+        for attempt in range(1 + self._CONFIRM_RETRIES):
+            if attempt:
+                refocus()
+            click_at((win_left + confirm_pt[0], win_top + confirm_pt[1]), settle=False)
+            self.human.move_to(*ground_screen)
+            time.sleep(0.03)
+            with self._input_lock_released("drop: the game answers the Confirm click"):
+                gone = dialog_watch.wait(grab, confirm_pt, base_confirm, timeout, lambda: self.running,
+                                         want_change=False, minimum=self._t_drop_settle, what="confirm dialog",
+                                         tag=self.diag_tag, owner=self.bot_id)
+                empty = not slot_has_item(wait=self._DROP_EMPTY_WAIT, move=False)
+                again = not empty and not (
+                    gone or attempt >= self._CONFIRM_RETRIES or not self.running
+                    or not dialog_watch.still_up(grab, confirm_pt, base_confirm, what=confirm_what,
+                                                 owner=self.bot_id))
+            if not again:
+                break
+            diag.log("DECISION", f"drop {fish_name}: item still in its slot and the dialog still up after the "
+                                 f"Confirm click -> Confirm once more", tag=self.diag_tag)
+        if slot_has_item() and self.running and dialog_watch.still_up(
+                grab, confirm_pt, base_confirm, what=confirm_what, owner=self.bot_id):
+            # Still asking: the item waits in the dialog. Cancelled with a
+            # click on its slot, not left open for the next click to answer.
+            # Another window may have had the focus since the Confirm click.
+            refocus()
+            put_back("the dialog did not take the Confirm click", dialog_up=True)
+            self._drop_failed("the dialog stayed open after the Confirm click. Check Confirm.")
+            return
         if slot_has_item():
             self._log(f"{fish_name} is still in its slot after the drop — leaving it there")
             if diag.ENABLED:
@@ -2058,14 +3264,17 @@ class FishingBot:
         lp = diag.current_loop()
         try:
             # ========== PHASE 1: Quick pre-check (NO LOCK) ==========
-            window_active, fish_pos = detect(capture())
+            frame = capture()
+            window_active, fish_pos = detect(frame)
+            if window_active:
+                self._last_panel_frame = frame
 
             if not window_active:
-                lp.frame("frame: panel not found")
+                lp.frame("frame: panel not found", panel=0, action="no panel")
                 lp.count("panel_missing")
                 return (False, None)
             if not fish_pos:
-                lp.frame("frame: panel open, no fish")
+                lp.frame("frame: panel open, no fish", panel=1, action="no fish")
                 lp.count("no_fish")
                 return (True, None)
             if lp.active:
@@ -2087,11 +3296,17 @@ class FishingBot:
             dx, dy = fish_pos[0] - cx, fish_pos[1] - cy
             if lp.active:
                 lp.score("fish_dist", (dx * dx + dy * dy) ** 0.5)
+            dist = round((dx * dx + dy * dy) ** 0.5)
             if (dx * dx + dy * dy) >= radius_sq:
                 lp.frame(f"frame: fish {fish_pos} outside circle ({cx},{cy}) r={radius_sq ** 0.5:.0f} "
-                         f"dist={(dx * dx + dy * dy) ** 0.5:.0f}")
+                         f"dist={dist}", panel=1, fish_x=fish_pos[0], fish_y=fish_pos[1], dist=dist,
+                         action="outside")
                 return (True, None)
-            lp.frame(f"frame: fish {fish_pos} INSIDE circle ({cx},{cy}) r={radius_sq ** 0.5:.0f} -> click path")
+            lp.frame(f"frame: fish {fish_pos} INSIDE circle ({cx},{cy}) r={radius_sq ** 0.5:.0f} -> click path",
+                     panel=1, fish_x=fish_pos[0], fish_y=fish_pos[1], dist=dist, action="inside")
+            if not self._ring_allows_click(frame, fish_pos, time.perf_counter(), lp):
+                lp.add(action="ring wait")
+                return (True, None)
 
             if reaction_delay > 0:
                 time.sleep(reaction_delay)
@@ -2112,7 +3327,8 @@ class FishingBot:
                     return (True, None)
                 switched = getattr(self.window_manager, "last_switch_time", 0.0) != switch_before
 
-                window_active, fish_pos = detect(capture())
+                frame = capture()
+                window_active, fish_pos = detect(frame)
                 if not window_active:
                     lp.note("re-check under the lock: panel gone", "DECISION")
                     return (False, None)
@@ -2124,6 +3340,10 @@ class FishingBot:
                 dx, dy = fx - cx, fy - cy
                 if (dx * dx + dy * dy) >= radius_sq:
                     lp.count("recheck_left_circle")
+                    return (True, None)
+                self._last_panel_frame = frame
+                ring = ring_color(frame, (cx, cy), radius_sq ** 0.5, fish_pos)
+                if not self._ring_allows_click(frame, fish_pos, time.perf_counter(), lp, ring):
                     return (True, None)
 
                 # Aim where the fish will be when the button goes down, and
@@ -2140,14 +3360,19 @@ class FishingBot:
                 win_left, win_top, _, _ = self.window_manager.get_window_rect()
                 if diag.ENABLED:
                     lp.count("clicks")
+                    lp.count(f"clicks_ring_{ring if ring in (RING_RED, RING_WHITE) else 'unknown'}")
                     diag.log("DECISION", f"click fish seen at {fish_pos}, aimed at {target} "
                                          f"(velocity {self._fish_velocity(now)}, circle ({cx},{cy}) "
-                                         f"r={radius_sq ** 0.5:.0f}, region {self.region}, "
+                                         f"r={radius_sq ** 0.5:.0f}, ring {ring}, ring gate "
+                                         f"{self._ring_turns_red}, region {self.region}, "
                                          f"reaction delay {reaction_delay * 1000:.0f} ms)", tag=self.diag_tag)
                 self.human.move_to(win_left + self.region.left + fx,
                                    win_top + self.region.top + fy)
                 time.sleep(self._cursor_settle(switched))
                 self.human.click(hold=self._t_hold)
+                self._ring_last_click = time.perf_counter()
+                self._ring_cleared = False
+                lp.add(action="click")
             # ========== LOCK RELEASED ==========
 
             # Post-click settle happens outside the lock so other windows can
@@ -2159,6 +3384,62 @@ class FishingBot:
             diag.exc("click", tag=self.diag_tag)
             self._log(f"Click error: {e}")
             return (True, None)
+
+    def _ring_allows_click(self, frame, fish_pos, now: float, lp, ring: Optional[str] = None) -> bool:
+        """Whether the game would count a click now, by the ring's color.
+
+        The official client draws the ring red while it counts the fish as
+        inside and white otherwise, also for a while after a hit with the
+        fish still inside. A click on a white ring cannot be a hit. The bot
+        used to click every ~70 ms while the fish was inside its own circle;
+        in a 2026-11-19 session 7 of 9 games ended right after such click
+        runs with no catch.
+
+        - Once a red ring is seen, this window only clicks on red, and once
+          per red phase: after a click it waits for the ring to go white (the
+          hit) or for _RING_RETRY with it still red (the click did not count).
+        - Until then a white ring with the fish deep inside is waited on for
+          _RING_PROOF: the official ring turns red within a frame. If it
+          never does (adding up over the frames), this client does not color the ring, and the circle
+          alone decides from then on (as does a ring of another color).
+        Called with the fish inside the bot's circle."""
+        cx, cy = self._circle_center
+        radius = self._circle_radius_sq ** 0.5
+        if ring is None:
+            ring = ring_color(frame, (cx, cy), radius, fish_pos)
+        if ring != RING_RED:
+            self._ring_cleared = True
+        if ring == RING_RED and self._ring_turns_red is not True:
+            self._ring_turns_red = True
+            lp.note("ring turned red with the fish inside: clicks now wait for a red ring", "DECISION")
+        if self._ring_turns_red is False:
+            return True
+        if self._ring_turns_red is None:
+            if ring != RING_WHITE:
+                return True               # not the official look: the circle decides
+            dx, dy = fish_pos[0] - cx, fish_pos[1] - cy
+            last, self._ring_white_deep_last = self._ring_white_deep_last, None
+            if (dx * dx + dy * dy) >= (radius - self._RING_DEEP) ** 2:
+                lp.count("ring_wait_red")
+                return False
+            if last is not None:
+                # Frames in a row add up; a gap (fish left, other window) adds one frame's worth
+                self._ring_white_deep_total += min(now - last, 0.05)
+            self._ring_white_deep_last = now
+            if self._ring_white_deep_total < self._RING_PROOF:
+                lp.count("ring_wait_red")
+                return False
+            self._ring_turns_red = False
+            lp.note(f"ring stayed white with the fish deep inside for {self._RING_PROOF}s: this client "
+                    f"does not color the ring, the circle decides", "DECISION")
+            return True
+        if ring != RING_RED:
+            lp.count("ring_wait_red")
+            return False
+        if not self._ring_cleared and now - self._ring_last_click < self._RING_RETRY:
+            lp.count("ring_same_phase")
+            return False
+        return True
 
     def _fish_velocity(self, now: float) -> Optional[Tuple[float, float]]:
         """Fish speed in px/s from the recent track, or None when the track is
@@ -2377,10 +3658,35 @@ class FishingBot:
             diag.log("DECISION", "page wait: the active tab was never recognized on this client: "
                                  "using the fixed wait from now on", tag=self.diag_tag)
 
+    def _tabs_readable(self, page_pos) -> bool:
+        """Whether _wait_for_page can see the clicked tab become active."""
+        if self._tab_check_off:
+            return False
+        _, _, win_width, win_height = self.window_manager.get_window_rect()
+        points = inventory_layout.tab_points(self.config, win_width, win_height)
+        try:
+            clicked = (int(page_pos[0]), int(page_pos[1]))
+        except (TypeError, ValueError, IndexError):
+            return False
+        return len(points) >= 3 and clicked in points.values()
+
+    def _page_empty_slots(self) -> Optional[list]:
+        """Empty slots on the page shown now (None when it cannot be captured)."""
+        frame = self._grab(*self._inventory_rect())
+        return None if frame is None else self._scan_empty_slots(frame)
+
     def _goto_page(self, page_pos, settle: float = 0.3) -> bool:
         """Clicks an inventory page tab (window-relative position) and waits
         until the game shows the page. False when the click could not be
-        sent: the page on screen is then still the old one."""
+        sent: the page on screen is then still the old one.
+
+        When the tabs cannot be read (fewer than 3 configured, or never
+        recognized on this client) nothing would notice a click the game
+        missed, which happens right after a switch between game windows.
+        Then the empty slots are compared before and after: the same ones
+        mean the tab is clicked once more (harmless when that page was
+        already showing)."""
+        before = None if self._tabs_readable(page_pos) else self._page_empty_slots()
         ok = False
         for _attempt in range(3):
             if not self.running:
@@ -2400,6 +3706,19 @@ class FishingBot:
         if ok:
             self._fill_page_pending = False   # the bot's own page is being shown
             self._wait_for_page(page_pos, settle)
+            if before is not None and self.running:
+                after = self._page_empty_slots()
+                same, differ = inventory_layout.same_empty_slots(before, after) if after is not None else (False, -1)
+                diag.log("DECISION", f"page check without readable tabs: {len(before)} -> "
+                                     f"{'?' if after is None else len(after)} empty slots, {differ} differ -> "
+                                     + ("same page, the click may have been missed: clicking the tab once more"
+                                        if same else "page switched"), tag=self.diag_tag)
+                if same:
+                    with input_lock:
+                        if self.running and self._focus(force=True):
+                            win_left, win_top, _, _ = self.window_manager.get_window_rect()
+                            self._click_page_tab(win_left + page_pos[0], win_top + page_pos[1])
+                    self._wait_for_page(page_pos, settle)
         else:
             diag.log("DECISION", "page tab could not be clicked: the old page is still showing", tag=self.diag_tag)
         return ok
@@ -2431,45 +3750,161 @@ class FishingBot:
             self.on_stats_update(self.bot_id, self.hits, self.total_games, self.bait_counter)
     
     def press_ctrl_key(self, key: str) -> bool:
-        """Presses CTRL+key combination once. Uses input lock for thread safety.
+        """Presses CTRL+key combination once. Takes the input lock unless the
+        caller holds it already (the quick skip holds it for both presses).
         Returns True when the keys were sent."""
         if not self.keyboard_controller:
             return False
-        
+        if input_lock.held_by_me():
+            return self._press_ctrl_key_locked(key)
         with input_lock:
-            try:
-                # Paused: the player has the controls, a Ctrl+G now would
-                # mount or dismount under them.
-                if not self.running or self.paused or not self._focus():
-                    return False
-                self.human.sleep(self._t_key_set)
-                held = []
-                try:
-                    self.keyboard_controller.press(Key.ctrl)
-                    held.append(Key.ctrl)
-                    self.human.sleep(self._t_key_hold)
-                    self.keyboard_controller.press(key)
-                    held.append(key)
-                    self.human.sleep(self._t_key_hold)
-                finally:
-                    # Whatever went wrong, no key stays down: a Ctrl left
-                    # held turns every later bait key into Ctrl+key.
-                    for k in reversed(held):
-                        try:
-                            self.keyboard_controller.release(k)
-                        except Exception:
-                            diag.exc(f"releasing {k}", tag=self.diag_tag)
-                        if k is not held[0]:
-                            self.human.sleep(self._t_key_hold)
-                diag.log("ACTION", f"CTRL+{key} sent via {type(self.keyboard_controller).__name__}",
-                         tag=self.diag_tag)
-                return True
-            except Exception as e:
-                diag.exc(f"CTRL+{key}", tag=self.diag_tag)
-                if self.on_status_update:
-                    self.on_status_update(f"[W{self.bot_id+1}] Error pressing CTRL+{key}: {e}")
+            return self._press_ctrl_key_locked(key)
+
+    def _press_ctrl_key_locked(self, key: str) -> bool:
+        """press_ctrl_key with input_lock held."""
+        try:
+            # Paused: the player has the controls, a Ctrl+G now would
+            # mount or dismount under them.
+            if not self.running or self.paused or not self._focus():
                 return False
+            self.human.sleep(self._t_key_set)
+            # Through the humanizer: it waits for a fresh focus switch to
+            # settle and stamps each event, so no other window takes the
+            # focus before the releases have arrived (utils.KEY_FLUSH).
+            held = []
+            try:
+                self._ctrl_down = True
+                self.human.key_press(Key.ctrl)
+                held.append(Key.ctrl)
+                self.human.sleep(self._t_key_hold)
+                self.human.key_press(key)
+                held.append(key)
+                self.human.sleep(self._t_key_hold)
+            finally:
+                # Whatever went wrong, no key stays down: a Ctrl left
+                # held turns every later bait key into Ctrl+key.
+                for k in reversed(held):
+                    try:
+                        self.human.key_release(k)
+                    except Exception:
+                        diag.exc(f"releasing {k}", tag=self.diag_tag)
+                    if k is not held[0]:
+                        self.human.sleep(self._t_key_hold)
+                self._ctrl_down = False
+                self._ctrl_up_at = time.perf_counter()
+            diag.log("ACTION", f"CTRL+{key} sent via {type(self.keyboard_controller).__name__}",
+                     tag=self.diag_tag)
+            return True
+        except Exception as e:
+            diag.exc(f"CTRL+{key}", tag=self.diag_tag)
+            if self.on_status_update:
+                self.on_status_update(f"[W{self.bot_id+1}] Error pressing CTRL+{key}: {e}")
+            return False
     
+    def _queue_bait(self, filename: str, inv_x: int, inv_y: int, label: str = "") -> None:
+        """A bait fish set to "use": it stays in its slot (the bot does not
+        look at the slot again) and goes on the rod at one of the next
+        casts, in the order found."""
+        self._mark_occupied(inv_x, inv_y)
+        key = (self._current_inv_page, inv_x, inv_y)
+        if any((p, x, y) == key for p, x, y, _ in self._bait_queue):
+            return
+        self._bait_queue.append(key + (filename,))
+        self._log(f"{label}Bait for a later cast: {item_display_name(filename)} "
+                  f"({len(self._bait_queue)} waiting)")
+        diag.log("DECISION", f"bait fish {filename} at page {key[0] + 1} ({inv_x},{inv_y}) queued: "
+                             f"{len(self._bait_queue)} in the queue", tag=self.diag_tag)
+
+    _BAIT_TRIES = 2   # casts at which a bait fish is tried before it is left alone
+
+    def _use_fish_bait(self) -> Optional[str]:
+        """Before a cast: right-clicks the first queued bait fish, which puts
+        it on the rod. Returns its name when it left its slot (the cast then
+        needs no bait key); None when there is none or it did not go on (the
+        bait key is pressed as usual). A bait fish on another page is used
+        from there; a slot freed on an earlier page becomes the page the
+        bot watches, since new items fill the first free slot."""
+        while self._bait_queue and self.running and not self.paused:
+            page, inv_x, inv_y, filename = self._bait_queue[0]
+            home = self._current_inv_page
+            if page != home:
+                page_pos = self.config.get(f'inv_page_{page + 1}_pos')
+                if not page_pos:
+                    self._bait_queue.pop(0)
+                    continue
+                if not self._goto_page(page_pos):
+                    return None   # tried again at the next cast
+            used = False
+            try:
+                now = self._item_in_slot(inv_x, inv_y)
+                if now != filename:
+                    diag.log("DECISION", f"queued bait {filename} at page {page + 1} ({inv_x},{inv_y}): the "
+                                         f"slot holds {now} now -> dropped from the queue", tag=self.diag_tag)
+                    self._bait_queue.pop(0)
+                    if now is None:
+                        self._ignored_positions.discard((inv_x, inv_y))
+                    continue
+                with input_lock:
+                    if not self.running or self.paused or not self._focus(force=True):
+                        if self.paused:
+                            self._was_paused = True
+                        return None
+                    win_left, win_top, win_width, win_height = self.window_manager.get_window_rect()
+                    strip_x, strip_y = self._inventory_origin()
+                    before = self._slot_patch(self.capture_inventory_area(), inv_x, inv_y)
+                    self._ui_click(win_left + strip_x + inv_x, win_top + strip_y + inv_y, button='right')
+                    self.human.move_to(win_left + win_width // 2, win_top + win_height // 2)
+                self._wait_slot_answer(before, inv_x, inv_y)
+                gone = not self._is_item_at_position(self.capture_inventory_area(), inv_x, inv_y)
+                key = (page, inv_x, inv_y)
+                if gone:
+                    self._bait_queue.pop(0)
+                    self._bait_tries.pop(key, None)
+                    self._ignored_positions.discard((inv_x, inv_y))
+                    self._log(f"Fishing with {item_display_name(filename)} as bait "
+                              f"({len(self._bait_queue)} more waiting)")
+                    diag.log("DECISION", f"bait fish {filename} at page {page + 1} ({inv_x},{inv_y}) put on "
+                                         f"the rod", tag=self.diag_tag)
+                    if page < home:
+                        home = page   # the freed slot is where the next catch lands
+                    return filename
+                if self._slot_changed(before, inv_x, inv_y):
+                    # A stack (14 Vai in one slot): one went on the rod, the
+                    # rest stays. It stays first in the queue, so the next
+                    # casts use it too until the slot is empty.
+                    self._bait_tries.pop(key, None)
+                    self._log(f"Fishing with {item_display_name(filename)} as bait (more in the stack)")
+                    diag.log("DECISION", f"bait fish {filename} at page {page + 1} ({inv_x},{inv_y}): one "
+                                         f"of the stack put on the rod, the slot stays queued", tag=self.diag_tag)
+                    return filename
+                self._bait_tries[key] = self._bait_tries.get(key, 0) + 1
+                diag.log("DECISION", f"bait fish {filename} still in its slot after the right-click "
+                                     f"(try {self._bait_tries[key]}/{self._BAIT_TRIES}): bait key instead",
+                         tag=self.diag_tag)
+                if self._bait_tries[key] >= self._BAIT_TRIES:
+                    self._bait_queue.pop(0)
+                    self._bait_tries.pop(key, None)
+                    self._log(f"{item_display_name(filename)} did not go on the rod — keeping it")
+                return None
+            finally:
+                if page != self._current_inv_page or home != self._current_inv_page:
+                    self._return_from_bait_page(page, home)
+        return None
+
+    def _return_from_bait_page(self, shown: int, home: int) -> None:
+        """After using a bait fish on page ``shown``: back to page ``home``
+        (which is ``shown`` itself when a slot was freed on an earlier page
+        than the one watched; that page is then read again)."""
+        if home == shown:
+            self._current_inv_page = home
+            self._rescan_inventory_state()
+            return
+        page_pos = self.config.get(f'inv_page_{home + 1}_pos')
+        if not page_pos or not self._goto_page(page_pos):
+            # The page shown is not the one watched: read from the start
+            diag.log("DECISION", "could not go back after using a bait fish: full rescan", tag=self.diag_tag)
+            self._was_paused = self._full_rescan_wanted = True
+
     def bait_and_cast(self) -> bool:
         """Selects bait and casts fishing line in a single lock acquisition.
         Returns False when no cast was sent: the window could not be focused,
@@ -2478,6 +3913,12 @@ class FishingBot:
         self._cast_error = None
         if not self.keyboard_controller:
             self._cast_error = "no keyboard input is available"
+            return False
+
+        # A bait fish set to "use" goes on the rod instead of the bait key
+        fish_bait = self._use_fish_bait() if self._bait_queue else None
+        self._fish_bait_cast = fish_bait is not None
+        if not self.running:
             return False
 
         bait_key = self.get_bait_key(self.bait_counter)
@@ -2500,11 +3941,11 @@ class FishingBot:
                 self._verify_capture()
                 self.human.sleep(self._t_key_set)
 
-                self.human.tap_key(game_key(bait_key), hold=self._t_key_hold)
-                if self.on_status_update:
-                    self.on_status_update(f"[W{self.bot_id+1}] Pressed key {bait_key}")
-
-                self.human.sleep(self._t_interkey)
+                if fish_bait is None:
+                    self.human.tap_key(game_key(bait_key), hold=self._t_key_hold)
+                    if self.on_status_update:
+                        self.on_status_update(f"[W{self.bot_id+1}] Pressed key {bait_key}")
+                    self.human.sleep(self._t_interkey)
 
                 self.human.tap_key(game_key(self.config.get('cast_key', 'space')), hold=self._t_key_hold)
                 if self.on_status_update:
@@ -2529,7 +3970,36 @@ class FishingBot:
             if self.on_status_update:
                 self.on_status_update(f"[W{self.bot_id+1}] Quick skip (Horse mode - CTRL+G)...")
             mount_key = self.config.get('mount_key', 'g')
-            if not self.press_ctrl_key(mount_key):
+            # Both presses in one lock hold. Let go in between, another
+            # window took the focus there in 8 of 40 quick skips (two
+            # clients, diag 20261121_110550), and every switch away and back
+            # costs about 0.23 s of key settling, more than the 0.1 s pause.
+            second = False
+            with input_lock:
+                first = self.press_ctrl_key(mount_key)
+                if first:
+                    # From here the character may end up mounted
+                    self._quickskip_unchecked = True
+                    # The game must process the first CTRL+G. A fish click of
+                    # another window waiting meanwhile goes first (a fish
+                    # leaves the circle in a few tenths); the lock comes back
+                    # at click priority, so no cast or drop gets in before the
+                    # second press.
+                    pause_start = time.perf_counter()
+                    if input_lock.urgent_waiting():
+                        # Queued again at once, right behind the click
+                        with self._input_lock_released("quick skip: a fish click goes first",
+                                                       input_lock.URGENT):
+                            pass
+                    left = self._t_qs_between - (time.perf_counter() - pause_start)
+                    if left > 0:
+                        time.sleep(left)
+                    second = self.press_ctrl_key(mount_key)
+                    if not second and self.running:
+                        # Mounted by the first one: one more try to get off the horse.
+                        time.sleep(self._t_qs_between)
+                        second = self.press_ctrl_key(mount_key)
+            if not first:
                 # Nothing sent (window not in front, paused, stopped): no
                 # second Ctrl+G either — alone it would mount the character.
                 # The animation was not skipped, so it is waited out.
@@ -2538,12 +4008,6 @@ class FishingBot:
                 if self._wait_before_recast():
                     self._was_paused = True
                 return
-            time.sleep(self._t_qs_between)  # game must process the first CTRL+G
-            second = self.press_ctrl_key(mount_key)
-            if not second and self.running:
-                # Mounted by the first one: one more try to get off the horse.
-                time.sleep(self._t_qs_between)
-                second = self.press_ctrl_key(mount_key)
             if not second:
                 diag.log("DECISION", "quick skip: second CTRL+G not sent -> normal recast wait",
                          tag=self.diag_tag)
@@ -2781,6 +4245,7 @@ class FishingBot:
         self._diag_saved_calib = False
         prev_now = None
         with diag.loop("wait for minigame", tag=self.diag_tag, timeout=round(timeout, 2),
+                       columns=("elapsed", "calibrated", "pending", "scan", "panel", "partly"),
                        calibrated=self.region_auto_calibrated, region=self.region,
                        profile=self.detector.profile.name) as lp:
             while self.running:
@@ -2804,16 +4269,20 @@ class FishingBot:
                     return False
 
                 try:
-                    lp.frame(f"t={elapsed:.2f}s calibrated={self.region_auto_calibrated} "
-                             f"pending={self._pending_bounds}")
+                    lp.frame(elapsed=elapsed, calibrated=self.region_auto_calibrated,
+                             pending=self._pending_bounds is not None)
                     if not self.region_auto_calibrated:
                         lp.count("full_scans")
+                        lp.add(scan="full")
                         if self._try_calibrate(self.capture_full_window(), elapsed):
                             lp.set("result", f"found+calibrated after {elapsed:.2f}s")
                             return True
                     else:
                         frame = self.capture_screen()
                         window_active, _ = self.detector.detect_window_and_fish(frame)
+                        if lp.active:
+                            lp.add(scan="region", panel=window_active,
+                                   partly=window_active and self.detector.partly_visible)
                         if window_active:
                             if not self.detector.partly_visible:
                                 lp.set("result", f"panel open in region after {elapsed:.2f}s")
@@ -2831,6 +4300,7 @@ class FishingBot:
                                 # it may be another look whose colors overlap them.
                                 adapt = now - partial_since >= self._LOOK_CHANGE_CONFIRM
                                 lp.count("full_scans")
+                                lp.add(scan="full")
                                 if self._try_calibrate(self.capture_full_window(), elapsed, adapt):
                                     lp.set("result", f"re-found elsewhere after {elapsed:.2f}s")
                                     return True
@@ -2864,6 +4334,7 @@ class FishingBot:
                             if adapt:
                                 last_adapt = now
                             lp.count("full_scans")
+                            lp.add(scan="full")
                             if self._try_calibrate(self.capture_full_window(), elapsed, adapt):
                                 lp.set("result", f"found elsewhere after {elapsed:.2f}s")
                                 return True
@@ -2977,12 +4448,20 @@ class FishingBot:
             rw, rh = self.region.width, self.region.height
             return abs(b[2] - rw) <= rw * 0.15 and abs(b[3] - rh) <= rh * 0.15
 
-        if bounds is not None and not self.region_auto_calibrated and not self.detector.profile.learned:
+        if bounds is not None and not self.region_auto_calibrated:
+            # Learned looks too: one learned from scenery (or saved from a
+            # bad session) matches the scene before the cast as well
             why = self._first_panel_doubt(frame, bounds, pixels)
             if why:
                 if diag.ENABLED:
                     diag.current_loop().count("rejected_first_calibration")
                     diag.trace("DECISION", f"panel candidate {bounds} rejected: {why}", tag=self.diag_tag)
+                if self.detector.profile.learned:
+                    # Its colors are the scene's: forget it (also the saved
+                    # copy) and look with the stock colors again
+                    self._discard_learned_profile(f"matched scenery, not the minigame ({why})")
+                    self._pending_bounds = None
+                    return False
                 bounds, pixels = None, 0
 
         if not fits(bounds):
@@ -2995,6 +4474,15 @@ class FishingBot:
             adapt = elapsed >= self._ADAPTIVE_AFTER
         if bounds is None and self._adaptive and adapt:
             bounds, profile, pixels = self._find_with_other_profiles(frame, fits)
+            if bounds is not None and profile is not None and not self.region_auto_calibrated:
+                # Another look (a saved one included) passes the same checks
+                # as a first sighting with the stock look
+                why = self._first_panel_doubt(frame, bounds, pixels, FishDetector(profile))
+                if why:
+                    if diag.ENABLED:
+                        diag.current_loop().count("rejected_first_calibration")
+                    self._forget_look(profile, f"matched scenery, not the minigame ({why})")
+                    bounds, profile, pixels = None, None, 0
 
         if bounds is None:
             if self._pending_bounds is not None and diag.ENABLED:
@@ -3059,11 +4547,12 @@ class FishingBot:
             diag.first("minigame_calibrated", frame, tag=self.diag_tag, note=f"region {self.region}")
         return True
 
-    def _first_panel_doubt(self, frame: np.ndarray, bounds, pixels: int) -> Optional[str]:
-        """Why a first sighting with the stock colors is not the panel (None
-        when it may be). The stock colors also match scenery: a candidate
-        must have a panel's size, and must not have been there before the
-        cast (the minigame opens after it)."""
+    def _first_panel_doubt(self, frame: np.ndarray, bounds, pixels: int,
+                           detector: Optional[FishDetector] = None) -> Optional[str]:
+        """Why a first sighting is not the panel (None when it may be). Panel
+        colors also match scenery: a candidate must have a panel's size, and
+        must not have been there before the cast (the minigame opens after
+        it). For the stock colors and learned ones alike."""
         x, y, w, h = bounds
         fh, fw = frame.shape[:2]
         min_w, min_h = self._PANEL_MIN_SIZE
@@ -3074,11 +4563,59 @@ class FishingBot:
         ref = self._reference_frame
         if ref is None or ref.shape[:2] != frame.shape[:2] or not frame_usable(ref):
             return None
-        before = self.detector.panel_pixels(ref[y:y + h, x:x + w])
+        before = (detector or self.detector).panel_pixels(ref[y:y + h, x:x + w])
         if pixels > 0 and before >= pixels * 0.5:
             return (f"already there before the cast ({before} of {pixels} panel-colored pixels): "
                     f"scenery, not the minigame")
         return None
+
+    def _known_panel_in(self, frame: Optional[np.ndarray]) -> Optional[Tuple[int, int, int, int]]:
+        """Bounds of a fishing panel in a full-window frame, by the stock
+        look or the active one when it was not learned. Learned looks are
+        left out: one learned from scenery would find it everywhere."""
+        if frame is None or not frame_usable(frame):
+            return None
+        profiles = [DetectionProfile()]
+        if not self.detector.profile.learned and self.detector.profile.name != profiles[0].name:
+            profiles.append(self.detector.profile)
+        for profile in profiles:
+            probe = FishDetector(profile)
+            bounds = probe.find_fishing_window_bounds(frame, observe_only=True)
+            if bounds:
+                x, y, w, h = bounds
+                if probe.panel_pixels(frame[y:y + h, x:x + w]) >= w * h * self._MIN_PANEL_FILL:
+                    return bounds
+        return None
+
+    _OPEN_GAME_LOOK_GAP = 0.4     # s between the two looks at a panel seen at the start
+    _OPEN_GAME_MIN_CHANGE = 20    # changed pixels in it that make it a running game
+
+    def _game_running_at_start(self) -> Optional[Tuple[int, int, int, int]]:
+        """Bounds of a minigame that is running when the bot starts, or None.
+        A running game changes within a few tenths (the fish swims, the timer
+        drains); something in the scenery in the panel's colors does not."""
+        first = self.capture_full_window()
+        bounds = self._known_panel_in(first)
+        if bounds is None:
+            return None
+        if not self._sleep_interruptible(self._OPEN_GAME_LOOK_GAP):
+            return None
+        second = self.capture_full_window()
+        again = self._known_panel_in(second)
+        if again is None or max(abs(a - b) for a, b in zip(bounds, again)) > 10:
+            diag.log("DECISION", f"panel look at {bounds} at the start, gone or moved 0.4 s later ({again}): "
+                                 f"no game running", tag=self.diag_tag)
+            return None
+        x, y, w, h = bounds
+        a, b = first[y:y + h, x:x + w], second[y:y + h, x:x + w]
+        if a.shape != b.shape or a.size == 0:
+            return None
+        changed = cv2.countNonZero(cv2.compare(abs_diff_max(a, b), 25, cv2.CMP_GT))
+        running = changed >= self._OPEN_GAME_MIN_CHANGE
+        diag.log("DECISION", f"panel look at {bounds} at the start: {changed} px changed in "
+                             f"{self._OPEN_GAME_LOOK_GAP:.1f} s -> "
+                             f"{'a running game' if running else 'still, scenery'}", tag=self.diag_tag)
+        return bounds if running else None
 
     def _find_with_other_profiles(self, frame: np.ndarray, fits=None):
         """Returns (bounds, profile, pixel_count) from a profile other than the
@@ -3109,6 +4646,14 @@ class FishingBot:
                     and probe._last_bounds_pixels >= bounds[2] * bounds[3] * self._MIN_PANEL_FILL):
                 return bounds, candidate, probe._last_bounds_pixels
 
+        before = self._known_panel_in(self._reference_frame)
+        if before is not None and self._known_panel_in(frame) is None:
+            # A panel open before the cast and gone now: what changed is it
+            # closing, not a new one opening. Nothing to learn from that.
+            # (Still there now: scenery in the panel's colors.)
+            diag.log("DECISION", f"not learning a panel look: a minigame panel {before} was open in the "
+                                 f"frame before the cast and has closed", tag=self.diag_tag)
+            return None, None, 0
         learned = self._window_learner.learn(self._reference_frame, frame)
         if diag.ENABLED:
             diag.trace("ANALYSIS", f"panel learned from the pre-cast frame: "
@@ -3144,6 +4689,25 @@ class FishingBot:
             except Exception as e:
                 diag.exc(tag=self.diag_tag)
                 self._log(f"Could not save learned profile: {e}")
+
+    def _forget_look(self, profile: DetectionProfile, why: str) -> None:
+        """Drops a look that is not the minigame's from the ones tried, and
+        from the settings when it is the saved one."""
+        with FishingBot._profile_lock:
+            if FishingBot._shared_learned_profile is profile:
+                FishingBot._shared_learned_profile = None
+            FishingBot._known_profiles = [k for k in FishingBot._known_profiles
+                                          if k is not profile and k.to_dict() != profile.to_dict()]
+        saved = self.config.get('detection_profile')
+        if saved and profile.learned and DetectionProfile.from_dict(saved).to_dict() == profile.to_dict():
+            self.config['detection_profile'] = None
+            if self.on_profile_learned:
+                try:
+                    self.on_profile_learned(None)
+                except Exception:
+                    diag.exc(tag=self.diag_tag)
+        diag.log("DECISION", f"look {profile.to_dict()} dropped: {why}", tag=self.diag_tag)
+        self._log(f"Saved minigame colors {why} — dropped")
 
     def _discard_learned_profile(self, why: str = "found no fish in 2 games"):
         """Drops a learned profile that does not work (bad calibration)."""
@@ -3208,7 +4772,8 @@ class FishingBot:
             self._stop_bot(
                 self.STOP_FISH_NOT_DETECTED,
                 f"[W{self.bot_id+1}] The minigame opened {self._no_fish_games} times but its fish was never "
-                f"seen: this client draws it differently. Turn on 'Adapt to re-skinned minigames'. "
+                f"seen: this client draws it differently (adapting to re-skinned minigames is off in the "
+                f"configuration file: set adaptive_detection to true). "
                 f"Stopping bot.")
             return False
         if not self._no_fish_warned:
@@ -3625,6 +5190,8 @@ class FishingBot:
         Pass 2: loop identify_item_in_inventory (which skips ignored) and call
                 _handle_item for each open/drop item until none remain.
         Finally rescans empty slots."""
+        # This page's bait fish are found (and queued) again below
+        self._bait_queue = [b for b in self._bait_queue if b[0] != self._current_inv_page]
         templates = self._load_template_cache()
         if not templates:
             diag.log("DECISION", "no item templates loaded: page processing (and its empty-slot scan) SKIPPED",
@@ -3745,9 +5312,14 @@ class FishingBot:
                 if best_filename in confusable_fish:
                     matched_filename = self._disambiguate_confusable_fish(
                         inventory_frame, cx, cy, best_filename)
+                # Living, dead or grilled: one of them may be kept, another dropped
+                matched_filename = self._resolve_fish_state(inventory_frame, cx, cy, matched_filename)
+                if matched_filename is None:
+                    continue   # not this fish in any state: no item the bot knows
                 diag.log("DECISION", f"slot ({cx},{cy}) {matched_filename}: "
-                                     f"{normalize_fish_action(fish_actions.get(matched_filename))}", tag=self.diag_tag)
-                if normalize_fish_action(fish_actions.get(matched_filename)) == 'keep':
+                                     f"{normalize_fish_action(fish_actions.get(matched_filename), matched_filename)}",
+                         tag=self.diag_tag)
+                if normalize_fish_action(fish_actions.get(matched_filename), matched_filename) == 'keep':
                     self._ignored_positions.add((cx, cy))
                     keep_count += 1
 
@@ -3763,7 +5335,7 @@ class FishingBot:
                 if not match:
                     break
                 filename, (inv_x, inv_y) = match
-                action = normalize_fish_action(fish_actions.get(filename))
+                action = normalize_fish_action(fish_actions.get(filename), filename)
                 if action == 'keep':
                     self._ignored_positions.add((inv_x, inv_y))
                     continue
@@ -3883,7 +5455,7 @@ class FishingBot:
 
         frame = None
         with diag.loop("wait for classic fish", tag=self.diag_tag, timeout=timeout,
-                       last_scale=last_scale) as lp:
+                       columns=("best", "scale", "scales", "accept"), last_scale=last_scale) as lp:
             while self.running and perf_counter() - start_time < timeout:
                 if self.paused:
                     # What happens while the player has the controls says
@@ -3945,8 +5517,8 @@ class FishingBot:
                             break
 
                     lp.score("best", best_match_val)
-                    lp.frame(f"classic fish best={best_match_val:.3f} at scale {best_scale} "
-                             f"of {len(scaled_templates)} scales (accept {ACCEPT_THRESHOLD})")
+                    lp.frame(best=best_match_val, scale=best_scale, scales=len(scaled_templates),
+                             accept=ACCEPT_THRESHOLD)
                     if best_match_val >= ACCEPT_THRESHOLD:  # Found the classic fish indicator
                         lp.set("result", f"found best={best_match_val:.3f} scale={best_scale}")
                         diag.first("classic_fish", frame, tag=self.diag_tag,
@@ -4070,9 +5642,8 @@ class FishingBot:
             classic = self.config.get('classic_fishing', False)
             hint = ("If the fish icon does appear: keep the game window uncovered and the camera as "
                     "usual." if classic else
-                    "If the minigame does open on screen: keep the game window uncovered, make sure "
-                    "'Adapt to re-skinned minigames' is on, or use Classic fishing if this server has "
-                    "no minigame.")
+                    "If the minigame does open on screen: keep the game window uncovered, or use "
+                    "Classic fishing if this server has no minigame.")
             self._stop_bot(
                 self.STOP_NO_BITE,
                 f"[W{self.bot_id+1}] {self.consecutive_failures} casts and no "
@@ -4100,10 +5671,20 @@ class FishingBot:
         game_start = perf_counter()
         self._fish_track.clear()
         self._game_fish_seen = False
+        self._ring_white_deep_last = None
+        self._ring_last_click = 0.0
+        self._ring_cleared = True
+        self._last_panel_frame = None
+        if self._ring_turns_red is not None and self.detector.profile is not self._ring_profile:
+            # Another look (re-learned profile): its ring has to prove itself again
+            self._ring_turns_red = None
+            self._ring_white_deep_total = 0.0
+        self._ring_profile = self.detector.profile
         relearned = False
         last_partial_check = 0.0
 
-        with diag.loop("minigame", tag=self.diag_tag, region=self.region, circle=self._circle_center,
+        with diag.loop("minigame", tag=self.diag_tag, columns=("panel", "fish_x", "fish_y", "dist", "action"),
+                       region=self.region, circle=self._circle_center,
                        radius=round(self._circle_radius_sq ** 0.5), profile=self.detector.profile.name,
                        human_like=human_like) as lp:
             while self.running:
@@ -4179,18 +5760,25 @@ class FishingBot:
 
                     self._game_end_time = perf_counter()
                     self.total_games += 1
-                    self.bait_counter -= 1
+                    if not self._fish_bait_cast:
+                        self.bait_counter -= 1   # a bait fish is not from the bait stack
 
                     lp.set("result", f"game over after {game_time:.2f}s, hits={game_hits}, "
                                      f"fish seen={self._game_fish_seen}")
                     self._log(f"Game finished. Total: {self.total_games}, Bait: {self.bait_counter}")
+                    if diag.ENABLED and self._last_panel_frame is not None:
+                        # The last open frame shows the hit counter (x/3) and
+                        # the timer: whether this game was won.
+                        diag.image("game_end_last_panel", self._last_panel_frame, tag=self.diag_tag,
+                                   note=f"clicks={game_hits} ring gate={self._ring_turns_red}")
                     if self.on_bait_update:
                         self.on_bait_update(self.bot_id, self.bait_counter)
                     if self.on_stats_update:
                         self.on_stats_update(self.bot_id, self.hits, self.total_games, self.bait_counter)
 
-                    # Handle caught item (if auto fish handling is enabled)
-                    self.handle_caught_item(may_have_catch=game_hits > 0)
+                    # The caught item is handled after the next cast, while
+                    # the character casts and waits for a bite (_defer_catch)
+                    self._defer_catch(may_have_catch=game_hits > 0)
                     break
 
                 gone_frames = 0
@@ -4269,9 +5857,26 @@ class FishingBot:
         if not overlap_ok:
             return
 
-        # Scan all inventory pages at startup, process open/drop items, then settle on
-        # the first page that still has empty slots.
-        self._startup_scan_and_process_all_pages()
+        # Started with the Golden Tuna dialog open: it hides the inventory
+        self._handle_quest_dialog()
+        if not self.running:
+            return
+
+        # Started with a minigame running (stopped or paused mid-game and
+        # started again): it is played first. The inventory scan would let
+        # its timer run out, and a cast over it does nothing (diag
+        # 20261121_122030).
+        open_at_start = self._game_running_at_start()
+        if open_at_start:
+            diag.log("DECISION", f"minigame already open at {open_at_start} at the start: playing it first, "
+                                 f"the inventory scan comes after it", tag=self.diag_tag)
+            self._log("Minigame already open — playing it first, then scanning the inventory")
+            self._line_out = True
+            self._startup_scan_after_game = True
+        else:
+            # Scan all inventory pages at startup, process open/drop items, then settle on
+            # the first page that still has empty slots.
+            self._startup_scan_and_process_all_pages()
 
         # A pause during the startup scan needs no re-read afterwards; a scan
         # that could not settle on its page does (see _full_rescan_wanted).
@@ -4292,15 +5897,45 @@ class FishingBot:
                 self._diag_paused = False
                 diag.log("STATE", "resumed", tag=self.diag_tag)
 
+            if self._startup_scan_after_game and not self._line_out:
+                # The game open at the start is over (or was gone before the
+                # first look): the scan it postponed. Done as after a pause,
+                # which also waits for that game's catch to land.
+                self._startup_scan_after_game = False
+                self._was_paused = self._full_rescan_wanted = True
+
             if self._was_paused:
                 self._was_paused = False
+                # The resume reads the page again and handles what is on it.
+                # A catch from just before the pause may still be on its
+                # way: the page is read once it can have landed.
+                if self._pending_catch is not None and self._game_end_time is not None:
+                    landed_by = self._game_end_time + self._t_catch_wait + self._CATCH_EXTRA_WAIT
+                    if time.perf_counter() < landed_by:
+                        diag.log("DECISION", "resume right after a game: waiting for its catch to land before "
+                                             "the page is read", tag=self.diag_tag)
+                        if not self._sleep_interruptible(landed_by - time.perf_counter()):
+                            break
+                self._pending_catch = None
+                self._pending_catch_end = None
+                self._late_watch = None
+                self._page_switch_wanted = False
+                self._postponed_items = []
                 self._last_cast_wait = None
                 self._game_end_time = None
                 self._mount_toggled = False   # the player had the controls: mount state unknown
+                self._quickskip_unchecked = False
+                # A Golden Tuna dialog left open hides the inventory the
+                # resume is about to read
+                self._handle_quest_dialog()
+                if not self.running:
+                    break
                 if self._full_rescan_wanted:
                     self._full_rescan_wanted = False
                     self._log("Re-scanning inventory...")
                     self._startup_scan_and_process_all_pages()
+                elif self._startup_scan_after_game:
+                    pass   # the game open at the start is still out: the scan comes after it
                 else:
                     self._log("Resumed — re-reading the current inventory page...")
                     self._resume_inventory_check()
@@ -4321,16 +5956,42 @@ class FishingBot:
                         self._sleep_interruptible(0.25)
                         continue
 
+                if not classic:
+                    self._before_cast()
+                    if not self.running:
+                        break
+
                 # Self-calibration needs to know what the window looked like
-                # before the minigame opened: one full grab per cast.
-                if not classic and self._adaptive:
-                    self._reference_frame = self.capture_full_window()
+                # before the minigame opened: one full grab per cast. It also
+                # shows a minigame that is already open (the bite came while
+                # paused): that one is played, not cast over.
+                already_open = None
+                if not classic:
+                    before_cast = self.capture_full_window()
+                    # Never cast into the Golden Tuna dialog: the keys do
+                    # nothing there and the cast would count as a miss
+                    if self._handle_quest_dialog(before_cast):
+                        continue
+                    # Only with a cast still out: a panel-colored thing in the
+                    # scenery would otherwise stop every cast
+                    already_open = self._known_panel_in(before_cast) if self._line_out else None
+                    self._reference_frame = None if already_open or not self._adaptive else before_cast
+                    if already_open:
+                        diag.log("DECISION", f"minigame already open at {already_open} before the cast: "
+                                             f"playing it instead of casting", tag=self.diag_tag)
+                        self._log("Minigame already open — playing it")
+                elif self._quest_dialog_watch() and self._handle_quest_dialog():
+                    continue
                 if diag.ENABLED:
+                    diag.tally("casts", tag=self.diag_tag)
                     diag.log("DECISION", f"--- cast #{self.total_games + 1}: bait {self.bait_counter}, "
                                          f"failures {self.consecutive_failures}, classic={classic}, "
                                          f"bite timeout {self._bite_timeout():.1f}s ---", tag=self.diag_tag)
 
-                if self.bait_and_cast() is False:
+                cast_sent = None if already_open else self.bait_and_cast()
+                if cast_sent:
+                    self._line_out = True
+                if not already_open and cast_sent is False:
                     # Nothing was sent (the window could not be brought to the
                     # front, or the keys could not be sent): not a cast, so not
                     # a missed bite either.
@@ -4362,6 +6023,8 @@ class FishingBot:
                 self._cast_errors = 0
                 cast_time = time.perf_counter()
                 cast_wait, self._last_cast_wait = self._last_cast_wait, None
+                if already_open:
+                    cast_wait = None      # no cast: nothing to learn about the recast wait
                 if (cast_wait is not None and self._game_end_time is not None
                         and cast_time - self._game_end_time > cast_wait + self._RECAST_SLACK):
                     # Cast much later than planned (item handling, another
@@ -4370,14 +6033,65 @@ class FishingBot:
                     cast_wait = None
 
                 if not classic:
-                    minigame_detected = self.wait_for_minigame_window(timeout=self._bite_timeout())
+                    # The last catch: while the character casts and waits
+                    # (not with a minigame already running)
+                    self._cast_time = cast_time
+                    # The last catch was handled before the cast (_before_cast);
+                    # only the wait for a late item is left, screen only
+                    handling = 0.0 if already_open else self._watch_late_catch(in_cast_window=True)
+                    watching_from = time.perf_counter() - cast_time
+                    if not self.running:
+                        break
+                    if handling > self._DEFERRED_HANDLING_SLOW:
+                        cast_wait = None
+                    bite_timeout = max(0.5, self._bite_timeout() - (time.perf_counter() - cast_time))
+                    minigame_detected = self.wait_for_minigame_window(timeout=bite_timeout)
                     if not self.running:
                         break
                     if self._wait_interrupted:
-                        continue   # paused: handled at the top of the loop
+                        continue   # paused: handled at the top of the loop (the line stays out)
+                    self._line_out = False
                     if not minigame_detected:
+                        if self._handle_quest_dialog():
+                            # It opened while the bot waited (or hid the
+                            # panel): not a missed bite
+                            continue
+                        horse_skip = (self.config.get('quick_skip', False)
+                                      and self.config.get('quick_skip_mode', 'horse') == 'horse')
+                        mount_key = self.config.get('mount_key', 'g')
+                        if horse_skip and self._mount_toggled:
+                            # The CTRL+G after the last miss may have mounted
+                            # the character (it toggles): this miss may be the
+                            # bot's own doing and is not counted. CTRL+G again
+                            # restores the state before that toggle.
+                            self._mount_toggled = False
+                            diag.log("DECISION", "miss right after the bot's own CTRL+G: not counted, "
+                                                 "toggling the mount back", tag=self.diag_tag)
+                            self._log("No minigame after CTRL+G — pressing CTRL+G again (miss not counted)")
+                            self.press_ctrl_key(mount_key)
+                            self._sleep_interruptible(self._MOUNT_SETTLE)
+                            continue
                         if not self._on_missed_bite(cast_wait, self._MAX_BITE_FAILURES, "Minigame not detected"):
                             break
+                        if horse_skip and self._quickskip_unchecked:
+                            # The quick skip's second CTRL+G can be lost when
+                            # the game mounts late (seen in a recording: the
+                            # mount came 250 ms after the first CTRL+G, the
+                            # second was sent at 130 ms). On the horse no cast
+                            # works, and five misses wrote off bait that was
+                            # still there. CTRL+G dismounts then; on foot it
+                            # mounts, and the next miss is handled above.
+                            # Only right after a quick skip: with none since
+                            # the last minigame (first cast, after a pause)
+                            # the bot did not mount the character, and the
+                            # toggle would (diag 20261121_122030).
+                            self._quickskip_unchecked = False
+                            self._log("No minigame — pressing CTRL+G in case the character is still on the horse")
+                            self._mount_toggled = self.press_ctrl_key(mount_key)
+                            self._sleep_interruptible(self._MOUNT_SETTLE)
+                        elif horse_skip:
+                            diag.log("DECISION", "miss without a quick skip before it: no recovery CTRL+G "
+                                                 "(the bot did not mount the character)", tag=self.diag_tag)
                         if (self.consecutive_failures >= 2 and self._adaptive
                                 and self.region_auto_calibrated):
                             # Misses in a row: maybe the panel is not what it
@@ -4389,9 +6103,19 @@ class FishingBot:
 
                     # Reset failure counter on successful minigame detection
                     self.consecutive_failures = 0
+                    self._mount_toggled = False   # a cast worked: on foot now
+                    self._quickskip_unchecked = False
                     self._minigame_ever_seen = self._bite_ever_seen = True
                     self._report_cast(cast_wait, True)
-                    self._longest_bite = max(self._longest_bite, time.perf_counter() - cast_time)
+                    bite = time.perf_counter() - cast_time
+                    self._longest_bite = max(self._longest_bite, bite)
+                    if bite > watching_from + 0.15:
+                        # Seen opening (not already open when the handling
+                        # ended): how soon a bite can come
+                        self._bite_delays.append(bite)
+                    # Nothing lands in the inventory during the game: the
+                    # strip before the catch
+                    self._catch_baseline = self.capture_inventory_area()
 
                     stuck, game_hits = self._play_minigame()
                     self.hits = 0
@@ -4416,6 +6140,8 @@ class FishingBot:
                         continue   # paused: handled at the top of the loop
 
                     if not fish_found:
+                        if self._handle_quest_dialog():
+                            continue
                         mount_key = self.config.get('mount_key', 'g')
                         if self._mount_toggled:
                             # The CTRL+G after the last miss may have *mounted* the
@@ -4473,7 +6199,8 @@ class FishingBot:
                     time.sleep(0.05)
 
                     self.total_games += 1
-                    self.bait_counter -= 1
+                    if not self._fish_bait_cast:
+                        self.bait_counter -= 1
                     self._log(f"Classic catch! Total: {self.total_games}, Bait: {self.bait_counter}")
                     if self.on_bait_update:
                         self.on_bait_update(self.bot_id, self.bait_counter)
@@ -4491,8 +6218,17 @@ class FishingBot:
                     if classic and not self._sleep_interruptible(0.5):
                         break
                     self.quickskip()
-                elif self._wait_before_recast():
-                    self._was_paused = True
+                else:
+                    if not classic and not self._startup_scan_after_game:
+                        # The recast wait counts from the game end: the
+                        # catch is handled within it, not on top of it.
+                        # (After the game open at the start, the postponed
+                        # startup scan handles it.)
+                        self._handle_pending_catch()
+                        if not self.running:
+                            continue
+                    if self._wait_before_recast():
+                        self._was_paused = True
 
             except Exception as e:
                 diag.exc("play_game loop", tag=self.diag_tag)
@@ -4509,6 +6245,17 @@ class FishingBot:
                         f"{self._LOOP_ERROR_WINDOW:.0f} s (last: {e}). Stopping bot.")
                     break
                 time.sleep(0.5)
+
+        self._settle_held_item()
+        if ((self._pending_catch is not None or self._postponed_items or self._late_watch is not None)
+                and self.running and not self._manually_stopped):
+            # The bait ran out: no next cast to handle the last catch after
+            self._watch_late_catch(in_cast_window=False)
+            self._handle_pending_catch()
+        self._pending_catch = None
+        self._pending_catch_end = None
+        self._late_watch = None
+        self._postponed_items = []
 
         if self.stop_reason is None:
             if self._manually_stopped:
@@ -4561,6 +6308,8 @@ class FishingBot:
                 "quick_skip": cfg.get("quick_skip", False),
                 "quick_skip_mode": cfg.get("quick_skip_mode", "horse"),
                 "auto_fish_handling": cfg.get("auto_fish_handling", False),
+                "golden_tuna": self._quest_dialog_watch(),
+                "golden_tuna_choice": self.TUNA_CHOICES[self._tuna_choice()],
                 "human_like_clicking": self.human.enabled,
                 "fish_actions": cfg.get("fish_actions", {}),
                 "timings": timings,
@@ -4640,6 +6389,16 @@ diag.trace_class(FishingBot, exclude=(
     "_stop_if_window_unavailable", "_fish_velocity", "_diag_empty_slot_scores", "_diag_negative",
     "_diag_capture", "_diag_bot_header", "_diag_startup_images", "_identify_item",
     "_inventory_rect", "_inventory_origin",
+    # Captures: _diag_capture writes one CAPTURE line for each.
+    "capture_screen", "capture_window_region", "capture_inventory_area", "capture_full_window",
+    "_note_frame",
+    # Getters and loaders whose result the next DECISION / ANALYSIS line states,
+    # and _focus (the FOCUS lines say what happened).
+    "_focus", "_wait_while_paused", "_load_template_cache", "_load_empty_slot_template",
+    "_load_color_template_cache", "_load_timings", "_bite_timeout", "get_bait_key",
+    "get_tier_thresholds", "_slot_reading_order", "_icon_color", "_slot_patch", "_cursor_settle",
+    # One ANALYSIS line states each result (called per template candidate)
+    "_state_feature", "_load_fish_states", "_resolve_fish_state",
 ))
 
 

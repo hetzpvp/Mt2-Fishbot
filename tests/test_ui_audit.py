@@ -141,7 +141,7 @@ class ProfileLoadTests(GuiFixture):
         self._diag_enabled = diag.ENABLED
 
     def tearDown(self):
-        diag.configure(self._diag_enabled, False)
+        diag.configure(self._diag_enabled)
         super().tearDown()
 
     def test_profile_applies_its_activity_and_diagnostics(self):

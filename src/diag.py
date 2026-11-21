@@ -6,7 +6,11 @@ problem cannot be reproduced they switch "Diagnostic log" on (Settings tab),
 reproduce it and send the zip this module leaves next to the program:
 
     <exe folder>/diagnostics/<YYYYMMDD_HHMMSS>.zip
+        <YYYYMMDD_HHMMSS>/summary.txt          read first: per-window totals, loop
+                                               statistics, index of images /
+                                               exceptions / stops with log line numbers
         <YYYYMMDD_HHMMSS>/session.log          everything, in order
+        <YYYYMMDD_HHMMSS>/frames_<loop>.csv    one row per frame of each per-frame loop
         <YYYYMMDD_HHMMSS>/bot_config.json      the config file as it was on disk
         <YYYYMMDD_HHMMSS>/config_effective.json what each bot actually used
         <YYYYMMDD_HHMMSS>/NNNN_W1_<label>.png  frames that were analysed
@@ -19,16 +23,22 @@ Categories: SESSION, CONFIG, GUI, ACTION (input sent), FOCUS, CAPTURE,
 ANALYSIS (what a detector measured), DECISION (what the bot does next),
 STATE, STAT (status/stats callbacks the GUI gets), CALL (function entry /
 exit, from ``traced``), LOOP (per-wait / per-game summaries), IMAGE, EXC,
-DIAG (the logger itself).
+DETAIL (markers around recent per-frame detail), DIAG (the logger itself).
 
 Cost when switched off: callers test the module flag ``diag.ENABLED`` before
 building a message, an image or a summary; traced functions add one global
 lookup. A failure inside this module never reaches the bot: it is swallowed
 and counted (reported in the session footer).
 
-Per-frame loops (minigame, waits) wrap their body in ``diag.loop(...)``:
-inside it only state changes, actions and anomalies are written and the loop
-writes one summary at the end; with VERBOSE every frame is written too.
+Per-frame loops (minigame, waits) wrap their body in ``diag.loop(...)``.
+Inside one, session.log only gets state changes, actions and decisions, and
+the loop writes one LOOP line when it ends (a start line too, but only once
+something inside it was written). What each frame measured goes to
+frames_<loop>.csv (``Loop.frame(**fields)``). The per-frame detail lines
+(``trace()``, function calls, frame rows) are kept in a per-thread ring of
+the last RECENT_SECONDS and written out, marked "»", only when something
+goes wrong: before an image is saved, an exception is logged or a bot stops
+(``dump_recent``). Outside loops detail is written as it happens.
 """
 
 from __future__ import annotations
@@ -38,6 +48,7 @@ import functools
 import json
 import os
 import platform
+import random
 import re
 import shutil
 import sys
@@ -51,7 +62,6 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 # ---------------------------------------------------------------- switches
 
 ENABLED = False   # "Diagnostic log" is on: events are recorded
-VERBOSE = False   # also every frame of per-frame loops
 
 LOG_NAME = "session.log"
 DIR_NAME = "diagnostics"
@@ -62,7 +72,15 @@ MAX_IMAGES = 400                       # per session
 MAX_IMAGE_BYTES = 300 * 1024 * 1024    # per session
 MAX_IMAGES_PER_LABEL = 25              # one label repeating cannot eat the budget
 MAX_LOG_BYTES = 400 * 1024 * 1024      # after this only non-frame lines; at 2x nothing
+MAX_FRAME_BYTES = 150 * 1024 * 1024    # frames_*.csv together; rows past it are counted only
+RECENT_SECONDS = 3.0                   # per-frame detail kept for dump_recent()
+RECENT_MAX_LINES = 600                 # per thread
+MAX_RECENT_DUMPS = 300                 # per session
+MAX_EVENTS_PER_KIND = 60               # summary.txt index; later ones are counted
+MAX_SAMPLES = 20000                    # per statistic (reservoir) for percentiles
+SUMMARY_NAME = "summary.txt"
 _FSYNC_EVERY = 2.0                     # seconds between fsyncs of the log
+_CSV_FLUSH_EVERY = 1.0                 # seconds between flushes of the frame tables
 
 _STAMP_RE = re.compile(r"^(\d{8}_\d{6}(?:_\d+)?)(\.zip)?$")
 
@@ -95,8 +113,12 @@ def failures() -> int:
 def program_dir() -> str:
     """Folder of the program that is running: the folder of the .exe when
     frozen (not the temporary bundle folder, not the working directory),
-    the project root when run from source."""
+    the project root when run from source. A disguised copy (disguise.py)
+    runs from a temporary folder and is told the real one in FISHBOT_HOME."""
     if getattr(sys, "frozen", False):
+        home = os.environ.get("FISHBOT_HOME")
+        if home and os.path.isdir(home):
+            return home
         return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -184,8 +206,9 @@ def in_loop() -> bool:
 
 
 def detail_on() -> bool:
-    """Whether per-frame detail is written right now (outside a loop, or VERBOSE)."""
-    return ENABLED and (VERBOSE or getattr(_tls, "loop", 0) == 0)
+    """Whether detail goes straight into session.log right now (outside a
+    per-frame loop; inside one it goes to the recent-detail ring)."""
+    return ENABLED and getattr(_tls, "loop", 0) == 0
 
 
 # ---------------------------------------------------------------- writing
@@ -197,6 +220,7 @@ class _Session:
         self.log_path = os.path.join(folder, LOG_NAME)
         self.file = open(self.log_path, "a", encoding="utf-8", newline="\n")
         self.bytes = 0
+        self.lines = 0                 # lines in session.log (summary.txt points at them)
         self.last_fsync = time.monotonic()
         self.images = 0
         self.image_bytes = 0
@@ -209,11 +233,26 @@ class _Session:
         self.ending = False
         self.dropped = 0
         self.writing_images = 0
+        # summary.txt
+        self.events: List[Tuple[int, float, str, str, str]] = []   # (line, time, tag, kind, text)
+        self.event_counts: Dict[str, int] = {}
+        self.tallies: Dict[str, Dict[str, int]] = {}                 # tag -> key -> n
+        self.samples: Dict[Tuple[str, str], List[Any]] = {}          # (tag, key) -> [values, seen]
+        self.loop_stats: Dict[Tuple[str, str], Dict[str, Any]] = {}  # (tag, loop name) -> stats
+        self.loop_seq = 0
+        self.dumps = 0
+        # frames_<loop>.csv
+        self.tables: Dict[str, Tuple[Any, List[str]]] = {}           # loop name -> (file, columns)
+        self.frame_bytes = 0
+        self.frame_rows = 0
+        self.frame_rows_dropped = 0
+        self.last_table_flush = time.monotonic()
 
-    def write(self, line: str, frame_level: bool) -> None:
+    def write(self, line: str, frame_level: bool) -> int:
+        """Writes one line; returns its line number (0 when it was dropped)."""
         if self.closed:
             _pre_buffer.append(line)
-            return
+            return 0
         if self.bytes > MAX_LOG_BYTES and (frame_level or self.bytes > 2 * MAX_LOG_BYTES):
             self.dropped += 1
             if "logcap" not in self.cap_logged:
@@ -221,10 +260,13 @@ class _Session:
                 note = (f"{_now()} [DIAG] DIAG     diag.py | log size cap ({MAX_LOG_BYTES >> 20} MB) "
                         f"reached: per-frame lines are dropped from here on\n")
                 self.file.write(note)
-            return
+                self.lines += 1
+            return 0
         self.file.write(line + "\n")
         self.file.flush()
         self.bytes += len(line) + 1
+        number = self.lines + 1
+        self.lines += 1 + line.count("\n")
         now = time.monotonic()
         if now - self.last_fsync >= _FSYNC_EVERY:
             self.last_fsync = now
@@ -232,11 +274,47 @@ class _Session:
                 os.fsync(self.file.fileno())
             except Exception:
                 pass
+        return number
+
+    def add_event(self, number: int, t: float, tag: str, kind: str, text: str) -> None:
+        n = self.event_counts.get(kind, 0) + 1
+        self.event_counts[kind] = n
+        if n <= MAX_EVENTS_PER_KIND:
+            first = text.split("\n", 1)[0]
+            self.events.append((number, t, tag, kind, first if len(first) <= 200 else first[:200] + "…"))
+
+    def table(self, name: str, columns: List[str]):
+        """(file, columns) of frames_<name>.csv, created with its header."""
+        entry = self.tables.get(name)
+        if entry is None:
+            path = os.path.join(self.folder, f"frames_{_safe_name(name.replace(' ', '_'))}.csv")
+            f = open(path, "a", encoding="utf-8", newline="\n")
+            header = ",".join(_FRAME_HEAD + list(columns) + ["extra", "note"])
+            f.write(header + "\n")
+            self.frame_bytes += len(header) + 1
+            entry = self.tables[name] = (f, list(columns))
+        return entry
+
+    def flush_tables(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self.last_table_flush < _CSV_FLUSH_EVERY:
+            return
+        self.last_table_flush = now
+        for f, _cols in self.tables.values():
+            try:
+                f.flush()
+            except Exception:
+                pass
 
     def close(self) -> None:
         if self.closed:
             return
         self.closed = True
+        for f, _cols in self.tables.values():
+            try:
+                f.close()
+            except Exception:
+                pass
         try:
             self.file.flush()
             os.fsync(self.file.fileno())
@@ -248,21 +326,41 @@ class _Session:
             pass
 
 
-def _now() -> str:
-    t = time.time()
+_FRAME_HEAD = ["time", "t", "tag", "loop", "frame", "dt_ms"]
+
+
+def _clock(t: float) -> str:
     return time.strftime("%H:%M:%S", time.localtime(t)) + f".{int((t % 1) * 1000):03d}"
 
 
-def _write(cat: str, msg: str, tag: Optional[str], src: str, frame_level: bool = False) -> None:
-    line = f"{_now()} [{tag or thread_tag()}] {cat:<8} {src} | {_indent()}{msg}"
-    if "\n" in line:
-        line = line.replace("\n", "\n    ")
+def _now() -> str:
+    return _clock(time.time())
+
+
+def _fmt(t: float, tag: str, cat: str, src: str, msg: str) -> str:
+    line = f"{_clock(t)} [{tag}] {cat:<8} {src} | {msg}"
+    return line.replace("\n", "\n    ") if "\n" in line else line
+
+
+def _write(cat: str, msg: str, tag: Optional[str], src: str, frame_level: bool = False,
+           event: Optional[str] = None, t: Optional[float] = None, indent: Optional[str] = None) -> int:
+    """Writes one line to the session (or the pre-session buffer). Returns
+    its line number in session.log (0: buffered or dropped). ``event``
+    also lists it in summary.txt under that kind."""
+    if getattr(_tls, "pending", 0):
+        _flush_pending_loops()
+    t = time.time() if t is None else t
+    tag = tag or thread_tag()
+    line = _fmt(t, tag, cat, src, (_indent() if indent is None else indent) + msg)
     with _lock:
         s = _session
-        if s is not None:
-            s.write(line, frame_level)
-        else:
+        if s is None:
             _pre_buffer.append(line)
+            return 0
+        number = s.write(line, frame_level)
+        if event and number:
+            s.add_event(number, t, tag, event, msg)
+        return number
 
 
 def log(cat: str, msg: str, *, tag: Optional[str] = None, depth: int = 0) -> None:
@@ -277,27 +375,133 @@ def log(cat: str, msg: str, *, tag: Optional[str] = None, depth: int = 0) -> Non
 
 
 def trace(cat: str, msg: str, *, tag: Optional[str] = None, depth: int = 0) -> None:
-    """Per-frame detail: written outside loops, inside them only with VERBOSE."""
-    if not ENABLED or (not VERBOSE and getattr(_tls, "loop", 0)):
+    """Per-frame detail: written outside loops; inside them kept in the
+    recent-detail ring (see dump_recent)."""
+    if not ENABLED:
         return
     try:
-        _write(cat, msg, tag, _src(depth + 1), frame_level=True)
+        if getattr(_tls, "loop", 0):
+            _ring_add(cat, msg, tag, _src(depth + 1))
+        else:
+            _write(cat, msg, tag, _src(depth + 1), frame_level=True)
+    except Exception:
+        _fail()
+
+
+def event(cat: str, msg: str, *, kind: str, tag: Optional[str] = None, recent: bool = False,
+          depth: int = 0) -> None:
+    """A line that is also listed in summary.txt (stops, failures). With
+    ``recent`` the per-frame detail of the last seconds is written first."""
+    if not ENABLED:
+        return
+    try:
+        if recent:
+            dump_recent(kind, tag=tag, depth=depth + 1)
+        _write(cat, msg, tag, _src(depth + 1), event=kind)
     except Exception:
         _fail()
 
 
 def exc(msg: str = "exception caught", *, tag: Optional[str] = None, depth: int = 0) -> None:
     """Call inside an ``except`` block: logs the exception being handled,
-    with its full traceback, at the place it was caught."""
+    with its full traceback, at the place it was caught (after the recent
+    per-frame detail that led to it)."""
     if not ENABLED:
         return
     try:
         et, ev, tb = sys.exc_info()
         text = "".join(traceback.format_exception(et, ev, tb)).rstrip() if et else "(no active exception)"
-        _write("EXC", f"{msg}: {et.__name__ if et else ''}: {ev}\n{text}", tag, _src(depth + 1))
+        dump_recent(f"exception: {msg}", tag=tag, depth=depth + 1)
+        _write("EXC", f"{msg}: {et.__name__ if et else ''}: {ev}\n{text}", tag, _src(depth + 1),
+               event="exception")
     except Exception:
         _fail()
 
+
+def tally(key: str, n: int = 1, *, tag: Optional[str] = None) -> None:
+    """Counts ``key`` for this window in summary.txt (games, catches, ...)."""
+    if not ENABLED:
+        return
+    try:
+        with _lock:
+            s = _session
+            if s is None:
+                return
+            d = s.tallies.setdefault(tag or thread_tag(), {})
+            d[key] = d.get(key, 0) + n
+    except Exception:
+        _fail()
+
+
+def sample(key: str, value: float, *, tag: Optional[str] = None) -> None:
+    """One measurement for the percentiles in summary.txt (e.g. capture ms)."""
+    if not ENABLED:
+        return
+    try:
+        with _lock:
+            s = _session
+            if s is None:
+                return
+            _reservoir(s.samples.setdefault((tag or thread_tag(), key), [[], 0]), float(value))
+    except Exception:
+        _fail()
+
+
+def _reservoir(slot: List[Any], value: float) -> None:
+    values = slot[0]
+    slot[1] += 1
+    if len(values) < MAX_SAMPLES:
+        values.append(value)
+    else:
+        i = random.randrange(slot[1])
+        if i < MAX_SAMPLES:
+            values[i] = value
+
+
+# ---------------------------------------------------------------- recent detail
+
+def _ring_add(cat: str, msg: Any, tag: Optional[str], src: str, t: Optional[float] = None) -> None:
+    """Keeps one detail line (or a frame row, formatted when written) for
+    dump_recent()."""
+    ring = getattr(_tls, "ring", None)
+    if ring is None:
+        ring = _tls.ring = deque(maxlen=RECENT_MAX_LINES)
+    ring.append((time.time() if t is None else t, tag or thread_tag(), cat, src, _indent(), msg))
+
+
+def dump_recent(reason: str, *, tag: Optional[str] = None, depth: int = 0) -> int:
+    """Writes this thread's per-frame detail of the last RECENT_SECONDS
+    (lines marked "»" between two DETAIL lines) and empties the ring.
+    Called before an image is saved, an exception is logged or a bot
+    stops. Returns the number of lines written."""
+    if not ENABLED:
+        return 0
+    try:
+        ring = getattr(_tls, "ring", None)
+        if not ring:
+            return 0
+        now = time.time()
+        items = [e for e in ring if now - e[0] <= RECENT_SECONDS]
+        ring.clear()
+        if not items:
+            return 0
+        with _lock:
+            s = _session
+            if s is None or s.closed or s.dumps >= MAX_RECENT_DUMPS:
+                return 0
+            s.dumps += 1
+            src = _src(depth + 1)
+            span = now - items[0][0]
+            _write("DETAIL", f"▼ recent per-frame detail ({len(items)} lines, last {span:.1f}s) before: {reason}",
+                   tag, src, frame_level=True)
+            for t, tg, cat, sr, ind, msg in items:
+                text = msg.text() if isinstance(msg, _Row) else msg
+                s.write(_fmt(t, tg, cat, sr, "» " + ind + text), True)
+            _write("DETAIL", "▲ end of recent detail", tag, src, frame_level=True)
+        return len(items)
+    except Exception:
+        _fail()
+        return 0
 
 def block(cat: str, title: str, lines: Iterable[str], *, tag: Optional[str] = None) -> None:
     """A header line followed by indented lines (session header, config dump)."""
@@ -314,10 +518,12 @@ def block(cat: str, title: str, lines: Iterable[str], *, tag: Optional[str] = No
 
 # ---------------------------------------------------------------- summaries
 
-def summarize(value: Any, limit: int = 160) -> str:
-    """Short, loggable description of an argument or result."""
+def summarize(value: Any, limit: int = 160, brief: bool = False) -> str:
+    """Short, loggable description of an argument or result. ``brief``:
+    arrays as shape and dtype only (function arguments and results: the
+    capture line already gave the statistics of that frame)."""
     try:
-        text = _summ(value, limit, 0)
+        text = _summ(value, limit, 0, brief)
         cap = max(300, limit * 3)
         return text if len(text) <= cap else text[:cap] + f"… ({len(text)} chars)"
     except Exception:
@@ -325,7 +531,7 @@ def summarize(value: Any, limit: int = 160) -> str:
         return f"<{type(value).__name__}>"
 
 
-def _summ(v: Any, limit: int, level: int) -> str:
+def _summ(v: Any, limit: int, level: int, brief: bool = False) -> str:
     if v is None or isinstance(v, (bool, int)):
         return repr(v)
     if isinstance(v, float):
@@ -336,7 +542,7 @@ def _summ(v: Any, limit: int, level: int) -> str:
         return f"bytes(len={len(v)})"
     np = sys.modules.get("numpy")
     if np is not None and isinstance(v, np.ndarray):
-        return array_summary(v)
+        return f"array{tuple(v.shape)} {v.dtype}" if brief else array_summary(v)
     if np is not None and isinstance(v, np.generic):
         return repr(v.item())
     if isinstance(v, (list, tuple, set, frozenset, deque)):
@@ -345,7 +551,7 @@ def _summ(v: Any, limit: int, level: int) -> str:
         if level >= 2:
             return f"{type(v).__name__}(len={len(items)})"
         shown = items[:8]
-        inner = ", ".join(_summ(x, 40, level + 1) for x in shown)
+        inner = ", ".join(_summ(x, 40, level + 1, brief) for x in shown)
         more = f", … +{len(items) - 8}" if len(items) > 8 else ""
         if isinstance(v, tuple) and len(items) == 1:
             inner += ","
@@ -354,7 +560,7 @@ def _summ(v: Any, limit: int, level: int) -> str:
         if level >= 2:
             return f"dict(len={len(v)})"
         items = list(v.items())[:8]
-        inner = ", ".join(f"{_summ(k, 30, level + 1)}: {_summ(x, 40, level + 1)}" for k, x in items)
+        inner = ", ".join(f"{_summ(k, 30, level + 1, brief)}: {_summ(x, 40, level + 1, brief)}" for k, x in items)
         more = f", … +{len(v) - 8}" if len(v) > 8 else ""
         return "{" + inner + more + "}"
     if hasattr(v, "__dataclass_fields__"):
@@ -362,7 +568,7 @@ def _summ(v: Any, limit: int, level: int) -> str:
             return type(v).__name__
         parts = []
         for name in list(v.__dataclass_fields__)[:10]:
-            parts.append(f"{name}={_summ(getattr(v, name, None), 40, level + 1)}")
+            parts.append(f"{name}={_summ(getattr(v, name, None), 40, level + 1, brief)}")
         return f"{type(v).__name__}({', '.join(parts)})"
     name = type(v).__name__
     bot_id = getattr(v, "bot_id", None)
@@ -410,19 +616,24 @@ def _tag_of(obj) -> Optional[str]:
 
 
 def _call_traced(fn, qual: str, method: bool, a, k):
+    """Entry and exit lines of a traced call: into session.log outside
+    per-frame loops, into the recent-detail ring inside them."""
     entry = None
     try:
-        if VERBOSE or not getattr(_tls, "loop", 0):
-            tag = _tag_of(a[0]) if (method and a) else None
-            if tag is None and isinstance(k.get("bot_id"), int):
-                tag = f"W{k['bot_id'] + 1}"
-            shown = a[1:] if method else a
-            args = ", ".join([summarize(x, 60) for x in shown] +
-                             [f"{key}={summarize(x, 60)}" for key, x in k.items()])
-            src = _src(2)
+        tag = _tag_of(a[0]) if (method and a) else None
+        if tag is None and isinstance(k.get("bot_id"), int):
+            tag = f"W{k['bot_id'] + 1}"
+        shown = a[1:] if method else a
+        args = ", ".join([summarize(x, 60, brief=True) for x in shown] +
+                         [f"{key}={summarize(x, 60, brief=True)}" for key, x in k.items()])
+        src = _src(2)
+        ring = getattr(_tls, "loop", 0) > 0
+        if ring:
+            _ring_add("CALL", f"→ {qual}({args})", tag, src)
+        else:
             _write("CALL", f"→ {qual}({args})", tag, src)
-            _tls.depth = getattr(_tls, "depth", 0) + 1
-            entry = (tag, src)
+        _tls.depth = getattr(_tls, "depth", 0) + 1
+        entry = (tag, src, ring)
     except Exception:
         _fail()
     if entry is None:
@@ -434,14 +645,22 @@ def _call_traced(fn, qual: str, method: bool, a, k):
         try:
             _tls.depth = max(0, getattr(_tls, "depth", 1) - 1)
             ms = (time.perf_counter() - t0) * 1000
-            _write("CALL", f"✗ {qual} raised {type(e).__name__}: {e} [{ms:.1f} ms]", entry[0], entry[1])
+            text = f"✗ {qual} raised {type(e).__name__}: {e} [{ms:.1f} ms]"
+            if entry[2]:
+                _ring_add("CALL", text, entry[0], entry[1])
+            else:
+                _write("CALL", text, entry[0], entry[1])
         except Exception:
             _fail()
         raise
     try:
         _tls.depth = max(0, getattr(_tls, "depth", 1) - 1)
         ms = (time.perf_counter() - t0) * 1000
-        _write("CALL", f"← {qual} = {summarize(result, 120)} [{ms:.1f} ms]", entry[0], entry[1])
+        text = f"← {qual} = {summarize(result, 120, brief=True)} [{ms:.1f} ms]"
+        if entry[2]:
+            _ring_add("CALL", text, entry[0], entry[1])
+        else:
+            _write("CALL", text, entry[0], entry[1])
     except Exception:
         _fail()
     return result
@@ -450,7 +669,7 @@ def _call_traced(fn, qual: str, method: bool, a, k):
 def traced(fn=None, *, method: Optional[bool] = None):
     """Decorator: logs entry (summarised arguments) and exit (summarised
     result, duration) of the function while diagnostics is on. Inside a
-    per-frame loop only with VERBOSE."""
+    per-frame loop into the recent-detail ring (see dump_recent)."""
     def deco(f):
         if getattr(f, "_diag_traced", False):
             return f
@@ -545,6 +764,9 @@ class _NullLoop:
     def frame(self, *a, **k):
         pass
 
+    def add(self, *a, **k):
+        pass
+
     def count(self, *a, **k):
         pass
 
@@ -564,23 +786,76 @@ class _NullLoop:
 _NULL_LOOP = _NullLoop()
 
 
+class _Row:
+    """One frame of a loop: a row of frames_<loop>.csv and, in the
+    recent-detail ring, one line (formatted when it is written out)."""
+    __slots__ = ("loop", "n", "t", "dt", "fields", "note")
+
+    def __init__(self, loop: "Loop", n: int, t: float, dt: Optional[float], fields: dict, note: Optional[str]):
+        self.loop, self.n, self.t, self.dt, self.fields, self.note = loop, n, t, dt, fields, note
+
+    def text(self) -> str:
+        parts = " ".join(f"{k}={_cell(v)}" for k, v in self.fields.items() if v is not None)
+        dt = "" if self.dt is None else f" +{self.dt:.0f}ms"
+        note = f" {self.note}" if self.note else ""
+        return f"{self.loop.name} #{self.loop.seq} frame {self.n}{dt}:{note} {parts}".rstrip()
+
+
+def _cell(v: Any) -> str:
+    """A value as frames_*.csv and frame lines show it."""
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, float):
+        return repr(round(v, 3))
+    if isinstance(v, (int, str)):
+        return str(v)
+    if isinstance(v, (tuple, list)):
+        return " ".join(_cell(x) for x in v)
+    np = sys.modules.get("numpy")
+    if np is not None and isinstance(v, np.generic):
+        return _cell(v.item())
+    return summarize(v, 60, brief=True)
+
+
+def _csv(text: str) -> str:
+    if any(c in text for c in ',"\n'):
+        return '"' + text.replace('"', '""').replace("\n", " ") + '"'
+    return text
+
+
 class Loop:
     """Per-frame loop recorder. Counts, min/max scores and the result are
-    written as one LOOP line when the loop ends; ``frame()`` lines only with
-    VERBOSE; ``note()`` lines (state changes) always."""
+    written as one LOOP line when the loop ends; the start line only once
+    something inside the loop is written (short quiet loops stay one line).
+    ``frame(**fields)`` adds a row to frames_<name>.csv; ``note()`` lines
+    (state changes) are always written."""
     active = True
 
-    def __init__(self, name: str, tag: Optional[str], src: str, context: dict):
+    def __init__(self, name: str, tag: Optional[str], src: str, context: dict,
+                 columns: Optional[Iterable[str]] = None):
         self.name = name
         self.tag = tag
         self.src = src
         self.context = context
+        self.columns = list(columns) if columns is not None else None
         self.frames = 0
         self.counts: Dict[str, int] = {}
         self.scores: Dict[str, List[float]] = {}   # key -> [min, max, sum, n]
         self.values: Dict[str, Any] = {}
         self.anomalies: Dict[str, int] = {}
         self.t0 = time.perf_counter()
+        self.t_wall = time.time()
+        self.seq = 0
+        self.started = False       # start line written
+        self.depth = ""
+        self._row: Optional[_Row] = None
+        self._last_frame: Optional[float] = None
+        self._dts: List[float] = []
+
+    def _ctx(self) -> str:
+        return " ".join(f"{k}={summarize(v, 60)}" for k, v in self.context.items())
 
     def __enter__(self):
         _tls.loop = getattr(_tls, "loop", 0) + 1
@@ -588,19 +863,33 @@ class Loop:
         if stack is None:
             stack = _tls.loops = []
         stack.append(self)
+        self.depth = _indent()
         try:
-            ctx = " ".join(f"{k}={summarize(v, 60)}" for k, v in self.context.items())
-            _write("LOOP", f"start {self.name} {ctx}".rstrip(), self.tag, self.src)
+            with _lock:
+                s = _session
+                if s is not None:
+                    s.loop_seq += 1
+                    self.seq = s.loop_seq
         except Exception:
             _fail()
+        _tls.pending = getattr(_tls, "pending", 0) + 1
         return self
+
+    def _write_start(self) -> None:
+        """The deferred start line, with the time the loop really started."""
+        self.started = True
+        _write("LOOP", f"start {self.name} #{self.seq} {self._ctx()}".rstrip(), self.tag, self.src,
+               t=self.t_wall, indent=self.depth)
 
     def __exit__(self, et, ev, tb):
         _tls.loop = max(0, getattr(_tls, "loop", 1) - 1)
         stack = getattr(_tls, "loops", None)
         if stack and stack[-1] is self:
             stack.pop()
+        if not self.started:
+            _tls.pending = max(0, getattr(_tls, "pending", 1) - 1)
         try:
+            self._complete_row()
             dur = time.perf_counter() - self.t0
             parts = [f"frames={self.frames}", f"duration={dur:.3f}s"]
             if self.frames and dur > 0:
@@ -613,19 +902,103 @@ class Loop:
                 parts.append("anomalies=" + summarize(self.anomalies))
             if et is not None:
                 parts.append(f"raised={et.__name__}: {ev}")
-            _write("LOOP", f"end {self.name} " + " ".join(parts), self.tag, self.src)
+            head = f"end {self.name} #{self.seq}"
+            if not self.started:
+                ctx = self._ctx()
+                head += f" ({ctx})" if ctx else ""
+            _write("LOOP", head + " " + " ".join(parts), self.tag, self.src, indent=self.depth)
+            self._record(dur, et)
         except Exception:
             _fail()
         return False
 
-    def frame(self, msg: Optional[str] = None, cat: str = "ANALYSIS") -> None:
-        """One iteration; ``msg`` is written only with VERBOSE."""
-        self.frames += 1
-        if msg is not None and VERBOSE:
-            try:
-                _write(cat, msg, self.tag, _src(1), frame_level=True)
-            except Exception:
-                _fail()
+    def _record(self, dur: float, et) -> None:
+        """Adds this loop to the per-window loop statistics of summary.txt."""
+        with _lock:
+            s = _session
+            if s is None:
+                return
+            key = (self.tag or thread_tag(), self.name)
+            st = s.loop_stats.get(key)
+            if st is None:
+                st = s.loop_stats[key] = {
+                    "n": 0, "frames": 0, "dur": 0.0, "max_dur": 0.0, "results": {}, "counts": {},
+                    "scores": {}, "anomalies": {}, "dts": [[], 0]}
+            st["n"] += 1
+            st["frames"] += self.frames
+            st["dur"] += dur
+            st["max_dur"] = max(st["max_dur"], dur)
+            result = self.values.get("result")
+            if et is not None:
+                rkey = "raised " + et.__name__
+            elif result is None:
+                rkey = "(no result)"
+            else:
+                rkey = re.sub(r"-?\d+(\.\d+)?", "#", str(result))[:70]
+            st["results"][rkey] = st["results"].get(rkey, 0) + 1
+            for k, v in self.counts.items():
+                st["counts"][k] = st["counts"].get(k, 0) + v
+            for k, (lo, hi, total, n) in self.scores.items():
+                agg = st["scores"].get(k)
+                if agg is None:
+                    st["scores"][k] = [lo, hi, total, n]
+                else:
+                    agg[0], agg[1] = min(agg[0], lo), max(agg[1], hi)
+                    agg[2] += total
+                    agg[3] += n
+            for k, v in self.anomalies.items():
+                st["anomalies"][k] = st["anomalies"].get(k, 0) + v
+            for dt in self._dts:
+                _reservoir(st["dts"], dt)
+
+    def frame(self, msg: Optional[str] = None, cat: str = "ANALYSIS", **fields) -> None:
+        """One iteration: a row of frames_<name>.csv with ``fields`` (more
+        can be added with ``add``) and a line in the recent-detail ring.
+        ``msg``: optional short note for both."""
+        try:
+            self._complete_row()
+            self.frames += 1
+            now = time.perf_counter()
+            dt = None if self._last_frame is None else (now - self._last_frame) * 1000
+            self._last_frame = now
+            if dt is not None and len(self._dts) < 5000:
+                self._dts.append(dt)
+            row = self._row = _Row(self, self.frames, time.time(), dt, fields, msg)
+            _ring_add(cat, row, self.tag, _src(1), t=row.t)
+        except Exception:
+            _fail()
+
+    def add(self, **fields) -> None:
+        """More values for the current frame's row."""
+        if self._row is not None:
+            self._row.fields.update(fields)
+
+    def _complete_row(self) -> None:
+        row, self._row = self._row, None
+        if row is None:
+            return
+        try:
+            with _lock:
+                s = _session
+                if s is None or s.closed:
+                    return
+                if s.frame_bytes > MAX_FRAME_BYTES:
+                    s.frame_rows_dropped += 1
+                    return
+                f, columns = s.table(self.name, self.columns if self.columns is not None else list(row.fields))
+                extra = " ".join(f"{k}={_cell(v)}" for k, v in row.fields.items()
+                                 if k not in columns and v is not None)
+                cells = [_clock(row.t), f"{row.t - s.started:.3f}", self.tag or thread_tag(), str(self.seq),
+                         str(row.n), "" if row.dt is None else f"{row.dt:.1f}"]
+                cells += [_cell(row.fields.get(c)) for c in columns]
+                cells += [extra, row.note or ""]
+                line = ",".join(_csv(c) for c in cells) + "\n"
+                f.write(line)
+                s.frame_bytes += len(line)
+                s.frame_rows += 1
+                s.flush_tables()
+        except Exception:
+            _fail()
 
     def count(self, key: str, n: int = 1) -> None:
         self.counts[key] = self.counts.get(key, 0) + n
@@ -657,23 +1030,40 @@ class Loop:
             _fail()
 
     def anomaly(self, kind: str, msg: str = "") -> bool:
-        """Counts an anomaly; the first of each kind is written. Returns
-        True for that first one (callers save an image then)."""
+        """Counts an anomaly; the first of each kind is written (after the
+        recent per-frame detail). Returns True for that first one (callers
+        save an image then)."""
         n = self.anomalies.get(kind, 0) + 1
         self.anomalies[kind] = n
         if n == 1:
-            self.note(f"{kind}: {msg} (first in this {self.name}; later ones are counted)", "CAPTURE")
+            dump_recent(f"anomaly {kind}", tag=self.tag, depth=1)
+            try:
+                _write("CAPTURE", f"{kind}: {msg} (first in this {self.name}; later ones are counted)",
+                       self.tag, _src(1), event="anomaly")
+            except Exception:
+                _fail()
             return True
         return False
 
 
-def loop(name: str, *, tag: Optional[str] = None, **context):
-    """``with diag.loop("minigame", tag="W1", region=...) as lp:`` —
-    see Loop. A shared no-op object while diagnostics is off."""
+def _flush_pending_loops() -> None:
+    """Writes the deferred start lines of this thread's open loops (outer
+    first) before anything else is written inside them."""
+    _tls.pending = 0
+    for lp in list(getattr(_tls, "loops", None) or ()):
+        if not lp.started:
+            lp._write_start()
+
+
+def loop(name: str, *, tag: Optional[str] = None, columns: Optional[Iterable[str]] = None, **context):
+    """``with diag.loop("minigame", tag="W1", columns=("panel", "fish_x"), region=...) as lp:``
+    (see Loop). ``columns``: the frame fields in the column order of
+    frames_<name>.csv (default: the fields of the first frame; others go
+    to its "extra" column). A shared no-op object while diagnostics is off."""
     if not ENABLED:
         return _NULL_LOOP
     try:
-        return Loop(name, tag, _src(1), context)
+        return Loop(name, tag, _src(1), context, columns)
     except Exception:
         _fail()
         return _NULL_LOOP
@@ -697,10 +1087,14 @@ def _safe_name(text: str) -> str:
 def image(label: str, frame, *, tag: Optional[str] = None, note: str = "", depth: int = 0) -> Optional[str]:
     """Saves ``frame`` (BGR/BGRA/gray array) as PNG in the session folder and
     logs its file name. Respects the per-session caps. Returns the file name
-    or None (no session, cap reached, nothing to save)."""
+    or None (no session, cap reached, nothing to save). Except for the
+    "first_" reference images, the recent per-frame detail is written
+    first: an image is saved when something went wrong."""
     if not ENABLED:
         return None
     try:
+        if not label.startswith("first_"):
+            dump_recent(f"image {label}", tag=tag, depth=depth + 1)
         with _lock:
             s = _session
             if s is None or s.closed:
@@ -714,7 +1108,7 @@ def image(label: str, frame, *, tag: Optional[str] = None, note: str = "", depth
                 if "images" not in s.cap_logged:
                     s.cap_logged.add("images")
                     _write("IMAGE", f"image cap reached ({s.images} images, {s.image_bytes >> 20} MB): "
-                                    f"no more images in this session", tag, _src(depth + 1))
+                                    f"no more images in this session", tag, _src(depth + 1), event="logging")
                 return None
             if s.label_counts.get(key, 0) >= MAX_IMAGES_PER_LABEL:
                 if key not in s.cap_logged:
@@ -739,7 +1133,7 @@ def image(label: str, frame, *, tag: Optional[str] = None, note: str = "", depth
             s.image_bytes += size
         _write("IMAGE", f"saved {name} ({label}) {array_summary(frame)} {size} bytes"
                         f"{' — ' + note if note else ''}" if ok else f"FAILED to write {name}",
-               tag, _src(depth + 1))
+               tag, _src(depth + 1), event="image")
         return name if ok else None
     except Exception:
         _fail()
@@ -992,12 +1386,11 @@ def config_lines(cfg: dict) -> List[str]:
 
 # ---------------------------------------------------------------- lifecycle
 
-def configure(enabled: bool, verbose: bool = False) -> None:
+def configure(enabled: bool) -> None:
     """Switches recording on/off (Settings tab). Off also drops anything
     buffered while no session was open. An open session keeps running."""
-    global ENABLED, VERBOSE, _setting
+    global ENABLED, _setting
     enabled = bool(enabled)
-    VERBOSE = bool(verbose) and enabled
     if enabled and not _setting:
         _pre_buffer.clear()
     _setting = enabled
@@ -1078,7 +1471,10 @@ def start_session(header: Optional[Dict[str, List[str]]] = None,
         _write("SESSION", f"===== diagnostic session {s.stamp} ({reason}) =====", None, _src(1))
         _write("SESSION", f"log folder: {folder}" + ("  (program folder not writable: per-user fallback)"
                                                     if fallback else ""), None, _src(1))
-        _write("SESSION", f"verbose (every frame): {VERBOSE}", None, _src(1))
+        _write("SESSION", f"files: {SUMMARY_NAME} (totals and an index of this log, read first), "
+                          f"frames_<loop>.csv (one row per frame of each per-frame loop), PNG images. "
+                          f"Lines marked » are the last {RECENT_SECONDS:.0f}s of per-frame detail, "
+                          f"written before an image, an exception or a stop", None, _src(1))
         if buffered:
             _write("SESSION", f"--- {len(buffered)} events recorded before this session started ---", None, _src(1))
             for line in buffered:
@@ -1173,6 +1569,12 @@ def _finish(s: _Session, reason: str) -> None:
                         f"{_failures} logging failures =====", False)
             except Exception:
                 _fail()
+            try:
+                s.flush_tables(force=True)
+                with open(os.path.join(s.folder, SUMMARY_NAME), "w", encoding="utf-8", newline="\n") as f:
+                    f.write("\n".join(summary_lines(s, reason, dur)) + "\n")
+            except Exception:
+                _fail()
         if _session is s:
             _session = None
         s.close()
@@ -1181,6 +1583,83 @@ def _finish(s: _Session, reason: str) -> None:
             _set_class_tracing(ENABLED)
     if not _setting:
         _pre_buffer.clear()
+
+
+def _pct(values: List[float], q: float) -> float:
+    v = sorted(values)
+    return v[min(len(v) - 1, int(q * (len(v) - 1) + 0.5))]
+
+
+def _dist(values: List[float], unit: str) -> str:
+    if not values:
+        return "n=0"
+    return (f"p50 {_pct(values, 0.5):.1f}{unit} p95 {_pct(values, 0.95):.1f}{unit} "
+            f"max {max(values):.1f}{unit}")
+
+
+def _counts(d: Dict[str, int]) -> str:
+    return ", ".join(f"{k}={v}" for k, v in sorted(d.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
+def summary_lines(s: _Session, reason: str, dur: float) -> List[str]:
+    """summary.txt: what a reader needs before opening session.log."""
+    try:
+        from version import VERSION
+    except Exception:
+        VERSION = "?"
+    out = [f"Diagnostic session {s.stamp}: bot {VERSION}, {dur:.1f}s, ended: {reason or 'closed'}",
+           "",
+           "Files:",
+           f"  {SUMMARY_NAME:<22} this file",
+           f"  {LOG_NAME:<22} every event in order; 'L<n>' below is a line number in it",
+           "  frames_<loop>.csv      one row per frame of each per-frame loop: time, t (s since start),",
+           "                         tag, loop (the #n of its LOOP lines), frame, dt_ms (since the previous",
+           "                         frame), then what the loop measured",
+           "  NNNN_<tag>_<label>.png images (listed below); first_* are references of what worked",
+           "  bot_config.json, config_gui.json, config_effective.json: the settings",
+           f"Before each image, exception and stop, session.log holds the last {RECENT_SECONDS:.0f}s of",
+           "per-frame detail between '▼ recent per-frame detail' and '▲ end' (lines marked »).",
+           ""]
+    tags = sorted(set(list(s.tallies) + [t for t, _ in s.loop_stats] + [t for t, _ in s.samples]))
+    for tag in tags:
+        out.append(f"[{tag}]")
+        if s.tallies.get(tag):
+            out.append(f"  totals: {_counts(s.tallies[tag])}")
+        for (t, key), (values, seen) in sorted(s.samples.items()):
+            if t == tag:
+                out.append(f"  {key}: {_dist(values, '')} (n={seen})")
+        loops = sorted(((name, st) for (t, name), st in s.loop_stats.items() if t == tag),
+                       key=lambda x: -x[1]["dur"])
+        if loops:
+            out.append("  loops (by total time):")
+        for name, st in loops:
+            fps = st["frames"] / st["dur"] if st["dur"] > 0 else 0
+            out.append(f"    {name}: {st['n']}x, {st['frames']} frames, {st['dur']:.1f}s "
+                       f"(longest {st['max_dur']:.2f}s, {fps:.0f} fps)")
+            if st["dts"][0]:
+                out.append(f"      frame interval: {_dist(st['dts'][0], ' ms')}")
+            out.append(f"      results: {_counts(st['results'])}")
+            if st["counts"]:
+                out.append(f"      counts: {_counts(st['counts'])}")
+            for k, (lo, hi, total, n) in sorted(st["scores"].items()):
+                out.append(f"      {k}: avg {total / n:.3f} min {lo:.3f} max {hi:.3f} (n={n})")
+            if st["anomalies"]:
+                out.append(f"      anomalies: {_counts(st['anomalies'])}")
+        out.append("")
+    out.append("Index of session.log (exceptions, stops, images, anomalies, capture problems):")
+    if not s.events:
+        out.append("  (nothing)")
+    for number, t, tag, kind, text in sorted(s.events):
+        out.append(f"  L{number:<7} {_clock(t)} [{tag}] {kind}: {text}")
+    for kind, n in sorted(s.event_counts.items()):
+        if n > MAX_EVENTS_PER_KIND:
+            out.append(f"  … {n - MAX_EVENTS_PER_KIND} more '{kind}' not listed ({n} in all)")
+    out += ["",
+            f"Logging: {s.lines} lines ({s.bytes >> 10} KB) in {LOG_NAME}, {s.dropped} dropped by the size cap; "
+            f"{s.frame_rows} frame rows ({s.frame_bytes >> 10} KB) in {len(s.tables)} tables, "
+            f"{s.frame_rows_dropped} dropped; {s.images} images ({s.image_bytes >> 10} KB); "
+            f"{s.dumps} recent-detail dumps; {_failures} logging failures"]
+    return out
 
 
 def setting() -> bool:
@@ -1201,7 +1680,10 @@ def _pack(folder: str) -> Tuple[Optional[str], Optional[str]]:
                 for name in sorted(files):
                     full = os.path.join(root, name)
                     rel = os.path.relpath(full, folder)
-                    zf.write(full, arcname=f"{stamp}/{rel}".replace(os.sep, "/"))
+                    # Screen recordings are compressed already: deflating
+                    # them costs minutes and saves nothing
+                    kind = zipfile.ZIP_STORED if name.lower().endswith(".mjpg") else zipfile.ZIP_DEFLATED
+                    zf.write(full, arcname=f"{stamp}/{rel}".replace(os.sep, "/"), compress_type=kind)
         os.replace(tmp, zip_path)
         shutil.rmtree(folder, ignore_errors=True)
         _last_zip = zip_path
@@ -1327,7 +1809,9 @@ def install_hooks() -> None:
         if ENABLED:
             try:
                 text = "".join(traceback.format_exception(et, ev, tb)).rstrip()
-                _write("EXC", f"UNCAUGHT exception in main thread: {et.__name__}: {ev}\n{text}", None, "sys.excepthook")
+                dump_recent("uncaught exception")
+                _write("EXC", f"UNCAUGHT exception in main thread: {et.__name__}: {ev}\n{text}", None,
+                       "sys.excepthook", event="exception")
             except Exception:
                 _fail()
         try:
@@ -1344,8 +1828,10 @@ def install_hooks() -> None:
                     text = "".join(traceback.format_exception(
                         args.exc_type, args.exc_value, args.exc_traceback)).rstrip()
                     name = args.thread.name if args.thread is not None else "?"
+                    dump_recent("uncaught exception")
                     _write("EXC", f"UNCAUGHT exception in thread {name}: "
-                                  f"{args.exc_type.__name__}: {args.exc_value}\n{text}", None, "threading.excepthook")
+                                  f"{args.exc_type.__name__}: {args.exc_value}\n{text}", None,
+                           "threading.excepthook", event="exception")
                 except Exception:
                     _fail()
             try:
@@ -1358,13 +1844,17 @@ def install_hooks() -> None:
 
 def reset_for_tests() -> None:
     """Closes everything and restores the initial state (tests only)."""
-    global ENABLED, VERBOSE, _session, _last_zip, _last_dir, _last_dir_fallback, _failures, _setting
+    global ENABLED, _session, _last_zip, _last_dir, _last_dir_fallback, _failures, _setting
     s = _session
     if s is not None:
         s.close()
     _session = None
     wait_for_background()
-    ENABLED = VERBOSE = _setting = False
+    ENABLED = _setting = False
+    _tls.ring = None
+    _tls.loops = []
+    _tls.loop = 0
+    _tls.pending = 0
     _set_class_tracing(False)
     _pre_buffer.clear()
     _busy_folders.clear()

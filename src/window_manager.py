@@ -12,7 +12,7 @@ from typing import List, Optional, Tuple
 
 import diag
 import platforms
-from utils import DEBUG_PRINTS
+from utils import DEBUG_PRINTS, note_focus_switch, wait_keys_delivered
 
 # How long to wait for the OS to confirm a foreground switch (per attempt),
 # and how long to let the game process WM_ACTIVATE after a real switch.
@@ -191,6 +191,13 @@ class WindowManager:
             except Exception:
                 diag.exc("restore before activate", tag=self.diag_tag)
 
+            # Keys sent just before may still be on their way to the window
+            # in front: switching now would hand them to this one.
+            waited = wait_keys_delivered()
+            if waited and diag.ENABLED:
+                diag.log("FOCUS", f"waited {waited * 1000:.0f} ms for the last key or click to arrive before switching",
+                         tag=self.diag_tag)
+
             # The OS can silently ignore a plain activation request (Windows
             # when the calling thread doesn't own the foreground). First
             # attempt is the plain call; retries use the stronger variant.
@@ -208,6 +215,7 @@ class WindowManager:
                     # the activation before input arrives.
                     time.sleep(_ACTIVATE_SETTLE)
                     self.last_switch_time = time.perf_counter()
+                    note_focus_switch()
                     diag.log("FOCUS", f"activate {target_hwnd!r}: confirmed in front on attempt {attempt + 1} "
                                       f"({'plain' if attempt == 0 else 'forced'} request)", tag=self.diag_tag)
                     return True

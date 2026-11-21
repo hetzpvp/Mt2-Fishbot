@@ -139,6 +139,33 @@ def active_tab(frame: np.ndarray, origin: Point, points: Dict[int, Point]) -> Tu
     return pages[int(order[0])], measured
 
 
+SLOT_MATCH_TOL = 6     # px two empty-slot positions may differ and still be the same slot
+
+
+def same_empty_slots(before, after, allowed: int = 1) -> Tuple[bool, int]:
+    """Whether two empty-slot scans of the inventory strip look like the
+    same page: after a tab click, the page did not switch. Returns (same,
+    number of slots found in only one of them).
+
+    Empty slots, not pixels: the strip's left part can show the game world
+    behind the inventory, where characters move. ``allowed`` slots may
+    differ, for an item landing during the switch. Two different pages with
+    nearly the same free slots read as "same"; the caller then clicks the
+    tab once more, which does nothing when its page is already showing."""
+    before, after = list(before or []), list(after or [])
+    unmatched = list(after)
+    differ = 0
+    for bx, by in before:
+        hit = next((i for i, (ax, ay) in enumerate(unmatched)
+                    if abs(ax - bx) <= SLOT_MATCH_TOL and abs(ay - by) <= SLOT_MATCH_TOL), None)
+        if hit is None:
+            differ += 1
+        else:
+            unmatched.pop(hit)
+    differ += len(unmatched)
+    return differ <= allowed, differ
+
+
 def wait_for_tab(grab: Callable[[int, int, int, int], Optional[np.ndarray]], points: Dict[int, Point],
                  win_w: int, win_h: int, target: int, keep_going: Callable[[], bool],
                  timeout: float = 2.0, poll: float = 0.05,

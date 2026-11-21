@@ -62,3 +62,55 @@ def test_asset_names_are_url_safe():
     for name in (release.win_asset(V), release.linux_asset(V)):
         assert re.fullmatch(r"[A-Za-z0-9.\-]+", name)
     assert release.tag_name(V) == f"Mt2-Fishbot-v{V}"
+
+
+def test_entry_script_calls_freeze_support_before_heavy_imports():
+    # A frozen build without it re-runs the whole GUI for every multiprocessing
+    # helper (Numba's lock starts a resource tracker under Python 3.14's
+    # default "forkserver" start method): copies pile up and outlive the window.
+    with open(os.path.join(ROOT, "src", "fishing_bot.py"), encoding="utf-8") as f:
+        src = f.read()
+    call = src.index("multiprocessing.freeze_support()")
+    for heavy in ("import diag", "import cv2", "import numpy", "from qt_gui import"):
+        assert call < src.index(heavy), heavy
+
+
+def test_processes_of_finds_this_process():
+    import sys
+    if not os.path.isdir("/proc"):
+        pytest.skip("needs /proc")
+    found = release.processes_of(sys.executable)
+    assert os.getpid() in found
+    assert release.processes_of(os.path.join(ROOT, "no-such-program")) == {}
+
+
+NOTES = """## What's new
+- **Golden Tuna** dialog handled
+- Dead fish follow
+  the living one
+
+## Download
+- not a highlight
+"""
+
+
+def test_announce_highlights_come_from_whats_new():
+    assert release.notes_highlights(NOTES) == ["**Golden Tuna** dialog handled",
+                                               "Dead fish follow the living one"]
+    with pytest.raises(ValueError):
+        release.notes_highlights("## Download\n- x\n")
+
+
+@pytest.mark.parametrize("kind", ["discord", "elitepvpers"])
+def test_announcements_fill_every_placeholder(kind):
+    hl = release.notes_highlights(NOTES)
+    text = release.render_announcement(kind, V, hl, "21/11/2026")
+    assert "{{" not in text and V in text and "21/11/2026" in text
+    assert release.asset_url(V, release.win_asset(V)) in text
+    assert release.asset_url(V, release.linux_asset(V)) in text
+    assert "Golden Tuna" in text and "coming soon" in text
+    with_links = release.render_announcement(kind, V, hl, "21/11/2026",
+                                             mediafire="https://mf.example/x", virustotal="https://vt.example/y")
+    assert "https://mf.example/x" in with_links and "https://vt.example/y" in with_links
+    if kind == "elitepvpers":
+        assert "**" not in text and "[*]Golden Tuna dialog handled" in text

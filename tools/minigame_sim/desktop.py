@@ -31,6 +31,7 @@ from _stubs import install  # noqa: E402
 install()
 
 from fishing_bot import FishingBot  # noqa: E402
+import utils  # noqa: E402
 
 # Short waits so sessions fit into a test; bots that need other values pass them.
 FAST = {
@@ -45,7 +46,7 @@ FAST = {
 class FishingDesktop:
     """One cursor, one keyboard, one focused window."""
 
-    def __init__(self, switch_delay=0.0, refuse_focus=0.0, seed=1):
+    def __init__(self, switch_delay=0.0, refuse_focus=0.0, seed=1, click_latency=None):
         self.games = []
         self.bots = []
         self.logs = []
@@ -60,6 +61,15 @@ class FishingDesktop:
         self.misdirected_clicks = 0
         self.lock = threading.Lock()
         self._rng = random.Random(seed)
+        # (min, max) seconds a game takes to take in a click. A window that
+        # loses the focus before then never sees it (real clients under Wine:
+        # 37 of 63 clicks were lost when the focus moved 20-30 ms after them,
+        # none of 16 at 30 ms or later). None: clicks land at once.
+        self.click_latency = click_latency
+        self._pending = []                     # [game, deliver_at, lost] clicks on their way
+        self.clicks_lost = 0
+        self._last_click = {}                  # game -> time of its last click
+        self.click_to_switch = []              # seconds from a window's last click to a switch away
 
     # ------------------------------------------------------------------ setup
 
@@ -140,8 +150,21 @@ class DesktopWM:
         if d.refuse_focus and d._rng.random() < d.refuse_focus:
             d.refused += 1
             return False
+        # The bot's WindowManager waits like this before every switch
+        utils.wait_keys_delivered()
         if d.switch_delay:
             time.sleep(d.switch_delay)
+        with d.lock:
+            now = time.perf_counter()
+            last = d._last_click.pop(d.foreground, None)
+            if last is not None:
+                d.click_to_switch.append(now - last)
+            for click in d._pending:
+                if click[0] is d.foreground and now < click[1] and not click[2]:
+                    click[2] = True            # the window lost the focus before it took the click
+                    d.clicks_lost += 1
+                    click[0].stats["clicks_lost"] += 1
+            d._pending = [c for c in d._pending if now < c[1]]
         d.foreground = self.game
         d.switches += 1
         self.last_switch_time = time.perf_counter()
@@ -181,8 +204,25 @@ class DesktopMouse:
             target = d.game_at(pos)
             if target is not self.game or d.foreground is not self.game:
                 d.misdirected_clicks += 1
-        if target is not None:
-            target.click(pos[0] - target.left, pos[1] - target.top, button)
+        if target is None:
+            return
+        with d.lock:
+            d._last_click[target] = time.perf_counter()
+        x, y = pos[0] - target.left, pos[1] - target.top
+        if not d.click_latency:
+            target.click(x, y, button)
+            return
+        click = [target, time.perf_counter() + d._rng.uniform(*d.click_latency), False]
+        with d.lock:
+            d._pending.append(click)
+
+        def deliver():
+            if not click[2]:
+                target.click(x, y, button)
+
+        timer = threading.Timer(max(0.0, click[1] - time.perf_counter()), deliver)
+        timer.daemon = True
+        timer.start()
 
     def click(self, button="left"):
         self._click(button)
@@ -214,4 +254,6 @@ class DesktopKeyboard:
             target.key(str(key))
 
     def release(self, key):
-        pass
+        target = self.desktop.foreground
+        if target is not None:
+            target.key_up(str(key))

@@ -272,6 +272,7 @@ class SkinTests(unittest.TestCase):
         screen2.panel_open = True
         self.assertTrue(bot2.wait_for_minigame_window(timeout=2.0))
         self.assertLessEqual(abs(bot2._circle_center[0] - 165), 4)   # known before any learning
+        bot2._ring_turns_red = False   # simulated ring is never red: test the circle rule (see test_ring_gate.py)
         self._assert_all_in_circle(play(bot2, screen2, 2.5))
 
 
@@ -407,7 +408,7 @@ class GameLoopAdaptTests(unittest.TestCase):
         bot.bait_and_cast = cast
         bot._startup_scan_and_process_all_pages = lambda: None
         bot._resume_inventory_check = lambda: None
-        bot.handle_caught_item = lambda may_have_catch=True: None
+        bot.handle_caught_item = lambda may_have_catch=True, baseline=None, **kw: None
         thread = threading.Thread(target=bot.play_game, daemon=True)
         thread.start()
         return state, thread

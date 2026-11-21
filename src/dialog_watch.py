@@ -117,6 +117,8 @@ def wait(grab: Grab, point: Point, baseline: Optional[np.ndarray], timeout: floa
                     break
                 lp.score("change", change)
                 if not want_change:
+                    # One read like the old look is enough: replayed on a
+                    # real client it never came while the dialog was up.
                     if change <= CHANGED:
                         seen = True
                         break
@@ -140,3 +142,27 @@ def wait(grab: Grab, point: Point, baseline: Optional[np.ndarray], timeout: floa
     if remaining > 0:
         time.sleep(remaining)
     return seen
+
+
+def still_up(grab: Grab, point: Point, baseline: Optional[np.ndarray], what: str = "dialog",
+             owner=None, reads: int = 3, gap: float = 0.03) -> bool:
+    """Does the dialog still show at ``point``? Every one of ``reads``
+    looks must differ from ``baseline`` and, once its look was learned
+    (``confirm``), resemble it. Used before clicking a button a second time:
+    a click on the world behind a dialog that is not there makes the
+    character walk."""
+    if baseline is None or point is None:
+        return False
+    learned = _learned.get(_key(point, what, owner))
+    if learned is not None and learned.shape != baseline.shape:
+        learned = None
+    for i in range(reads):
+        patch = read_patch(grab, point, (baseline.shape[1], baseline.shape[0]))
+        change = difference(patch, baseline)
+        if change is None or change <= CHANGED:
+            return False
+        if learned is not None and difference(patch, learned) >= SAME_DIALOG:
+            return False
+        if i + 1 < reads:
+            time.sleep(gap)
+    return True

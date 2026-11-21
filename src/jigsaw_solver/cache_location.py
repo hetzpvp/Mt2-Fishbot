@@ -23,7 +23,10 @@ def cache_file_name() -> str:
 
 
 def program_cache_dir() -> str:
-    if getattr(sys, "frozen", False):
+    home = os.environ.get("FISHBOT_HOME")   # a disguised copy (disguise.py)
+    if getattr(sys, "frozen", False) and home and os.path.isdir(home):
+        root = home
+    elif getattr(sys, "frozen", False):
         root = os.path.dirname(os.path.abspath(sys.executable))
     else:
         root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

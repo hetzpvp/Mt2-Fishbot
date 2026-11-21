@@ -682,7 +682,7 @@ TOPICS: Dict[str, dict] = {
         draw=draw_armor_slot),
     "fish_handling": dict(
         title="What happens to each fish",
-        steps=["Turn on Automatic Fish Handling and press Configure Fish and Items.",
+        steps=["Fishing tab: turn on Automatic Fish Handling and press Configure Fish and Items.",
                "Choose keep, drop or open for each fish, and keep or drop for each item.",
                "Drop needs the Confirm coordinate (and Drop / Sell if your client asks drop or sell first)."],
         draw=draw_fish_handling),

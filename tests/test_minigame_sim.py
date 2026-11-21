@@ -166,17 +166,13 @@ class BotPlaysTests(unittest.TestCase):
         self.assertEqual(s["stray_clicks"], 0)
         self.assertFalse(bot.detector.profile.learned)
 
-    def test_reskinned_clients(self):
-        for name in SKINS:
-            if name == "official" or name in HARD_SKINS:
-                continue
-            with self.subTest(skin=name):
-                game, bot, logs = self._session(name)
-                s = game.stats
-                self.assertTrue(bot.detector.profile.learned, logs[-12:])
-                self.assertEqual(s["timeouts"], 0, logs[-12:])
-                self.assertGreaterEqual(s["caught"], 3)
-                self.assertLessEqual(s["misses"], 2)              # an occasional late click
+    def _check_reskinned_client(self, name):
+        game, bot, logs = self._session(name)
+        s = game.stats
+        self.assertTrue(bot.detector.profile.learned, logs[-12:])
+        self.assertEqual(s["timeouts"], 0, logs[-12:])
+        self.assertGreaterEqual(s["caught"], 3)
+        self.assertLessEqual(s["misses"], 2)              # an occasional late click
 
     def test_human_like_clicking_still_catches(self):
         game, _bot, logs = self._session("official", config={"human_like_clicking": True})
@@ -199,6 +195,22 @@ class BotPlaysTests(unittest.TestCase):
         self.assertGreaterEqual(s["caught"], 4)
         self.assertGreaterEqual(s["dropped"], s["caught"] - 1)             # the last one may be mid-handling
         self.assertEqual(s["drop_cancelled"], 0)
+
+
+# One test per reskinned client (test_reskinned_client_<skin>), not one test
+# looping over all of them: each session takes 10-20 s of real time, so the
+# loop was the longest single test (~110 s) and set the floor of the parallel
+# run. As separate tests the xdist workers share them out.
+def _reskinned_client_test(name):
+    def test(self):
+        self._check_reskinned_client(name)
+    test.__doc__ = f"A client reskinned as {name!r} is learned and fished."
+    return test
+
+
+for _skin in SKINS:
+    if _skin not in ("official", "official-real", "real-mt2") and _skin not in HARD_SKINS:   # stock colors: nothing to learn
+        setattr(BotPlaysTests, "test_reskinned_client_" + _skin.replace("-", "_"), _reskinned_client_test(_skin))
 
 
 if __name__ == "__main__":

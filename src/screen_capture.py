@@ -31,7 +31,7 @@ the bot already uses.
 
 import threading
 import time
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -171,6 +171,11 @@ class WindowCapture:
         self._print_window = window_grabber or print_window
         self.diag_tag = getattr(window_manager, "diag_tag", None)
         self._last_method = None
+        # Diagnostics: (method, ms) of the last grab. A caller that writes
+        # its own capture line (FishingBot) sets diag_log_grabs False and
+        # puts these in it, so one capture is one line.
+        self.diag_last_grab: Optional[Tuple[str, float]] = None
+        self.diag_log_grabs = True
         self._diag_anomaly_time = 0.0
         requested_raw = mode
         mode = str(mode or MODE_AUTO).lower()
@@ -207,6 +212,7 @@ class WindowCapture:
         """Returns a contiguous BGR array of the given window-relative rectangle,
         or None when nothing could be captured."""
         rel_left, rel_top, width, height = int(rel_left), int(rel_top), int(width), int(height)
+        t0 = time.perf_counter() if diag.ENABLED else 0.0
         if width <= 0 or height <= 0:
             diag.log("CAPTURE", f"grab of empty rect ({rel_left},{rel_top},{width},{height}) -> None",
                      tag=self.diag_tag)
@@ -216,7 +222,7 @@ class WindowCapture:
             frame = self._grab_window(rel_left, rel_top, width, height)
             if frame is not None or self.requested == MODE_WINDOW:
                 if diag.ENABLED:
-                    self._diag_grab((rel_left, rel_top, width, height), MODE_WINDOW, frame)
+                    self._diag_grab((rel_left, rel_top, width, height), MODE_WINDOW, frame, t0)
                 self._last_method = MODE_WINDOW
                 return frame
             # auto: render failed (e.g. minimized) — the screen copy is the best we have
@@ -233,24 +239,29 @@ class WindowCapture:
         else:
             frame = self._grab_screen(rel_left, rel_top, width, height)
         if diag.ENABLED:
-            self._diag_grab((rel_left, rel_top, width, height), MODE_SCREEN, frame)
+            self._diag_grab((rel_left, rel_top, width, height), MODE_SCREEN, frame, t0)
         self._last_method = MODE_SCREEN
         return frame
 
-    def _diag_grab(self, rect, method: str, frame) -> None:
+    def _diag_grab(self, rect, method: str, frame, t0: float) -> None:
         """Logs one grab. Anomalies (None / black / flat) always, throttled
-        to one line per 2 s; ordinary grabs as per-frame detail."""
+        to one line per 2 s inside per-frame loops; ordinary grabs as
+        per-frame detail (unless the caller writes the capture line)."""
         try:
+            ms = (time.perf_counter() - t0) * 1000 if t0 else 0.0
+            self.diag_last_grab = (method, ms)
+            diag.sample("capture_ms", ms, tag=self.diag_tag)
             st = diag.frame_stats(frame) if frame is not None else None
             anomaly = "None" if frame is None else ("BLACK" if st and st["black"] else ("FLAT" if st and st["flat"] else ""))
-            text = (f"grab rel={rect} via {method} -> "
+            text = (f"grab rel={rect} via {method} {ms:.1f} ms -> "
                     f"{'None' if frame is None else diag.array_summary(frame)}")
             if anomaly:
                 now = time.perf_counter()
-                if diag.VERBOSE or not diag.in_loop() or now - self._diag_anomaly_time >= 2.0:
+                if not diag.in_loop() or now - self._diag_anomaly_time >= 2.0:
                     self._diag_anomaly_time = now
-                    diag.log("CAPTURE", f"{anomaly} frame: {text}", tag=self.diag_tag, depth=1)
-            else:
+                    diag.event("CAPTURE", f"{anomaly} frame: {text}", kind="capture problem",
+                               tag=self.diag_tag, depth=1)
+            elif self.diag_log_grabs:
                 diag.trace("CAPTURE", text, tag=self.diag_tag, depth=1)
         except Exception:
             diag.exc("capture log", tag=self.diag_tag)

@@ -55,7 +55,7 @@ class UnknownCatchFillsPageTests(unittest.TestCase):
     def test_full_page_of_unknown_items_switches_page(self):
         _, bot, _ = quiet_bot({"auto_fish_handling": True, "fish_actions": {"x_item.jpg": "keep"}})
         frame = np.zeros((40, 40, 3), np.uint8)
-        bot._find_new_item = lambda allow_extra: (None, frame)
+        bot._find_new_item = lambda allow_extra, baseline=None, **kw: (None, frame)
         bot._page_has_space = lambda f=None, expected=None: False
         switches = []
         bot._switch_inventory_page = lambda: switches.append(1)
@@ -64,7 +64,7 @@ class UnknownCatchFillsPageTests(unittest.TestCase):
 
     def test_game_without_a_hit_does_not_judge_the_page(self):
         _, bot, _ = quiet_bot({"auto_fish_handling": True, "fish_actions": {"x_item.jpg": "keep"}})
-        bot._find_new_item = lambda allow_extra: (None, None)
+        bot._find_new_item = lambda allow_extra, baseline=None, **kw: (None, None)
         bot._page_has_space = lambda f=None, expected=None: self.fail("page judged without a catch")
         bot.handle_caught_item(may_have_catch=False)
 
@@ -143,7 +143,9 @@ class JigsawNoDialogTests(unittest.TestCase):
     def test_crate_without_a_dialog_gets_no_confirm(self):
         game = JigsawGame(seed=11, dialog_delay=999.0)
         rig = jsim.Rig([game], {"jigsaw_dialog_wait_timeout": 0.05})
-        rig.run(lambda: game.opened >= 3, timeout=60)
+        # The bot pauses itself after a few crates with no piece; waiting only
+        # for 3 openings ran the full 60 s timeout every time.
+        rig.run(lambda: game.opened >= 3 or (0, True) in rig.pauses, timeout=60)
         self.assertGreaterEqual(game.opened, 1, rig.logs[-8:])
         self.assertEqual(game.early_confirms, 0, rig.logs[-8:])
 

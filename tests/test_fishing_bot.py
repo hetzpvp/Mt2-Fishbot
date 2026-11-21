@@ -57,6 +57,10 @@ class OfficialClientTests(unittest.TestCase):
 
         # This test steps a virtual clock; speed prediction needs real time.
         bot._TRACK_MIN_SPAN = float("inf")
+        # The simulated ring never turns red and the virtual clock never adds up
+        # to the ring gate's proof time: test the circle rule (tests/test_ring_gate.py
+        # covers the red-ring rule).
+        bot._ring_turns_red = False
         outside_clicks = 0
         for _ in range(150):
             screen.t += 0.02
@@ -338,6 +342,8 @@ class PageSwitchTests(unittest.TestCase):
 
     def test_tabs_that_cannot_be_read_cost_two_timeouts_at_most(self):
         screen = InventoryScreen(highlight=False)                     # a client that does not light its tabs
+        item = cv2.imread(os.path.join(ROOT, "assets", "fishing", "Carp_living.jpg"))
+        screen.fill(3, 7, item)                                       # page 4 looks unlike page 3
         bot, _mouse, _logs = make_inventory_bot(screen)
         bot._PAGE_WAIT_TIMEOUT = 0.3
         for page in (2, 3):
@@ -350,6 +356,50 @@ class PageSwitchTests(unittest.TestCase):
         self.assertEqual(len(screen.tab_clicks), clicks + 1)
         screen.render()
         self.assertEqual(screen.page, 3)
+
+    def _two_tab_bot(self, screen):
+        """Only pages 1 and 2 set up: the active tab cannot be read."""
+        cfg = {f"inv_page_{page}_pos": list(screen.TABS[page]) for page in (1, 2)}
+        return make_inventory_bot(screen, cfg, tabs=False)[0]
+
+    def test_two_tabs_a_missed_click_is_noticed_and_repeated(self):
+        """Diagnostics 20261120_190647: right after a switch between game
+        windows the game missed the click back to page 1, and with only two
+        tabs nothing noticed: page 2 was used as page 1."""
+        screen = InventoryScreen(lost_clicks=1)
+        item = cv2.imread(os.path.join(ROOT, "assets", "fishing", "Carp_living.jpg"))
+        screen.fill(0, 8, item)                                       # page 1: 37 empty, page 2: 45
+        screen.page = 1
+        bot = self._two_tab_bot(screen)
+        self.assertTrue(bot._goto_page(screen.TABS[1], settle=0.05))
+        self.assertEqual(screen.tab_clicks, [1, 1])
+        screen.render()
+        self.assertEqual(screen.page, 0)
+
+    def test_two_tabs_a_click_that_worked_is_not_repeated(self):
+        screen = InventoryScreen()
+        item = cv2.imread(os.path.join(ROOT, "assets", "fishing", "Carp_living.jpg"))
+        screen.fill(0, 8, item)
+        bot = self._two_tab_bot(screen)
+        self.assertTrue(bot._goto_page(screen.TABS[2], settle=0.05))
+        self.assertEqual(screen.tab_clicks, [2])
+        screen.render()
+        self.assertEqual(screen.page, 1)
+
+    def test_two_tabs_pages_that_look_alike_cost_one_harmless_click(self):
+        screen = InventoryScreen()                                    # both pages empty
+        bot = self._two_tab_bot(screen)
+        self.assertTrue(bot._goto_page(screen.TABS[2], settle=0.05))
+        self.assertEqual(screen.tab_clicks, [2, 2])
+        screen.render()
+        self.assertEqual(screen.page, 1)
+
+    def test_same_empty_slots_allows_one_item_landing(self):
+        grid = [(x, y) for y in range(16, 300, 32) for x in range(16, 160, 32)]
+        self.assertEqual(inventory_layout.same_empty_slots(grid, [(x + 2, y - 1) for x, y in grid]), (True, 0))
+        self.assertEqual(inventory_layout.same_empty_slots(grid, grid[1:]), (True, 1))
+        self.assertEqual(inventory_layout.same_empty_slots(grid, grid[5:]), (False, 5))
+        self.assertEqual(inventory_layout.same_empty_slots([], []), (True, 0))
 
     def test_startup_scan_judges_each_page_by_its_own_content(self):
         """On a slow machine every page used to be judged by the one before."""
@@ -410,7 +460,7 @@ class GameLoopTests(unittest.TestCase):
         bot.bait_and_cast = cast
         bot._startup_scan_and_process_all_pages = lambda: None
         bot._resume_inventory_check = lambda: None
-        bot.handle_caught_item = lambda may_have_catch=True: handled.append(may_have_catch)
+        bot.handle_caught_item = lambda may_have_catch=True, baseline=None, **kw: handled.append(may_have_catch)
 
         thread = threading.Thread(target=bot.play_game, daemon=True)
         thread.start()

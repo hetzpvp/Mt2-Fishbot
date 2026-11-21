@@ -127,7 +127,16 @@ class OverlapTests(unittest.TestCase):
         games[1].left = games[0].left + 200          # partly on top of the first
         for bot in bots:
             self.assertTrue(bot.capture.reads_screen_when_covered)
-        desktop.run(lambda: all(b.stop_reason for b in bots), timeout=30)
+        # Not "until both stop": the first bot plays on alone by design, so
+        # that wait always ran the full timeout. Stop 2 s after the refusal,
+        # long enough for the other bot to cast if it is going to.
+        refused_at = []
+
+        def refused_and_played_on():
+            if not refused_at and any(b.stop_reason == FishingBot.STOP_CAPTURE_OVERLAP for b in bots):
+                refused_at.append(time.time())
+            return bool(refused_at) and time.time() - refused_at[0] >= 2.0
+        desktop.run(refused_and_played_on, timeout=30)
         reasons = [b.stop_reason for b in bots]
         self.assertIn(FishingBot.STOP_CAPTURE_OVERLAP, reasons, desktop.logs[-10:])
         self.assertTrue(any("overlaps W" in m for m in desktop.logs), desktop.logs[-10:])
@@ -236,7 +245,8 @@ class DropLoopTests(unittest.TestCase):
 
     def test_ground_click_that_hits_ui_puts_the_item_back(self):
         game, cfg = self._game_and_config(blocked_ground_clicks=1)
-        bot, logs, blind = self._run(game, cfg)
+        # (the first drop waits for a timed bite: it comes at the end of game 2)
+        bot, logs, blind = self._run(game, cfg, catches=4)
         self.assertEqual(game.stats["blocked_ground_clicks"], 1)
         self.assertEqual(blind, [], "a button was clicked without its dialog")
         self.assertIsNone(game.carrying, "the item was left on the cursor")
@@ -375,7 +385,7 @@ class LockSafetyTests(unittest.TestCase):
             def release(self, key):
                 events.append(("release", key))
 
-        bot.keyboard_controller = Keyboard()
+        bot.keyboard_controller = bot.human.keyboard_controller = Keyboard()
         bot.press_ctrl_key("g")
         from fishing_bot import Key
         self.assertIn(("release", Key.ctrl), events, events)
@@ -423,7 +433,8 @@ class PerClientTests(unittest.TestCase):
             return True
 
         bot.window_manager.is_foreground = is_foreground
-        run_bot(bot, lambda: game.stats["caught"] >= 2, timeout=90)
+        # (the first drop waits for a timed bite: it comes at the end of game 2)
+        run_bot(bot, lambda: game.stats["caught"] >= 3, timeout=90)
         self.assertEqual(state["stolen"], 1)
         self.assertIsNone(game.carrying, "item left on the cursor after the focus was lost")
         self.assertTrue(any("lost the focus" in m for m in logs), logs[-10:])

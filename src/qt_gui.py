@@ -55,11 +55,12 @@ if _HERE not in sys.path:
 
 from utils import (  # noqa: E402
     DEBUG_MODE_EN, DEBUG_PRINTS, DISCORD_INVITE_URL, MAX_WINDOWS,
-    get_resource_path, normalize_fish_action,
+    get_resource_path, is_bait_fish, normalize_fish_action, with_dead_fish_actions,
     load_window_icon, play_pause_beep, play_rickroll_beep,
 )
 import diag  # noqa: E402
 import dialog_watch  # noqa: E402
+import disguise  # noqa: E402
 import inventory_layout  # noqa: E402
 import setup_checks  # noqa: E402
 from window_manager import WindowManager, window_size_mismatch  # noqa: E402
@@ -152,6 +153,14 @@ SANS = "'Segoe UI', 'Inter', system-ui, sans-serif"
 MODE_FISHING = "fishing"
 MODE_JIGSAW = "jigsaw"
 MODE_NAMES = {MODE_FISHING: "Fishing", MODE_JIGSAW: "Jigsaw Puzzle"}
+# Former options that are now always on (no checkbox): the Golden Tuna answer
+# (harmless where the dialog does not exist), learning re-skinned minigame
+# colors and shortening the wait before the next cast.
+ALWAYS_ON_KEYS = ("golden_tuna", "adaptive_detection", "adaptive_recast_wait")
+# Each activity has its own color (mode buttons, the bar under them, the mode
+# tag), so the selected one is seen at a glance whatever the accent color.
+MODE_COLORS = {MODE_FISHING: "#5aa9ff", MODE_JIGSAW: "#b46cf2"}
+MODE_TAGS = {MODE_FISHING: "FISHBOT MODE", MODE_JIGSAW: "JIGSAW PUZZLE SOLVER MODE"}
 
 # Interface size. Everything is laid out in logical pixels for a 920x664
 # window; Qt's own scale factor (QT_SCALE_FACTOR) enlarges or shrinks text,
@@ -323,24 +332,6 @@ def build_qss(accent: Optional[str] = None) -> str:
         font-weight: 400;
         letter-spacing: 1px;
     }}
-    .HlPill {{
-        background: {C['bg_2']};
-        border: 1px solid {C['line_2']};
-        border-radius: 11px;
-        padding: 0 10px;
-    }}
-    .HlLabel {{
-        color: {C['text_mute']};
-        font-family: {MONO};
-        font-size: 10px;
-        letter-spacing: 2px;
-    }}
-    .HlValue {{
-        color: {accent};
-        font-family: {MONO};
-        font-size: 12px;
-        font-weight: 600;
-    }}
     QPushButton#DiscordBtn {{
         background: #5865F2;
         color: white;
@@ -354,16 +345,26 @@ def build_qss(accent: Optional[str] = None) -> str:
     }}
     QPushButton#DiscordBtn:hover {{ background: #6d78f5; }}
     QPushButton#DiscordBtn:pressed {{ background: #4752c4; }}
-    .HlValueIdle {{ color: {C['green']}; font-family: {MONO}; font-size: 12px; font-weight: 600; }}
-    .HlValueRun  {{ color: {accent}; font-family: {MONO}; font-size: 12px; font-weight: 600; }}
-    .HlValuePaused {{ color: {C['orange']}; font-family: {MONO}; font-size: 12px; font-weight: 600; }}
-    .HlValueWarn {{ color: {C['red']}; font-family: {MONO}; font-size: 12px; font-weight: 600; }}
 
     /* ---------- Mode bar (Fishing | Jigsaw) ---------- */
     #ModeBar {{
         background: {C['bg_0']};
-        border-bottom: 1px solid {C['line']};
+        border-bottom: 3px solid {C['line']};
     }}
+    #ModeBar[mode="fishing"] {{ background: rgba(90,169,255,0.07); border-bottom: 3px solid {MODE_COLORS['fishing']}; }}
+    #ModeBar[mode="jigsaw"]  {{ background: rgba(180,108,242,0.08); border-bottom: 3px solid {MODE_COLORS['jigsaw']}; }}
+    QLabel#ModeTag {{
+        font-family: {MONO};
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 1px;
+        border-radius: 10px;
+        padding: 2px 10px;
+    }}
+    QLabel#ModeTag[mode="fishing"] {{ color: {MODE_COLORS['fishing']}; background: rgba(90,169,255,0.14);
+                                      border: 1px solid {MODE_COLORS['fishing']}; }}
+    QLabel#ModeTag[mode="jigsaw"]  {{ color: {MODE_COLORS['jigsaw']}; background: rgba(180,108,242,0.14);
+                                      border: 1px solid {MODE_COLORS['jigsaw']}; }}
     .ModeCaption {{
         font-family: {MONO};
         font-size: 11px;
@@ -386,6 +387,12 @@ def build_qss(accent: Optional[str] = None) -> str:
         background: {C['bg_3']};
         color: {accent};
         border: 2px solid {accent};
+    }}
+    QPushButton.ModeBtn[active="true"][mode="fishing"] {{
+        background: {MODE_COLORS['fishing']}; color: #0b0b0e; border: 2px solid {MODE_COLORS['fishing']};
+    }}
+    QPushButton.ModeBtn[active="true"][mode="jigsaw"] {{
+        background: {MODE_COLORS['jigsaw']}; color: #0b0b0e; border: 2px solid {MODE_COLORS['jigsaw']};
     }}
     QPushButton.ModeBtn:disabled {{ color: #4a4a52; border-color: {C['line']}; background: {C['bg_1']}; }}
     .ModeHint {{ font-family: {MONO}; font-size: 11px; color: {C['text_mute']}; }}
@@ -786,9 +793,10 @@ def build_qss(accent: Optional[str] = None) -> str:
         border: 1px solid {C['line']};
         border-radius: 6px;
     }}
-    .FishImgKeep {{ border: 3px solid rgba(74,222,128,0.95); }}
-    .FishImgDrop {{ border: 3px solid rgba(239,94,94,0.95); }}
-    .FishImgOpen {{ border: 3px solid rgba(90,169,255,0.95); }}
+    .FishImgKeep {{ border: 2px solid rgba(74,222,128,0.95); }}
+    .FishImgDrop {{ border: 2px solid rgba(239,94,94,0.95); }}
+    .FishImgOpen {{ border: 2px solid rgba(90,169,255,0.95); }}
+    .FishImgUse {{ border: 2px solid rgba(180,108,242,0.95); }}
     .FishName {{
         font-family: {MONO};
         font-size: 13px;
@@ -815,6 +823,7 @@ def build_qss(accent: Optional[str] = None) -> str:
     QPushButton.SegBtn[active="keep"]  {{ background: rgba(74,222,128,0.18); color: {C['green']}; }}
     QPushButton.SegBtn[active="drop"]  {{ background: rgba(239,94,94,0.18); color: {C['red']}; }}
     QPushButton.SegBtn[active="open"]  {{ background: rgba(90,169,255,0.18); color: {C['blue']}; }}
+    QPushButton.SegBtn[active="use"]   {{ background: rgba(180,108,242,0.18); color: {C['purple']}; }}
 
     /* ---------- Wizard ---------- */
     .WizStep {{ font-family: {MONO}; font-size: 11px; color: {C['text_mute']}; letter-spacing: 1px; }}
@@ -1001,6 +1010,29 @@ def qss_icon_file(name: str, color: str, size: int = 12) -> str:
     except Exception:
         diag.exc()
         return ""
+
+
+def plain_letter_icon(name: str) -> QIcon:
+    """A plain icon (first letter on a gray rounded square), for the
+    disguised window: the monkey would give the program away."""
+    icon = QIcon()
+    for px in (16, 32, 48, 64):
+        pix = QPixmap(px, px)
+        pix.fill(Qt.transparent)
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#5b6472"))
+        p.drawRoundedRect(0, 0, px, px, px * 0.22, px * 0.22)
+        font = p.font()
+        font.setBold(True)
+        font.setPixelSize(int(px * 0.62))
+        p.setFont(font)
+        p.setPen(QColor("#f2f4f7"))
+        p.drawText(pix.rect(), Qt.AlignCenter, (name.strip()[:1] or "A").upper())
+        p.end()
+        icon.addPixmap(pix)
+    return icon
 
 
 def name_icon_buttons(root: QWidget) -> None:
@@ -1197,6 +1229,28 @@ class ReadyChips(QWidget):
                 chip.setProperty("state", state)
                 chip.style().unpolish(chip)
                 chip.style().polish(chip)
+
+    def setProgress(self, key: str, percent: Optional[int]) -> None:
+        """Fills chip ``key`` from the left with green up to ``percent``
+        (a small progress bar inside the chip); None: a plain chip."""
+        chip = self.chips.get(key)
+        if chip is None:
+            return
+        if percent is None:
+            if chip.property("progress") is not None:
+                chip.setProperty("progress", None)
+                chip.setStyleSheet("")
+            return
+        p = max(0.0, min(1.0, percent / 100.0))
+        if chip.property("progress") == round(p, 2):
+            return
+        chip.setProperty("progress", round(p, 2))
+        edge = min(0.999, p + 0.001)
+        chip.setStyleSheet(
+            f"QPushButton {{ color: {C['green']}; border-color: rgba(74,222,128,0.55); "
+            f"background: qlineargradient(x1:0, y1:0, x2:1, y2:0, "
+            f"stop:0 rgba(74,222,128,0.38), stop:{p:.3f} rgba(74,222,128,0.38), "
+            f"stop:{edge:.3f} {C['bg_2']}, stop:1 {C['bg_2']}); }}")
 
     def allOk(self) -> bool:
         return all(c.property("state") == "ok" for c in self.chips.values())
@@ -1479,7 +1533,7 @@ class NoticeBar(QFrame):
 
 
 # ============================================================================
-# Header (frameless window chrome: icon, title, Discord, status, min / close)
+# Header (frameless window chrome: icon, title, Discord, min / close)
 # ============================================================================
 
 class Header(QFrame):
@@ -1487,9 +1541,6 @@ class Header(QFrame):
 
     minimize = Signal()
     close_window = Signal()
-
-    STATUS_CLASS = {"idle": "HlValueIdle", "running": "HlValueRun",
-                    "paused": "HlValuePaused", "warn": "HlValueWarn"}
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -1505,7 +1556,7 @@ class Header(QFrame):
         self.gif.setAlignment(Qt.AlignCenter)
         self.gif.setStyleSheet("background: #2a1808; border-radius: 6px; border: 1px solid #1a0f06; "
                                "font-size: 17px;")
-        self.gif.setText("🐒")
+        self.gif.setText("")
         layout.addWidget(self.gif)
         self._load_monkey()
 
@@ -1526,8 +1577,6 @@ class Header(QFrame):
             lambda: QDesktopServices.openUrl(QUrl(DISCORD_INVITE_URL))
         )
         layout.addWidget(self._discord_pill)
-        self._status_pill, self._status_value = self._make_hl_status("STATUS", "● IDLE")
-        layout.addWidget(self._status_pill)
         layout.addSpacing(4)
 
         for ico_name, slot, obj_name, tip in [
@@ -1554,31 +1603,6 @@ class Header(QFrame):
         self.gif.setText("")
         self.gif.setMovie(movie)
         movie.start()
-
-    def _make_hl_status(self, label: str, value: str) -> Tuple[QFrame, QLabel]:
-        f = QFrame()
-        f.setProperty("class", "HlPill")
-        f.setFixedHeight(24)
-        l = QHBoxLayout(f)
-        l.setContentsMargins(10, 0, 10, 0)
-        l.setSpacing(6)
-        lbl = QLabel(label)
-        lbl.setProperty("class", "HlLabel")
-        val = QLabel(value)
-        val.setProperty("class", "HlValueIdle")
-        val.setMinimumWidth(90)     # fits "● FISHING" / "● JIGSAW" / "● PAUSED"
-        l.addWidget(lbl)
-        l.addWidget(val)
-        return f, val
-
-    def statusText(self) -> str:
-        return self._status_value.text()
-
-    def setStatus(self, text: str, kind: str = "idle") -> None:
-        self._status_value.setText(text)
-        self._status_value.setProperty("class", self.STATUS_CLASS.get(kind, "HlValueIdle"))
-        self._status_value.style().unpolish(self._status_value)
-        self._status_value.style().polish(self._status_value)
 
     # Drag-to-move (the window is frameless)
     def mousePressEvent(self, ev) -> None:
@@ -1623,8 +1647,21 @@ class TabsBar(QFrame):
             layout.addWidget(btn)
             self._buttons[tab_id] = btn
         layout.addStretch(1)
+        # Which activity the tabs belong to (set by the window)
+        self.mode_tag = QLabel("")
+        self.mode_tag.setObjectName("ModeTag")
+        layout.addWidget(self.mode_tag, 0, Qt.AlignVCenter)
         if items:
             self.setActive(items[0][0])
+
+    def setModeTag(self, mode: str) -> None:
+        self.mode_tag.setText(f"● {MODE_TAGS[mode]}")
+        self.mode_tag.setToolTip("The Fishing / Jigsaw tab and the Dashboard belong to this activity. "
+                                 "Switch with the buttons above.")
+        if self.mode_tag.property("mode") != mode:
+            self.mode_tag.setProperty("mode", mode)
+            self.mode_tag.style().unpolish(self.mode_tag)
+            self.mode_tag.style().polish(self.mode_tag)
 
     def active(self) -> str:
         return self._active
@@ -1670,7 +1707,7 @@ class ModeBar(QFrame):
     mode_changed = Signal(str)
     wizard_requested = Signal()
 
-    IDLE_HINT = "Only one activity runs at a time."
+    IDLE_HINT = ""
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -1681,13 +1718,14 @@ class ModeBar(QFrame):
         layout.setSpacing(8)
         self._buttons: Dict[str, QPushButton] = {}
         for mode, text, tip in (
-            (MODE_FISHING, "🎣  FISHING",
+            (MODE_FISHING, "FISHBOT",
              "Cast, play the fishing minigame and sort the catch"),
-            (MODE_JIGSAW, "🧩  JIGSAW PUZZLE",
+            (MODE_JIGSAW, "JIGSAW PUZZLE SOLVER",
              "Open fish puzzle crates and solve the Fishing Jigsaw boards"),
         ):
             btn = QPushButton(text)
             btn.setProperty("class", "ModeBtn")
+            btn.setProperty("mode", mode)
             btn.setProperty("active", "false")
             btn.setMinimumWidth(170)
             btn.setFixedHeight(34)
@@ -1697,6 +1735,7 @@ class ModeBar(QFrame):
             layout.addWidget(btn)
             self._buttons[mode] = btn
         layout.addSpacing(6)
+        # Empty while idle; says why the other activity is locked while one runs.
         self.hint = QLabel("")
         self.hint.setProperty("class", "ModeHint")
         self.hint.setWordWrap(True)
@@ -1767,6 +1806,10 @@ class ModeBar(QFrame):
         self.mode_changed.emit(mode)
 
     def _refresh(self) -> None:
+        if self.property("mode") != self._mode:
+            self.setProperty("mode", self._mode)
+            self.style().unpolish(self)
+            self.style().polish(self)
         for mode, btn in self._buttons.items():
             active = mode == self._mode
             btn.setProperty("active", "true" if active else "false")
@@ -2110,6 +2153,23 @@ class DashboardTab(QWidget):
         self.kpi_cap.setValue(f"{bait_cap:,}")
 
 
+class WrapLabel(QLabel):
+    """A word-wrapped label that always gets the height its text needs.
+    Layouts inside a scroll area hand a wrapped label the height of the
+    text at its preferred width, which cuts off the last line when the
+    window is narrower."""
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(text, parent)
+        self.setWordWrap(True)
+
+    def resizeEvent(self, ev) -> None:
+        super().resizeEvent(ev)
+        need = self.heightForWidth(self.width())
+        if need > 0 and need != self.minimumHeight():
+            self.setMinimumHeight(need)
+
+
 class ElidedLabel(QLabel):
     """A one-line label that ends in "…" when its text does not fit (a plain
     QLabel just cuts it off mid-word). text() stays the full text."""
@@ -2306,8 +2366,6 @@ class InventoryTab(QWidget):
 
     set_coord = Signal(str)  # mode key
     unset_coord = Signal(str)  # mode key - the pill's ✕
-    open_fish_modal = Signal()
-    auto_fish_toggled = Signal(bool)
     cancel_capture = Signal()
 
     FISHING_ONLY = ("drop", "armor")
@@ -2383,68 +2441,37 @@ class InventoryTab(QWidget):
         action_card.add(self.action_hint)
         layout.addWidget(action_card)
 
-        # --- Auto fish handling ---
-        auto_card = Card("Automatic Fish Handling")
-        self.fishing_only_badge = QLabel("FISHING ONLY")
-        self.fishing_only_badge.setProperty("class", "Badge")
-        self.fishing_only_badge.setVisible(False)
-        auto_card.addAction(self.fishing_only_badge)
-        self.auto_check = QCheckBox("Enable")
-        self.auto_check.toggled.connect(self.auto_fish_toggled.emit)
-        auto_card.addAction(self.auto_check)
-        body = QHBoxLayout()
-        body.setSpacing(12)
-        desc = QLabel()
-        desc.setText(
-            f"After each catch: <span style='color:{C['green']};'>keep</span>, "
-            f"<span style='color:{C['red']};'>drop/sell</span> or "
-            f"<span style='color:{C['blue']};'>open</span> each fish, and keep or drop each item."
-        )
-        desc.setTextFormat(Qt.RichText)
-        desc.setWordWrap(True)
-        desc.setProperty("class", "HintDim")
-        self.configure_fish_btn = QPushButton("  Configure Fish and Items")
-        self.configure_fish_btn.setProperty("class", "Btn")
-        self.configure_fish_btn.setIcon(make_icon("fish", 14, C["text"]))
-        self.configure_fish_btn.setCursor(Qt.PointingHandCursor)
-        self.configure_fish_btn.clicked.connect(self.open_fish_modal.emit)
-        body.addWidget(desc, 1)
-        body.addWidget(self.configure_fish_btn)
-        auto_card.body_layout.addLayout(body)
-        layout.addWidget(auto_card)
-        self.auto_card = auto_card
         layout.addStretch(1)
 
-        self._auto_fish_enabled = False
         self.setMode(MODE_FISHING)
 
     def setMode(self, mode: str) -> None:
         """Both activities share this tab. In Jigsaw mode the Fishing-only
-        parts stay visible but are greyed out with a FISHING ONLY note, so
-        nothing seems to vanish; Confirm becomes required (crate dialog)."""
+        points stay visible but are greyed out, so nothing seems to vanish;
+        Confirm becomes required (crate dialog). Page 1 is required in both:
+        Fishing finds where catches land, Jigsaw searches the pages for
+        crates and checks that the inventory has room."""
         self._mode = mode
         fishing = mode != MODE_JIGSAW
-        self.fishing_only_badge.setVisible(not fishing)
         self.coord_pills["confirm"].setOptional(fishing, "for drops" if fishing else "")
-        # Fishing needs Page 1 to know where catches land. Jigsaw only uses
-        # the pages to find crates for refilling the crate slots.
-        self.coord_pills["page1"].setOptional(not fishing)
+        self.coord_pills["page1"].setOptional(False)
         if fishing:
             self.pages_hint.setText(
                 "Click a page, then that inventory tab (I, II, …) in the game. Page 1 is required; set "
                 "the further pages your client has, in order.")
         else:
             self.pages_hint.setText(
-                "Optional for Jigsaw: the pages are searched for crates to refill the crate slots. Without "
-                "them only the crates already in the slots are used.")
+                "Click a page, then that inventory tab (I, II, …) in the game. Page 1 is required; set "
+                "the further pages your client has, in order. The solver searches them for crates and "
+                "does not play while every page is full.")
         if fishing:
             self.action_hint.setText(
                 "Confirm is the Yes button of the game's drop dialog: needed when fish are set to drop. "
                 "Spare Armor is for Armor quick skip.")
         else:
             self.action_hint.setText(
-                "Jigsaw uses the page tabs to find crates and Confirm to accept the 'open the crate?' "
-                "dialog. Drop / Sell and Spare Armor are Fishing only.")
+                "Jigsaw uses Confirm to accept the 'open the crate?' dialog. Drop / Sell and Spare Armor "
+                "are Fishing only.")
         self._apply_locks()
 
     def _apply_locks(self) -> None:
@@ -2457,10 +2484,6 @@ class InventoryTab(QWidget):
                 pill.setLocked(True, "Fishing only — not used by the Jigsaw solver.")
             else:
                 pill.setLocked(False)
-        auto_ok = not self._disabled and fishing
-        self.auto_check.setEnabled(auto_ok)
-        self.configure_fish_btn.setEnabled(auto_ok)
-        self.configure_fish_btn.setCursor(Qt.PointingHandCursor if auto_ok else Qt.ForbiddenCursor)
 
     def _on_pill_clicked(self, key: str) -> None:
         """Handle pill click - only start capture if not disabled."""
@@ -2480,14 +2503,8 @@ class InventoryTab(QWidget):
         self.capture_text.setText(text)
         self.capture_banner.setVisible(bool(key))
 
-    def setAutoFish(self, enabled: bool) -> None:
-        self._auto_fish_enabled = enabled
-        self.auto_check.blockSignals(True)
-        self.auto_check.setChecked(enabled)
-        self.auto_check.blockSignals(False)
-
     def setDisabled(self, disabled: bool) -> None:
-        """Locks all positions and fish handling while a bot runs."""
+        """Locks all positions while a bot runs."""
         self._disabled = disabled
         self._apply_locks()
 
@@ -2500,13 +2517,15 @@ class SettingsTab(QWidget):
     open_timing = Signal()
     config_changed = Signal()
     accent_changed = Signal(str)
-    forget_profile = Signal()
+    open_fish_modal = Signal()
+    auto_fish_toggled = Signal(bool)
     profile_load_requested = Signal(str)   # path
     profile_save_requested = Signal(str)   # path
     open_log_folder = Signal()
     show_log = Signal()
+    restart_requested = Signal()
 
-    BAIT_KEYS = ["1", "2", "3", "4", "F1", "F2", "F3", "F4"]
+    BAIT_KEYS =["1", "2", "3", "4", "F1", "F2", "F3", "F4"]
     # Game keys the bot presses (stored lowercase, as the bot sends them)
     LETTER_KEYS = [chr(c) for c in range(ord("a"), ord("z") + 1)]
     CAST_KEYS = ["space"] + LETTER_KEYS
@@ -2677,15 +2696,67 @@ class SettingsTab(QWidget):
         qs.body_layout.addLayout(qs_row)
         fishing_layout.addWidget(qs)
 
-        # --- Minigame detection (fishing only) ---
-        dc = Card("Minigame Detection")
-        self.adaptive_check = QCheckBox("Adapt to re-skinned minigames (learn panel and fish colors)")
-        self.adaptive_check.setToolTip(
-            "When the standard colors find no minigame after a cast, the bot learns this "
-            "client's panel and fish colors by itself and remembers them."
+        # --- Automatic fish handling ---
+        auto_card = Card("Automatic Fish Handling")
+        self.auto_check = QCheckBox("Enable")
+        self.auto_check.toggled.connect(self.auto_fish_toggled.emit)
+        auto_card.addAction(self.auto_check)
+        body = QHBoxLayout()
+        body.setSpacing(12)
+        desc = QLabel()
+        desc.setText(
+            f"After each catch: <span style='color:{C['green']};'>keep</span>, "
+            f"<span style='color:{C['red']};'>drop/sell</span> or "
+            f"<span style='color:{C['blue']};'>open</span> each fish, and keep or drop each item. "
+            f"Dropping needs Confirm (Positions tab)."
         )
-        self.adaptive_check.toggled.connect(self._on_changed)
-        dc.body_layout.addWidget(self.adaptive_check)
+        desc.setTextFormat(Qt.RichText)
+        desc.setWordWrap(True)
+        desc.setProperty("class", "HintDim")
+        self.configure_fish_btn = QPushButton("  Configure Fish and Items")
+        self.configure_fish_btn.setProperty("class", "Btn")
+        self.configure_fish_btn.setIcon(make_icon("fish", 14, C["text"]))
+        self.configure_fish_btn.setCursor(Qt.PointingHandCursor)
+        self.configure_fish_btn.clicked.connect(self.open_fish_modal.emit)
+        body.addWidget(desc, 1)
+        body.addWidget(self.configure_fish_btn)
+        auto_card.body_layout.addLayout(body)
+        fishing_layout.addWidget(auto_card)
+
+        # --- Golden Tuna (official and some private servers) ---
+        gt = Card("Golden Tuna")
+        gt.setToolTip(
+            "After a won minigame the Golden Tuna can open a dialog with three answers. The bot "
+            "answers it and clicks OK on the page that follows, then fishes on. It recognizes the "
+            "dialog by its shape (black bars, board, answer bars), not its text, so it works in "
+            "every language. On servers without it nothing happens.")
+        gt_row = QHBoxLayout()
+        gt_row.setSpacing(10)
+        gt_lbl = QLabel("Answer")
+        gt_lbl.setStyleSheet(f"color: {C['text']}; font-family: {MONO}; font-size: 12px;")
+        gt_row.addWidget(gt_lbl)
+        self.tuna_choice_combo = QComboBox()
+        for i, (text, tip) in enumerate((
+                ("1. Let it go", "A buff for rare fish (60 min) or a short slow-down"),
+                ("2. Cut it open", "A random item: clam, pearl, Kelpie chest or a rod (30 days)"),
+                ("3. Use it for bait", "A stronger buff for rare fish for 5 minutes"))):
+            self.tuna_choice_combo.addItem(text, i)
+            self.tuna_choice_combo.setItemData(i, tip, Qt.ToolTipRole)
+        self.tuna_choice_combo.setToolTip("Which of the three answers the bot clicks. They are counted "
+                                          "from the top, so the client's language does not matter.")
+        self.tuna_choice_combo.currentIndexChanged.connect(self._on_changed)
+        gt_row.addWidget(self.tuna_choice_combo)
+        self.tuna_desc = QLabel("Answered automatically when the dialog opens (servers without it are "
+                                "not affected). The bars are counted from the top, so any language works.")
+        self.tuna_desc.setWordWrap(True)
+        self.tuna_desc.setStyleSheet(
+            f"color: {C['text_mute']}; font-family: {MONO}; font-size: 11px; "
+            f"border-left: 1px solid {C['line']}; padding-left: 12px;"
+        )
+        gt_row.addWidget(self.tuna_desc, 1)
+        gt.body_layout.addLayout(gt_row)
+        fishing_layout.addWidget(gt)
+
         self.window_capture_check = QCheckBox("Per-window capture (game windows may overlap)")
         self.window_capture_check.setToolTip(
             "Reads each game window directly instead of copying the screen, so windows can "
@@ -2693,27 +2764,6 @@ class SettingsTab(QWidget):
             "clients that block it fall back to screen capture automatically."
         )
         self.window_capture_check.toggled.connect(self._on_changed)
-        self.recast_tune_check = QCheckBox("Shorten the wait before the next cast automatically")
-        self.recast_tune_check.setToolTip(
-            "Without Quick Skip the bot waits before casting again. With this on it starts at "
-            "'Wait before next cast' from Timing Settings and shortens the wait step by step "
-            "while casts keep getting a bite; the first wait that is too short for this server "
-            "costs one missed cast, after which the last working wait is kept."
-        )
-        self.recast_tune_check.toggled.connect(self._on_changed)
-        dc.body_layout.addWidget(self.recast_tune_check)
-        dc_row = QHBoxLayout()
-        dc_row.setSpacing(10)
-        self.forget_profile_btn = QPushButton("  Forget learned colors")
-        self.forget_profile_btn.setProperty("class", "Btn")
-        self.forget_profile_btn.setIcon(make_icon("reset", 12, C["text"]))
-        self.forget_profile_btn.setCursor(Qt.PointingHandCursor)
-        self.forget_profile_btn.clicked.connect(self.forget_profile.emit)
-        dc_row.addWidget(self.forget_profile_btn)
-        self.learned_label = self._mono_label("", color=C["text_mute"])
-        dc_row.addWidget(self.learned_label, 1)
-        dc.body_layout.addLayout(dc_row)
-        fishing_layout.addWidget(dc)
         fishing_layout.addStretch(1)
 
         # --- Screen capture + input (both activities) ---
@@ -2729,7 +2779,6 @@ class SettingsTab(QWidget):
         sc.body_layout.addWidget(self.input_label)
         layout.addWidget(sc)
         self._capture_backend = "auto"
-        self._has_learned_profile = False
 
         # --- Profiles ---
         pr = Card("Profiles & Presets")
@@ -2759,6 +2808,28 @@ class SettingsTab(QWidget):
 
         # --- Diagnostics ---
         dg = Card("Diagnostics")
+        self.diag_warning = WrapLabel(
+            "FOR SUPPORT AND TROUBLESHOOTING ONLY\n"
+            "Only turn these on if you know what you are doing, or support asked you to. "
+            "Otherwise, do not change these settings. They make the bot slower and write "
+            "large files to disk. The recording also captures everything shown in the game "
+            "windows, including chat and character names.")
+        self.diag_warning.setWordWrap(True)
+        # The border sits on a frame around the label: CSS padding on a
+        # word-wrapped label makes Qt cut off its last line
+        self.diag_warning.setStyleSheet(f"color: {C['orange']}; border: none; background: transparent;")
+        warn_font = self.diag_warning.font()
+        warn_font.setBold(True)
+        self.diag_warning.setFont(warn_font)
+        warn_box = QFrame()
+        warn_box.setObjectName("DiagWarning")
+        warn_box.setStyleSheet(
+            f"QFrame#DiagWarning {{ border: 2px solid {C['orange']}; border-radius: 6px; "
+            f"background: rgba(255,160,60,0.08); }}")
+        warn_layout = QVBoxLayout(warn_box)
+        warn_layout.setContentsMargins(12, 10, 12, 10)
+        warn_layout.addWidget(self.diag_warning)
+        dg.body_layout.addWidget(warn_box)
         dg_row = QHBoxLayout()
         dg_row.setSpacing(14)
         self.diag_check = QCheckBox("Diagnostic log")
@@ -2767,15 +2838,8 @@ class SettingsTab(QWidget):
             "window when something is not found) into one .zip per run. Turn it on, reproduce "
             "the problem, then send the newest .zip from the log folder to support."
         )
-        self.diag_check.toggled.connect(self._on_diag_toggled)
+        self.diag_check.toggled.connect(self._on_changed)
         dg_row.addWidget(self.diag_check)
-        self.diag_verbose_check = QCheckBox("Verbose (every frame)")
-        self.diag_verbose_check.setToolTip(
-            "Also log every single frame of the minigame and of every wait. Makes the log much "
-            "bigger; only needed when asked for."
-        )
-        self.diag_verbose_check.toggled.connect(self._on_changed)
-        dg_row.addWidget(self.diag_verbose_check)
         dg_row.addStretch(1)
         self.diag_show_btn = QPushButton("  Show log")
         self.diag_show_btn.setProperty("class", "Btn")
@@ -2790,6 +2854,17 @@ class SettingsTab(QWidget):
         self.diag_open_btn.clicked.connect(self.open_log_folder.emit)
         dg_row.addWidget(self.diag_open_btn)
         dg.body_layout.addLayout(dg_row)
+        self.diag_record_check = QCheckBox("Record game windows (video in the diagnostic log)")
+        self.diag_record_check.setToolTip(
+            "Also records a video of each game window the bot runs on (10 frames a second), "
+            "saved in the same .zip as the diagnostic log, with every frame's time so it can "
+            "be matched to the log. Only the game windows are recorded, never the rest of the "
+            "screen. Files get big: about 60 MB per minute for an 800x600 game window (more for "
+            "bigger windows), at most 2 GB per run, which is about 15 minutes with two windows. "
+            "Needs the diagnostic log.")
+        self.diag_record_check.toggled.connect(self._on_changed)
+        self.diag_check.toggled.connect(self._update_record_enabled)
+        dg.body_layout.addWidget(self.diag_record_check)
         self.diag_path_label = QLabel("")
         self.diag_path_label.setWordWrap(True)
         self.diag_path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -2800,8 +2875,6 @@ class SettingsTab(QWidget):
         self.diag_last_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.diag_last_label.setStyleSheet(f"color: {C['text_dim']}; font-family: {MONO}; font-size: 11px;")
         dg.body_layout.addWidget(self.diag_last_label)
-        layout.addWidget(dg)
-
         # --- Theme ---
         th = Card("Appearance")
         size_row = QHBoxLayout()
@@ -2849,6 +2922,27 @@ class SettingsTab(QWidget):
         th_row.addWidget(self.accent_label)
         th.body_layout.addLayout(th_row)
         layout.addWidget(th)
+        # --- Detection bypass ---
+        pv = Card("Detection bypass")
+        self.disguise_check = QCheckBox("Disguise in Task Manager (random name at every start)")
+        self.disguise_check.toggled.connect(self._on_changed)
+        self.disguise_check.toggled.connect(self._update_disguise_note)
+        pv.body_layout.addWidget(self.disguise_check)
+        dz_row = QHBoxLayout()
+        dz_row.setSpacing(10)
+        self.disguise_note = self._mono_label("", color=C["text_mute"])
+        self.disguise_note.setWordWrap(True)
+        self.disguise_note.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        dz_row.addWidget(self.disguise_note, 1)
+        self.restart_btn = QPushButton("  Restart now")
+        self.restart_btn.setProperty("class", "Btn")
+        self.restart_btn.setIcon(make_icon("refresh", 12, C["text"]))
+        self.restart_btn.setCursor(Qt.PointingHandCursor)
+        self.restart_btn.clicked.connect(self.restart_requested.emit)
+        dz_row.addWidget(self.restart_btn, 0, Qt.AlignTop)
+        pv.body_layout.addLayout(dz_row)
+        layout.addWidget(pv)
+        layout.addWidget(dg)   # last: support only, see its warning
 
         layout.addStretch(1)
 
@@ -2858,6 +2952,29 @@ class SettingsTab(QWidget):
         self._qs_mode = "horse"
         self._on_qs_enable(False)
         self._update_scale_note()
+        self._update_disguise_note()
+
+    def _update_disguise_note(self, *_args) -> None:
+        """What the disguise does now, and whether a restart is needed."""
+        wanted = self.disguise_check.isChecked()
+        running_as = disguise.active_name()
+        pending = False
+        if not disguise.available():
+            text = "Only in the downloaded program" if wanted else ""
+        elif running_as:
+            pending = not wanted
+            text = "Restart to apply" if pending else f"Running as \"{running_as}\""
+        elif disguise.LAST_ERROR and wanted:
+            text = f"Failed: {disguise.LAST_ERROR}"
+            pending = True
+        elif wanted:
+            text = "Restart to apply"
+            pending = True
+        else:
+            text = ""
+        self.disguise_note.setText(text)
+        self.disguise_note.setVisible(bool(text))
+        self.restart_btn.setVisible(pending)
 
     def _update_scale_note(self, *_args) -> None:
         now = f"now {round(ACTIVE_UI_SCALE * 100)}%"
@@ -2915,10 +3032,6 @@ class SettingsTab(QWidget):
             f"Skips the fishing animation between catches: Horse presses Ctrl + {key} (the mount key, "
             "set above); Armor right-clicks a spare armor in the inventory (set Spare Armor on the "
             "Positions tab), which swaps it with the worn one.")
-
-    def _on_diag_toggled(self, checked: bool) -> None:
-        self.diag_verbose_check.setEnabled(checked and self._config_enabled)
-        self._on_changed()
 
     def setDiagLocation(self, folder: str, fallback: bool) -> None:
         text = f"Logs are saved in: {folder}"
@@ -3004,14 +3117,11 @@ class SettingsTab(QWidget):
         self._set_key_combo(self.cast_key_combo, cfg.get("cast_key", "space"))
         self._set_key_combo(self.mount_key_combo, cfg.get("mount_key", "g"))
         self._update_qs_desc()
-        self.adaptive_check.setChecked(bool(cfg.get("adaptive_detection", True)))
-        self.recast_tune_check.setChecked(bool(cfg.get("adaptive_recast_wait", True)))
         self._capture_backend = str(cfg.get("capture_backend", "auto")).lower()
         self.window_capture_check.setChecked(self._capture_backend != "screen")
-        self.setLearnedProfile(cfg.get("detection_profile"))
         self.diag_check.setChecked(bool(cfg.get("diagnostics_enabled", False)))
-        self.diag_verbose_check.setChecked(bool(cfg.get("diagnostics_verbose", False)))
-        self.diag_verbose_check.setEnabled(self.diag_check.isChecked() and self._config_enabled)
+        self.diag_record_check.setChecked(bool(cfg.get("diagnostics_record_screens", False)))
+        self._update_record_enabled()
         self._qs_mode = "armor" if cfg.get("quick_skip_mode") == "armor" else "horse"
         self.qs_horse.setChecked(False)
         self.qs_armor.setChecked(False)
@@ -3019,11 +3129,18 @@ class SettingsTab(QWidget):
         self.qs_enable.setChecked(bool(cfg.get("quick_skip", False)))
         self.qs_enable.blockSignals(False)
         self._on_qs_enable(self.qs_enable.isChecked())
+        try:
+            choice = int(cfg.get("golden_tuna_choice", 1))
+        except (TypeError, ValueError):
+            choice = 1
+        self.tuna_choice_combo.setCurrentIndex(choice if 0 <= choice <= 2 else 1)
         key = str(cfg.get("ui_scale", "auto"))
         idx = self.ui_scale_combo.findData(key if self.ui_scale_combo.findData(key) >= 0 else "auto")
         self.ui_scale_combo.setCurrentIndex(idx)
         self._update_scale_note()
-        accent = cfg.get("accent_color", DEFAULT_ACCENT)
+        self.disguise_check.setChecked(bool(cfg.get(disguise.CONFIG_KEY, False)))
+        self._update_disguise_note()
+        accent =cfg.get("accent_color", DEFAULT_ACCENT)
         accent = accent if isinstance(accent, str) and QColor(accent).isValid() else DEFAULT_ACCENT
         # match against known swatches case-insensitively
         match = next((c for c in self.swatches if c.lower() == accent.lower()), None)
@@ -3065,10 +3182,14 @@ class SettingsTab(QWidget):
         cfg["mount_key"] = self.mount_key_combo.currentData() or "g"
         cfg["quick_skip"] = self.qs_enable.isChecked()
         cfg["quick_skip_mode"] = self.quickSkipMode()
-        cfg["adaptive_detection"] = self.adaptive_check.isChecked()
-        cfg["adaptive_recast_wait"] = self.recast_tune_check.isChecked()
+        # Always on, no setting: the Golden Tuna answer only matters where
+        # the dialog exists, and the minigame detection adapts by itself.
+        cfg["golden_tuna"] = True
+        cfg["golden_tuna_choice"] = int(self.tuna_choice_combo.currentData() or 0)
+        cfg["adaptive_detection"] = True
+        cfg["adaptive_recast_wait"] = True
         cfg["diagnostics_enabled"] = self.diag_check.isChecked()
-        cfg["diagnostics_verbose"] = self.diag_verbose_check.isChecked()
+        cfg["diagnostics_record_screens"] = self.diag_record_check.isChecked()
         if not self.window_capture_check.isChecked():
             cfg["capture_backend"] = "screen"
         else:
@@ -3076,15 +3197,12 @@ class SettingsTab(QWidget):
             cfg["capture_backend"] = "window" if self._capture_backend == "window" else "auto"
         self._capture_backend = cfg["capture_backend"]
         cfg["ui_scale"] = self.ui_scale_combo.currentData() or "auto"
+        cfg[disguise.CONFIG_KEY] = self.disguise_check.isChecked()
 
-    def setLearnedProfile(self, profile) -> None:
-        """Reflects whether a self-learned minigame color profile is stored."""
-        self._has_learned_profile = isinstance(profile, dict)
-        if self._has_learned_profile:
-            self.learned_label.setText(f"Using learned colors: {profile.get('name', 'custom')}")
-        else:
-            self.learned_label.setText("Using standard colors")
-        self._update_disabled_state()
+    def setAutoFish(self, enabled: bool) -> None:
+        self.auto_check.blockSignals(True)
+        self.auto_check.setChecked(enabled)
+        self.auto_check.blockSignals(False)
 
     def selectedBaitKeys(self) -> List[str]:
         return [k for k, cb in self.bait_checks.items() if cb.isChecked()]
@@ -3092,7 +3210,7 @@ class SettingsTab(QWidget):
     def setConfigEnabled(self, enabled: bool) -> None:
         for w in (self.classic_check, self.classic_delay_input, self.human_check,
                   self.sound_check, self.qs_enable, self.qs_horse, self.qs_armor,
-                  self.adaptive_check, self.window_capture_check, self.recast_tune_check,
+                  self.window_capture_check, self.tuna_choice_combo, self.auto_check,
                   self.cast_key_combo, self.mount_key_combo):
             w.setEnabled(enabled if w not in (self.qs_horse, self.qs_armor) else (enabled and self.qs_enable.isChecked()))
         for cb in self.bait_checks.values():
@@ -3100,9 +3218,9 @@ class SettingsTab(QWidget):
         # Diagnostics settings apply from the next Start; the log buttons
         # stay usable while running.
         self.diag_check.setEnabled(enabled)
-        self.diag_verbose_check.setEnabled(enabled and self.diag_check.isChecked())
         # Track config enabled state
         self._config_enabled = enabled
+        self._update_record_enabled()
         self._update_disabled_state()
 
     def setPaused(self, paused: bool) -> None:
@@ -3110,13 +3228,20 @@ class SettingsTab(QWidget):
         self._paused = paused
         self._update_disabled_state()
 
+    def _update_record_enabled(self, *_args) -> None:
+        """The recording goes into the diagnostic log, so it needs the log on."""
+        self.diag_record_check.setEnabled(getattr(self, "_config_enabled", True) and self.diag_check.isChecked())
+
     def _update_disabled_state(self) -> None:
         """Update disabled state based on config enabled and paused state."""
         disabled = self._paused or not self._config_enabled
         for w in (self.timing_btn, self.profile_load_btn, self.profile_save_btn):
             w.setDisabled(disabled)
             w.setCursor(Qt.ForbiddenCursor if disabled else Qt.PointingHandCursor)
-        self.forget_profile_btn.setDisabled(disabled or not self._has_learned_profile)
+        # The fish choices are part of the run's configuration: not while a bot runs.
+        self.configure_fish_btn.setDisabled(not self._config_enabled)
+        self.configure_fish_btn.setCursor(Qt.ForbiddenCursor if not self._config_enabled
+                                          else Qt.PointingHandCursor)
         self.bait_qty_input.setDisabled(disabled)
         self.bait_qty_input.setCursor(Qt.ForbiddenCursor if disabled else Qt.IBeamCursor)
 
@@ -3138,51 +3263,70 @@ class SettingsTab(QWidget):
 # ============================================================================
 
 FISH_DISPLAY: List[Tuple[str, str, str]] = [
-    # (display_name, asset_basename, emoji_fallback)
-    ("Aal", "Aal_living.jpg", "🐟"),
-    ("Ayu", "Ayu_living.jpg", "🐠"),
-    ("Barsch", "Barsch_living.jpg", "🐟"),
-    ("Brookforel", "Brookforell_living.jpg", "🐟"),
-    ("Carp", "Carp_living.jpg", "🐠"),
-    ("Catfish", "Catsfish_living.jpg", "🐟"),
-    ("Crab", "Crab_living.jpg", "🦀"),
-    ("Goldfish", "Goldfish_living.jpg", "🐠"),
-    ("Grasscarp", "Grasscarp_living.jpg", "🐟"),
-    ("Large zander", "Large_zander_living.jpg", "🐟"),
-    ("Lotusfish", "Lotusfish_living.jpg", "🐟"),
-    ("Mandarinfish", "Mandarinfish_living.jpg", "🐠"),
-    ("Mirrorcarp", "Mirrorcarp_living.jpg", "🐟"),
-    ("Rainbowfish", "Rainbowforell_living.jpg", "🌈"),
-    ("Redfeather", "Redfeather_living.jpg", "🐟"),
-    ("Riverforel", "Riverforell_living.jpg", "🐟"),
-    ("Salmon", "Salmon_living.jpg", "🐟"),
-    ("Shiri", "Shiri_living.jpg", "🐟"),
-    ("Shrimp", "Shrimp_living.jpg", "🦐"),
-    ("Skygazer", "Skygazer_living.jpg", "🐟"),
-    ("Snake head", "Snake_head_living.jpg", "🐍"),
-    ("Stint", "Stint_living.jpg", "🐟"),
-    ("Tenchi", "Tenchi_living.jpg", "🐟"),
-    ("Vai", "Vai_living.jpg", "🐟"),
-    ("Yabby", "Yabby_living.jpg", "🦞"),
-    ("Zander", "Zander_living.jpg", "🐟"),
-    ("Zebra", "Zebra_living.jpg", "🐟"),
+    # (display_name, asset_basename, fallback text; empty: the name's first letter)
+    ("Aal", "Aal_living.jpg", ""),
+    ("Ayu", "Ayu_living.jpg", ""),
+    ("Barsch", "Barsch_living.jpg", ""),
+    ("Brookforel", "Brookforell_living.jpg", ""),
+    ("Carp", "Carp_living.jpg", ""),
+    ("Catfish", "Catsfish_living.jpg", ""),
+    ("Crab", "Crab_living.jpg", ""),
+    ("Goldfish", "Goldfish_living.jpg", ""),
+    ("Grasscarp", "Grasscarp_living.jpg", ""),
+    ("Large zander", "Large_zander_living.jpg", ""),
+    ("Lotusfish", "Lotusfish_living.jpg", ""),
+    ("Mandarinfish", "Mandarinfish_living.jpg", ""),
+    ("Mirrorcarp", "Mirrorcarp_living.jpg", ""),
+    ("Rainbowfish", "Rainbowforell_living.jpg", ""),
+    ("Redfeather", "Redfeather_living.jpg", ""),
+    ("Riverforel", "Riverforell_living.jpg", ""),
+    ("Salmon", "Salmon_living.jpg", ""),
+    ("Shiri", "Shiri_living.jpg", ""),
+    ("Skygazer", "Skygazer_living.jpg", ""),
+    ("Snake head", "Snake_head_living.jpg", ""),
+    ("Stint", "Stint_living.jpg", ""),
+    ("Tenchi", "Tenchi_living.jpg", ""),
+    ("Yabby", "Yabby_living.jpg", ""),
+    ("Zander", "Zander_living.jpg", ""),
+    ("Zebra", "Zebra_living.jpg", ""),
+]
+
+# Fish the game takes as bait (see utils.BAIT_FISH): keep, drop or use.
+BAIT_DISPLAY: List[Tuple[str, str, str]] = [
+    ("Shrimp", "Shrimp_living.jpg", ""),
+    ("Vai", "Vai_living.jpg", ""),
+]
+
+# The dead kind of each fish with a dead icon in assets/fishing. They get no
+# tile: a dead fish does what its living fish does (utils.dead_fish_action).
+# Grilled fish are recognized too (so they are never taken for dead ones)
+# and always kept.
+DEAD_DISPLAY: List[Tuple[str, str, str]] = [
+    (name, asset.replace("_living.jpg", "_dead.png"), emoji) for name, asset, emoji in FISH_DISPLAY + BAIT_DISPLAY
+    if os.path.exists(get_resource_path(asset.replace("_living.jpg", "_dead.png")))
 ]
 
 ITEM_DISPLAY: List[Tuple[str, str, str]] = [
-    ("Black Dye", "Black_Dye_item.jpg", "🎨"),
-    ("Bleach", "Bleach_item.jpg", "🧴"),
-    ("Brown Dye", "Brown_Dye_item.jpg", "🎨"),
-    ("Gold", "Gold_item.jpg", "💰"),
-    ("Goldring", "Goldring_item.jpg", "💍"),
-    ("Kelp Key", "Kelp_Key_item.jpg", "🗝️"),
-    ("Lucys ring", "Lucys_ring_item.jpg", "💍"),
-    ("Red Dye", "Red_Dye_item.jpg", "🎨"),
-    ("Refugee cape", "Refugee_cape_item.jpg", "🧥"),
-    ("Sage King Glove", "Sage_King_Glove_item.jpg", "👑"),
-    ("White Dye", "White_Dye_item.jpg", "🎨"),
-    ("Wise Emperor symbol", "Symbol_wise_emperors_item.jpg", "✨"),
-    ("Yellow Dye", "Yellow_Dye_item.jpg", "🎨"),
+    ("Black Dye", "Black_Dye_item.jpg", ""),
+    ("Bleach", "Bleach_item.jpg", ""),
+    ("Brown Dye", "Brown_Dye_item.jpg", ""),
+    ("Gold", "Gold_item.jpg", ""),
+    ("Goldring", "Goldring_item.jpg", ""),
+    ("Kelp Key", "Kelp_Key_item.jpg", ""),
+    ("Lucys ring", "Lucys_ring_item.jpg", ""),
+    ("Red Dye", "Red_Dye_item.jpg", ""),
+    ("Refugee cape", "Refugee_cape_item.jpg", ""),
+    ("Sage King Glove", "Sage_King_Glove_item.jpg", ""),
+    ("White Dye", "White_Dye_item.jpg", ""),
+    ("Wise Emperor symbol", "Symbol_wise_emperors_item.jpg", ""),
+    ("Yellow Dye", "Yellow_Dye_item.jpg", ""),
 ]
+
+
+def default_fish_action(asset: str) -> str:
+    """What a fish / item not set yet starts as: bait fish are used as bait,
+    everything else is kept."""
+    return "use" if is_bait_fish(asset) else "keep"
 
 
 def section_divider(text: str) -> QHBoxLayout:
@@ -3199,21 +3343,38 @@ def section_divider(text: str) -> QHBoxLayout:
 
 
 class FishModal(QDialog):
-    saved = Signal(dict)  # {asset_filename: 'keep'|'drop'|'open'}
+    """What the bot does with each catch, in three tabs: bait fish (keep,
+    drop or use), fish (keep, drop or open) and items (keep or drop). The
+    dead fish have no tiles: they follow their living fish."""
+    saved = Signal(dict)  # {asset_filename: 'keep'|'drop'|'open'|'use' (bait fish)}
+
+    # (tab id, icon, label, entries, options shown in the legend, hint)
+    TABS = [
+        ("bait", "target", "Bait fish", BAIT_DISPLAY, ("keep", "drop", "use"),
+         "Use puts them on the rod instead of pressing the bait key."),
+        ("fish", "fish", "Fish", FISH_DISPLAY, ("keep", "drop", "open"),
+         "Dead fish follow their fish: dropped if it drops, kept otherwise."),
+        ("items", "package", "Items", ITEM_DISPLAY, ("keep", "drop"), ""),
+    ]
+    COLUMNS = 6
+    _LEGEND = {"keep": ("K", "green", "Keep"), "drop": ("D", "red", "Drop"),
+               "open": ("O", "blue", "Open"), "use": ("U", "purple", "Use as bait")}
 
     def __init__(self, current_actions: Dict[str, str], parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.setWindowTitle("Fish & Item Selection")
         self.setModal(True)
-        self.resize(720, 660)
-        self.setMinimumSize(700, 600)
-        self._actions = dict(current_actions)
-        for _, asset, _ in FISH_DISPLAY:
-            self._actions[asset] = normalize_fish_action(self._actions.get(asset))
+        self.resize(600, 500)
+        self.setMinimumSize(560, 400)
+        self._actions = {a: v for a, v in dict(current_actions).items() if not a.endswith("_dead.png")}
+        for _, asset, _ in FISH_DISPLAY + BAIT_DISPLAY:
+            self._actions[asset] = normalize_fish_action(
+                self._actions.get(asset, default_fish_action(asset)), asset)
         for _, asset, _ in ITEM_DISPLAY:
             # Items cannot be opened: anything but drop is keep
             self._actions[asset] = "drop" if self._actions.get(asset) == "drop" else "keep"
         self._tiles: Dict[str, FishTile] = {}
+        self._tab_assets: Dict[str, List[str]] = {}
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -3223,81 +3384,40 @@ class FishModal(QDialog):
         header = QFrame()
         header.setProperty("class", "ModalHeader")
         hl = QHBoxLayout(header)
-        hl.setContentsMargins(16, 12, 12, 12)
+        hl.setContentsMargins(16, 10, 12, 10)
         title = QLabel("FISH & ITEM SELECTION")
         title.setProperty("class", "ModalTitle")
         hl.addWidget(title)
         hl.addStretch(1)
-        # The item tiles are below the fish: one click shows them
-        self.items_btn = QPushButton(f"Items ({len(ITEM_DISPLAY)}) ↓")
-        self.items_btn.setProperty("class", "BtnGhost")
-        self.items_btn.setCursor(Qt.PointingHandCursor)
-        self.items_btn.setToolTip("Scroll to the items (dyes, rings, gold …) below the fish")
-        hl.addWidget(self.items_btn)
-        hl.addSpacing(12)
-        legend = QLabel(
-            f"<span style='color:{C['green']}'>K</span> Keep "
-            f"<span style='color:{C['text_mute']}'>·</span> "
-            f"<span style='color:{C['red']}'>D</span> Drop "
-            f"<span style='color:{C['text_mute']}'>·</span> "
-            f"<span style='color:{C['blue']}'>O</span> Open"
-        )
-        legend.setStyleSheet(f"font-family: {MONO}; font-size: 11px; color: {C['text_mute']};")
-        legend.setTextFormat(Qt.RichText)
-        hl.addWidget(legend)
         outer.addWidget(header)
 
-        # Body (scroll)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        self.scroll = scroll
-        body = QWidget()
-        bl = QVBoxLayout(body)
-        bl.setContentsMargins(16, 12, 16, 12)
-        bl.setSpacing(8)
+        self.tabs = TabsBar([(tid, icon, f"{label} ({len(entries)})")
+                             for tid, icon, label, entries, _, _ in self.TABS])
+        outer.addWidget(self.tabs)
 
-        bl.addLayout(section_divider(f"Fish ({len(FISH_DISPLAY)})"))
-        fish_grid = QGridLayout()
-        fish_grid.setSpacing(10)
-        for i, (name, asset, emoji) in enumerate(FISH_DISPLAY):
-            tile = FishTile(name, asset, emoji, self._actions[asset])
-            tile.changed.connect(lambda v, a=asset: self._actions.update({a: v}))
-            self._tiles[asset] = tile
-            fish_grid.addWidget(tile, i // 5, i % 5)
-        bl.addLayout(fish_grid)
+        self.stack = QStackedWidget()
+        self._pages: Dict[str, QWidget] = {}
+        for tid, _, _, entries, options, hint in self.TABS:
+            page = self._build_page(tid, entries, options, hint)
+            self._pages[tid] = page
+            self.stack.addWidget(page)
+        outer.addWidget(self.stack, 1)
 
-        self.items_anchor = QWidget()
-        self.items_anchor.setLayout(section_divider(f"Items ({len(ITEM_DISPLAY)}) — keep or drop"))
-        self.items_anchor.layout().setContentsMargins(0, 8, 0, 0)
-        bl.addWidget(self.items_anchor)
-        self.items_btn.clicked.connect(self._scroll_to_items)
-        items_grid = QGridLayout()
-        items_grid.setSpacing(10)
-        for i, (name, asset, emoji) in enumerate(ITEM_DISPLAY):
-            tile = FishTile(name, asset, emoji, self._actions[asset], kd_only=True)
-            tile.changed.connect(lambda v, a=asset: self._actions.update({a: v}))
-            self._tiles[asset] = tile
-            items_grid.addWidget(tile, i // 5, i % 5)
-        bl.addLayout(items_grid)
-        bl.addStretch(1)
-        scroll.setWidget(body)
-        outer.addWidget(scroll, 1)
-
-        # Footer
+        # Footer: the bulk buttons act on the tab shown
         footer = QFrame()
         footer.setProperty("class", "ModalFooter")
         fl = QHBoxLayout(footer)
-        fl.setContentsMargins(16, 12, 16, 12)
+        fl.setContentsMargins(16, 10, 16, 10)
         fl.setSpacing(6)
-        for label, slot in [
-            ("Keep All",  lambda: self._set_all([a for _, a, _ in FISH_DISPLAY] + [a for _, a, _ in ITEM_DISPLAY], "keep")),
-            ("Drop All",  lambda: self._set_all([a for _, a, _ in FISH_DISPLAY] + [a for _, a, _ in ITEM_DISPLAY], "drop")),
-            ("Open All Fish",  self._open_all),
-        ]:
-            b = QPushButton(label)
+        self.keep_all_btn = QPushButton("Keep All")
+        self.keep_all_btn.clicked.connect(lambda: self._set_tab_all("keep"))
+        self.drop_all_btn = QPushButton("Drop All")
+        self.drop_all_btn.clicked.connect(lambda: self._set_tab_all("drop"))
+        self.third_all_btn = QPushButton()
+        self.third_all_btn.clicked.connect(self._third_all)
+        for b in (self.keep_all_btn, self.drop_all_btn, self.third_all_btn):
             b.setProperty("class", "BtnGhost")
             b.setCursor(Qt.PointingHandCursor)
-            b.clicked.connect(slot)
             fl.addWidget(b)
         fl.addStretch(1)
         cancel_btn = QPushButton("Cancel")
@@ -3312,8 +3432,66 @@ class FishModal(QDialog):
         fl.addWidget(cancel_btn)
         fl.addWidget(save_btn)
         outer.addWidget(footer)
+
+        self.tabs.changed.connect(self._show_tab)
+        self._show_tab(self.tabs.active())
         no_enter_default(self)
         help_visuals.fit_to_screen(self)   # short screens: keep the footer on screen
+
+    def _build_page(self, tid: str, entries, options, hint: str) -> QWidget:
+        page = QWidget()
+        pl = QVBoxLayout(page)
+        pl.setContentsMargins(0, 0, 0, 0)
+        pl.setSpacing(0)
+        sep = f" <span style='color:{C['text_mute']}'>·</span> "
+        legend = sep.join(f"<span style='color:{C[color]}; font-weight:700'>{letter}</span> {word}"
+                          for letter, color, word in (self._LEGEND[o] for o in options))
+        if hint:
+            legend += f"<br><span style='color:{C['text_mute']}'>{hint}</span>"
+        lbl = QLabel(legend)
+        lbl.setTextFormat(Qt.RichText)
+        lbl.setWordWrap(True)
+        lbl.setStyleSheet(f"font-family: {MONO}; font-size: 11px; color: {C['text_dim']};")
+        lbl.setContentsMargins(16, 8, 16, 4)
+        pl.addWidget(lbl)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        body = QWidget()
+        bl = QVBoxLayout(body)
+        bl.setContentsMargins(12, 6, 12, 12)
+        grid = QGridLayout()
+        grid.setSpacing(6)
+        assets = []
+        for i, (name, asset, emoji) in enumerate(entries):
+            tile = FishTile(name, asset, emoji, self._actions[asset], kd_only=(tid == "items"))
+            tile.changed.connect(lambda v, a=asset: self._actions.update({a: v}))
+            self._tiles[asset] = tile
+            assets.append(asset)
+            grid.addWidget(tile, i // self.COLUMNS, i % self.COLUMNS)
+        for c in range(self.COLUMNS):
+            grid.setColumnStretch(c, 1)
+        bl.addLayout(grid)
+        bl.addStretch(1)
+        scroll.setWidget(body)
+        pl.addWidget(scroll, 1)
+        self._tab_assets[tid] = assets
+        return page
+
+    def _show_tab(self, tid: str) -> None:
+        self.stack.setCurrentWidget(self._pages[tid])
+        third = {"bait": "Use All", "fish": "Open All"}.get(tid)
+        self.third_all_btn.setVisible(third is not None)
+        self.third_all_btn.setText(third or "")
+
+    def _set_tab_all(self, action: str) -> None:
+        self._set_all(self._tab_assets[self.tabs.active()], action)
+
+    def _third_all(self) -> None:
+        if self.tabs.active() == "bait":
+            self._set_all(self._tab_assets["bait"], "use")
+        else:
+            self._open_all()
 
     def _set_all(self, assets: List[str], action: str) -> None:
         for a in assets:
@@ -3321,16 +3499,15 @@ class FishModal(QDialog):
                 self._tiles[a].setAction(action)
                 self._actions[a] = action
 
-    def _scroll_to_items(self) -> None:
-        self.scroll.verticalScrollBar().setValue(self.items_anchor.y())
-
     def _open_all(self) -> None:
-        """Sets every fish to open; the items (which cannot be opened) keep
-        what they are set to."""
+        """Sets every fish to open; the items (which cannot be opened) and
+        the bait fish (a right-click puts them on the rod) keep what they
+        are set to."""
         self._set_all([a for _, a, _ in FISH_DISPLAY], "open")
 
     def _save(self) -> None:
-        self.saved.emit({a: normalize_fish_action(v) for a, v in self._actions.items()})
+        actions = {a: normalize_fish_action(v, a) for a, v in self._actions.items()}
+        self.saved.emit(with_dead_fish_actions(actions))
         self.accept()
 
 
@@ -3342,32 +3519,43 @@ class FishTile(QFrame):
         super().__init__(parent)
         self.setProperty("class", "FishTile")
         self._asset = asset
+        self._name = name
         self._kd_only = kd_only
+        self.setToolTip(name)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
         layout.setAlignment(Qt.AlignHCenter)
 
         self.img = QLabel()
         self.img.setProperty("class", "FishImg")
-        self.img.setFixedSize(48, 48)
+        self.img.setFixedSize(38, 38)
         self.img.setAlignment(Qt.AlignCenter)
         self._load_img(asset, emoji)
         layout.addWidget(self.img, alignment=Qt.AlignHCenter)
 
         nm = QLabel(name)
         nm.setProperty("class", "FishName")
-        nm.setStyleSheet(f"color: {C['text']}; font-family: {MONO}; font-size: 13px;")
+        nm.setStyleSheet(f"color: {C['text']}; font-family: {MONO}; font-size: 11px;")
         nm.setAlignment(Qt.AlignCenter)
-        nm.setMaximumWidth(110)
+        nm.setMaximumWidth(84)
         nm.setWordWrap(True)
         layout.addWidget(nm)
 
-        seg_opts = [("keep", "K"), ("drop", "D")] if kd_only else [("keep", "K"), ("drop", "D"), ("open", "O")]
-        action = normalize_fish_action(action)
-        if kd_only and action == "open":
+        if kd_only:
+            seg_opts = [("keep", "K"), ("drop", "D")]
+        elif is_bait_fish(asset):
+            # A bait fish does not open: a right-click puts it on the rod
+            seg_opts = [("keep", "K"), ("drop", "D"), ("use", "U")]
+            self.setToolTip(f"{name}. U: use it as bait. Each cast puts the next one on the rod "
+                            "instead of pressing the bait key, in the order they were found.")
+        else:
+            seg_opts = [("keep", "K"), ("drop", "D"), ("open", "O")]
+        action = normalize_fish_action(action, asset)
+        if kd_only and action in ("open", "use"):
             action = "keep"
         self.seg = Segmented(seg_opts, action)
+        self.seg.setFixedHeight(20)
         self.seg.changed.connect(self._on_seg)
         layout.addWidget(self.seg)
         self.setAction(action)
@@ -3377,10 +3565,11 @@ class FishTile(QFrame):
         if os.path.exists(path):
             pix = QPixmap(path)
             if not pix.isNull():
-                self.img.setPixmap(pix.scaled(44, 44, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                self.img.setPixmap(pix.scaled(32, 32, Qt.KeepAspectRatio, Qt.SmoothTransformation))
                 return
-        self.img.setText(emoji)
-        self.img.setStyleSheet(self.img.styleSheet() + " font-size: 22px;")
+        # No picture: the name's first letter (no emoji anywhere in the GUI)
+        self.img.setText(emoji or self._name[:1].upper())
+        self.img.setStyleSheet(self.img.styleSheet() + " font-size: 18px; font-weight: 700;")
 
     def _on_seg(self, action: str) -> None:
         self.setAction(action)
@@ -3391,6 +3580,7 @@ class FishTile(QFrame):
         if action == "keep": cls += " FishImgKeep"
         elif action == "drop": cls += " FishImgDrop"
         elif action == "open": cls += " FishImgOpen"
+        elif action == "use": cls += " FishImgUse"
         self.img.setProperty("class", cls)
         self.img.style().unpolish(self.img)
         self.img.style().polish(self.img)
@@ -3744,8 +3934,8 @@ class SetupWizard(QDialog):
             return win._armor_skip_problem() is None
         if name == "Puzzle grid":
             return valid_grid_bounds(cfg.get("jigsaw_grid_bounds"))
-        if name == "Confirm":
-            return bool(cfg.get("confirm_button_pos"))
+        if name == "Confirm":     # Jigsaw: the crate dialog's Yes and the page tabs
+            return bool(cfg.get("confirm_button_pos")) and bool(cfg.get("inv_page_1_pos"))
         return None
 
     def _paint_chips(self) -> None:
@@ -4016,8 +4206,7 @@ class SetupWizard(QDialog):
             "choose. Dropping always needs <b>Confirm</b> (the Yes button of the game's drop "
             "dialog). Set <b>Drop / Sell</b> only if your client first asks drop or sell; if it only "
             "asks yes/no, leave Drop / Sell empty. Skip this step to keep everything.")
-        inv = self.win.inventory
-        l.addWidget(self._bind_check("Handle the catch automatically", inv.auto_check))
+        l.addWidget(self._bind_check("Handle the catch automatically", self.win.settings.auto_check))
         btn = QPushButton("  Choose fish and items…")
         btn.setProperty("class", "Btn")
         btn.setIcon(make_icon("fish", 14, C["text"]))
@@ -4120,15 +4309,16 @@ class SetupWizard(QDialog):
         l.addWidget(self._status_label("confirm"))
         l.addWidget(self._picture("jigsaw_confirm"))
         l.addSpacing(6)
-        pages = QLabel("To refill the crate slot from the inventory, the solver also needs the "
-                       "inventory page tabs (Page 1 is enough for one page):")
+        pages = QLabel("The solver also needs the inventory page tabs: it searches them for crates "
+                       "to refill the crate slots and does not play while every page is full. "
+                       "Page 1 is required; set the further pages your client has:")
         pages.setProperty("class", "WizBody")
         pages.setWordWrap(True)
         l.addWidget(pages)
         row = QHBoxLayout()
         row.setSpacing(8)
         for n in (1, 2, 3, 4):
-            row.addWidget(self._pill(f"page{n}", f"Page {n}", optional=True), 1)
+            row.addWidget(self._pill(f"page{n}", f"Page {n}", optional=n > 1), 1)
         l.addLayout(row)
         g = guide_button(lambda: open_guide(self, "jigsaw_confirm"))
         g.setText("  Open this in the guide")
@@ -4256,8 +4446,10 @@ class SetupWizard(QDialog):
             st["grid"].setText(self._ok("The grid is set") if valid_grid_bounds(cfg.get("jigsaw_grid_bounds"))
                                else self._bad("The grid is not set yet"))
         if "confirm" in st:
-            st["confirm"].setText(self._ok("Confirm is set") if cfg.get("confirm_button_pos")
-                                  else self._bad("Confirm is not set yet"))
+            confirm_ok, page_ok = bool(cfg.get("confirm_button_pos")), bool(cfg.get("inv_page_1_pos"))
+            st["confirm"].setText(self._ok("Confirm and Page 1 are set") if confirm_ok and page_ok
+                                  else self._bad("Confirm is not set yet" if not confirm_ok
+                                                 else "Page 1 is not set yet"))
         if "solver" in st:
             state = win.solver_cache_manager.state()
             text = SolverCacheManager.describe(state)
@@ -4288,6 +4480,8 @@ class SolverCacheManager(QObject):
 
     # state ∈ {"missing", "building", "ready", "failed"}; second arg = message
     state_changed = Signal(str, str)
+    # While building: percent (0-100) and what is being done
+    progress_changed = Signal(int, str)
 
     def __init__(self, parent: Optional[QObject] = None):
         super().__init__(parent)
@@ -4295,6 +4489,7 @@ class SolverCacheManager(QObject):
         self._thread: Optional[threading.Thread] = None
         self._error: str = ""
         self._state: str = "ready" if self._cache_exists() else "missing"
+        self._progress = (100 if self._state == "ready" else 0, "")
 
     @staticmethod
     def cache_path() -> str:
@@ -4330,6 +4525,19 @@ class SolverCacheManager(QObject):
     def is_building(self) -> bool:
         return self._state == "building"
 
+    def progress(self) -> Tuple[int, str]:
+        """(percent, text) of the build; 100 once the table is ready."""
+        if self.state() == "ready":
+            return 100, ""
+        return self._progress
+
+    def _set_progress(self, fraction: float, text: str) -> None:
+        percent = int(round(fraction * 100))
+        if (percent, text) == self._progress:
+            return
+        self._progress = (percent, text)
+        self.progress_changed.emit(percent, text)
+
     def error(self) -> str:
         return self._error
 
@@ -4344,6 +4552,7 @@ class SolverCacheManager(QObject):
                 return
             self._state = "building"
             self._error = ""
+            self._progress = (0, "")
             self._thread = threading.Thread(
                 target=self._run_build, name="SolverCacheBuild", daemon=True
             )
@@ -4361,11 +4570,16 @@ class SolverCacheManager(QObject):
             cache_dir = cache_location.cache_dir(create=True)
             os.makedirs(cache_dir, exist_ok=True)
             os.environ["JIGSAW_SOLVER_CACHE_DIR"] = cache_dir
+            self._set_progress(0.01, "Loading the solver")
             # Importing deterministic also imports numba / numpy. The first
             # call to get_solver() runs load_cache() if a file is present, or
             # else _run_numba() to compute the table from scratch.
-            from jigsaw_solver.deterministic import get_solver  # noqa: WPS433
-            solver = get_solver()
+            from jigsaw_solver import deterministic  # noqa: WPS433
+            deterministic.set_progress_callback(self._set_progress)
+            try:
+                solver = deterministic.get_solver()
+            finally:
+                deterministic.set_progress_callback(None)
             if solver is None:
                 raise RuntimeError("get_solver() returned None")
         except Exception as exc:  # noqa: BLE001
@@ -4375,6 +4589,7 @@ class SolverCacheManager(QObject):
             self.state_changed.emit("failed", f"Cache build failed: {exc}")
             return
         self._state = "ready"
+        self._set_progress(1.0, "")
         self.state_changed.emit("ready", "Solver cache ready.")
 
 
@@ -4777,6 +4992,12 @@ class JigsawRunner(QObject):
                       problem="The bot needs to know where the puzzle grid is. Press Define Grid (JIGSAW tab) "
                               "and lay the ghost grid exactly on the 24 cells of the Fish Puzzle window.")
             return False
+        if not win.config.get("inv_page_1_pos"):
+            show_help(win, "inventory_tabs", title="Inventory pages not set",
+                      problem="The solver needs the inventory page tabs: it searches them for crates and "
+                              "checks that the inventory has room for the rewards. POSITIONS tab → click "
+                              "Page 1, then the first inventory tab in the game (and the further pages).")
+            return False
         all_windows = {n: w for n, w in WindowManager.get_all_windows()}
         if win._report_gone_windows(selected, all_windows):
             return False
@@ -4968,7 +5189,7 @@ class DiagnosticLogDialog(QDialog):
     """Tails the current diagnostic session log; without a running session it
     shows the log of the newest finished session (read from its zip)."""
 
-    MAX_CHARS = 2_000_000   # keep the widget responsive on huge verbose logs
+    MAX_CHARS = 2_000_000   # keep the widget responsive on huge logs
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -5090,6 +5311,7 @@ class FishbotWindow(QMainWindow):
         "drop_failing": "Drops keep failing",
         "catch_not_recognized": "Catches not recognized",
         "cursor_item": "Item may be on the cursor",
+        "quest_dialog": "Quest dialog not answered",
     }
 
     # Defaults that mirror the Tk version's TimingSettingsWindow.DEFAULTS
@@ -5188,6 +5410,7 @@ class FishbotWindow(QMainWindow):
         self._config_fixed: List[str] = []  # keys whose saved value had the wrong type
         self._save_failed = False
         self._log_dialog: Optional["DiagnosticLogDialog"] = None
+        self._screen_recorder = None   # "Record game windows" of the diagnostic session
         self._wizard: Optional[SetupWizard] = None
         self.bots: Dict[int, "FishingBot"] = {}
         self.bot_threads: Dict[int, threading.Thread] = {}
@@ -5238,6 +5461,8 @@ class FishbotWindow(QMainWindow):
         self.jigsaw_tab.priority_changed.connect(self._on_jigsaw_priority)
         self.jigsaw_tab.retry_cache.connect(lambda: self.solver_cache_manager.ensure_build())
         self.solver_cache_manager.state_changed.connect(self._on_cache_state)
+        self.solver_cache_manager.progress_changed.connect(self._on_cache_progress)
+
         self.dashboard.refresh_windows.connect(self.refresh_window_list)
         self.dashboard.reset_bait.connect(self._on_reset_bait_clicked)
         self.dashboard.window_changed.connect(self._on_window_changed)
@@ -5245,13 +5470,12 @@ class FishbotWindow(QMainWindow):
             lambda topic, text: show_help(self, topic, problem=text, modal=False))
         self.inventory.set_coord.connect(self._begin_capture)
         self.inventory.unset_coord.connect(self._on_unset_coord)
-        self.inventory.open_fish_modal.connect(self.open_fish_modal)
-        self.inventory.auto_fish_toggled.connect(self._on_auto_fish_toggled)
+        self.settings.open_fish_modal.connect(self.open_fish_modal)
+        self.settings.auto_fish_toggled.connect(self._on_auto_fish_toggled)
         self.inventory.cancel_capture.connect(self._cancel_capture)
         self.settings.open_timing.connect(self.open_timing_modal)
         self.settings.config_changed.connect(self._save_settings)
         self.settings.accent_changed.connect(self._on_accent_changed)
-        self.settings.forget_profile.connect(self._on_forget_profile)
         self.settings.profile_load_requested.connect(self._load_profile_file)
         self.settings.profile_save_requested.connect(self._save_profile_file)
         self.settings.open_log_folder.connect(self.open_log_folder)
@@ -5285,10 +5509,21 @@ class FishbotWindow(QMainWindow):
         # A session a crash or kill left unpacked is packed now (background).
         diag.recover_leftovers(on_done=self._sig_diag_recovered.emit)
 
-        # Window icon
+        # Window title and icon (taskbar, Alt+Tab, Task Manager's window list).
+        # Disguised (disguise.py): the random name and a plain letter icon.
+        disguised_as = disguise.active_name()
+        self.setWindowTitle(disguised_as or "Fishing Puzzle Player")
         ico = get_resource_path("monkey.ico")
-        if os.path.exists(ico):
+        if disguised_as:
+            self.setWindowIcon(plain_letter_icon(disguised_as))
+            diag.log("GUI", f"disguised as {disguised_as!r} ({sys.executable}), "
+                            f"program folder {diag.program_dir()}")
+        elif os.path.exists(ico):
             self.setWindowIcon(QIcon(ico))
+        if disguise.LAST_ERROR:
+            diag.log("GUI", f"disguise failed, running under the normal name: {disguise.LAST_ERROR}")
+        self._restart_on_close = False
+        self.settings.restart_requested.connect(self.restart_program)
 
         # Periodic stats poll for running bots
         self._poll = QTimer(self)
@@ -5299,8 +5534,20 @@ class FishbotWindow(QMainWindow):
         name_icon_buttons(self)
 
     # ---------------- Notices ----------------
+    def restart_program(self) -> None:
+        """Settings → Restart now: closes like the Close button (asks first
+        while a bot runs), then main() starts the program again."""
+        self.save_config()
+        diag.log("GUI", "restart requested (Settings)")
+        self._restart_on_close = True
+        if not self.close():
+            self._restart_on_close = False
+
     def _show_startup_notices(self) -> None:
         """Non-blocking notices about the configuration and the platform."""
+        if disguise.LAST_ERROR and self.config.get(disguise.CONFIG_KEY):
+            self.notice.show_notice(
+                "disguise", f"Disguise in Task Manager failed: {disguise.LAST_ERROR}", "warn")
         if self._config_status == "corrupt":
             self.notice.show_notice(
                 "config", "Your settings file could not be read, so the defaults are used. The old file "
@@ -5448,12 +5695,15 @@ class FishbotWindow(QMainWindow):
             "human_like_clicking": False,
             "quick_skip": False,
             "quick_skip_mode": "horse",
+            "golden_tuna": True,
+            "golden_tuna_choice": 1,
             "sound_alert_on_finish": True,
             "sound_on_pause": True,
             "classic_fishing": False,
             "classic_fishing_delay": 3.0,
             "ui_mode": MODE_FISHING,
             "ui_scale": "auto",
+            disguise.CONFIG_KEY: False,
             "jigsaw_solver_enabled": False,
             "jigsaw_crate_priority": "normal_first",
             "jigsaw_detection_threshold": 0.80,
@@ -5473,7 +5723,7 @@ class FishbotWindow(QMainWindow):
             "detection_profile": None,
             # Diagnostic log (Settings tab): one zip per run next to the program.
             "diagnostics_enabled": False,
-            "diagnostics_verbose": False,
+            "diagnostics_record_screens": False,   # + a video of each game window in the log
             "fish_actions": {},
             "drop_button_pos": None,
             "confirm_button_pos": None,
@@ -5609,6 +5859,7 @@ class FishbotWindow(QMainWindow):
             self.tabs_bar.setTabLabel("activity", "Jigsaw", "grid")
         else:
             self.tabs_bar.setTabLabel("activity", "Fishing", "fish")
+        self.tabs_bar.setModeTag(mode)
         self._set_tab(self.tabs_bar.active())
         for i, row in enumerate(self.dashboard.window_rows):
             if not self._row_window_gone(i):
@@ -5669,15 +5920,22 @@ class FishbotWindow(QMainWindow):
         if mode == MODE_JIGSAW:
             grid_ok = valid_grid_bounds(cfg.get("jigsaw_grid_bounds"))
             confirm_ok = bool(cfg.get("confirm_button_pos"))
+            pages_ok = bool(cfg.get("inv_page_1_pos"))
             state = self.solver_cache_manager.state()
             items += [
                 ("grid", "Puzzle grid", "ok" if grid_ok else "bad",
                  "Grid is set" if grid_ok else "JIGSAW tab → Define Grid"),
+                ("pages", "Inventory pages", "ok" if pages_ok else "bad",
+                 "Inventory page 1 is set" if pages_ok else "POSITIONS tab → set the page tabs"),
                 ("confirm", "Confirm", "ok" if confirm_ok else "bad",
                  "Confirm point is set" if confirm_ok else "JIGSAW tab → Set Confirm "
                                                            "(or POSITIONS tab → Confirm)"),
-                ("solver", "Solver", {"ready": "ok", "building": "wait"}.get(state, "bad"),
-                 SolverCacheManager.describe(state)),
+                ("solver", "Solver" + (f" {self.solver_cache_manager.progress()[0]}%"
+                                       if state == "building" else ""),
+                 {"ready": "ok", "building": "wait"}.get(state, "bad"),
+                 SolverCacheManager.describe(state) + (f" — {self.solver_cache_manager.progress()[1]}"
+                                                       if state == "building"
+                                                       and self.solver_cache_manager.progress()[1] else "")),
             ]
         else:
             pages_ok = bool(cfg.get("inv_page_1_pos"))
@@ -5725,6 +5983,10 @@ class FishbotWindow(QMainWindow):
             return
         items = self._readiness_items()
         self.dashboard.ready_chips.setItems(items)
+        if self.mode == MODE_JIGSAW and self.solver_cache_manager.state() == "building":
+            self.dashboard.ready_chips.setProgress("solver", self.solver_cache_manager.progress()[0])
+        else:
+            self.dashboard.ready_chips.setProgress("solver", None)
         if not (self.bots or self.jigsaw.is_running()):
             missing = [label for _k, label, state, _t in items if state == "bad"]
             waiting = [label for _k, label, state, _t in items if state == "wait"]
@@ -5787,14 +6049,12 @@ class FishbotWindow(QMainWindow):
         self.jigsaw_tab.setSetupEnabled(free)
 
     def _running_status(self, mode: str, paused: bool = False) -> None:
-        """Header pill + dashboard status line while something runs."""
+        """The dashboard status line while something runs."""
         n = len(self.jigsaw.bots) if mode == MODE_JIGSAW else len(self.bots)
         where = f"in {n} window{'s' if n != 1 else ''}"
         if paused:
-            self.header.setStatus("● PAUSED", "paused")
             self.dashboard.setStatus("Paused", f"{MODE_NAMES[mode]} {where} — press RESUME or F5", "paused")
         else:
-            self.header.setStatus("● JIGSAW" if mode == MODE_JIGSAW else "● FISHING", "running")
             self.dashboard.setStatus(f"{MODE_NAMES[mode]} is running", f"{where} — F5 pauses", "running")
 
     def _on_activity_started(self, mode: str) -> None:
@@ -5817,7 +6077,6 @@ class FishbotWindow(QMainWindow):
         self.settings.setPaused(False)
         self.inventory.setDisabled(False)
         self.jigsaw_tab.setSetupEnabled(True)
-        self.header.setStatus("● IDLE", "idle")
         self._update_kpis()
 
     def _pause_chime(self, paused: bool) -> None:
@@ -5839,6 +6098,11 @@ class FishbotWindow(QMainWindow):
         self.jigsaw_tab.setCache(state, message)
         self._update_kpis()
         self._refresh_readiness()
+
+    def _on_cache_progress(self, percent: int, text: str) -> None:
+        if self.solver_cache_manager.state() == "building":
+            self.dashboard.kpi_cap.setValue(f"{percent}%")
+            self._refresh_readiness()     # the Solver chip fills up
 
     def _on_jigsaw_priority(self, priority: str) -> None:
         diag.log("GUI", f"jigsaw crate priority: {priority}")
@@ -6026,6 +6290,9 @@ class FishbotWindow(QMainWindow):
             if DEBUG_PRINTS:
                 print(f"Config load failed: {e}")
             return
+        # Retired: the per-frame detail now always goes to frames_*.csv and,
+        # around problems, to the log ("Verbose" checkbox before 2.0.3).
+        saved.pop("diagnostics_verbose", None)
         defaults = self._default_config()
         missing = sorted(k for k in defaults if k not in saved)
         unknown = sorted(k for k in saved if k not in defaults)
@@ -6125,6 +6392,10 @@ class FishbotWindow(QMainWindow):
         for k in list(self.config.keys()):
             if k.endswith("_pos") and isinstance(self.config[k], list) and len(self.config[k]) == 2:
                 self.config[k] = tuple(self.config[k])
+        # No longer settings (always on): a file saved by an older version
+        # with one of them off must not keep it off with no way to turn it on.
+        for k in ALWAYS_ON_KEYS:
+            self.config[k] = True
         self._remembered_windows = list(self.config.get("selected_windows") or [""] * MAX_WINDOWS)
 
     def _snapshot_config(self) -> dict:
@@ -6229,19 +6500,6 @@ class FishbotWindow(QMainWindow):
         self._update_kpis()
         QMessageBox.information(self, "Profile", f"Loaded {os.path.basename(path)}")
 
-    def _on_forget_profile(self) -> None:
-        answer = QMessageBox.question(
-            self, "Forget learned colors",
-            "Forget the learned colors?\n\nThe bot goes back to the standard colors and learns them "
-            "again during the next fishing session.",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if answer != QMessageBox.Yes:
-            return
-        diag.log("GUI", f"forget learned colors (was {self.config.get('detection_profile')})")
-        self.config["detection_profile"] = None
-        self.settings.setLearnedProfile(None)
-        self.save_config()
-
     def _save_settings(self) -> None:
         # Triggered from settings tab on user changes
         self.save_config()
@@ -6271,7 +6529,7 @@ class FishbotWindow(QMainWindow):
         for k in self.inventory.coord_pills:
             cfg_key = self._coord_key_to_cfg(k)
             self._set_coord_ui(k, self.config.get(cfg_key))
-        self.inventory.setAutoFish(self.config.get("auto_fish_handling", False))
+        self.settings.setAutoFish(self.config.get("auto_fish_handling", False))
         # Jigsaw options
         self.jigsaw_tab.setGrid(self.config.get("jigsaw_grid_bounds"))
         self.jigsaw_tab.setConfirm(self.config.get("confirm_button_pos"))
@@ -6400,7 +6658,8 @@ class FishbotWindow(QMainWindow):
             self.dashboard.setRunningCount(active)
             self.dashboard.kpi_bait.setValue(boards)
             state = self.solver_cache_manager.state()
-            self.dashboard.kpi_cap.setValue({"ready": "READY", "building": "BUILDING",
+            building = f"{self.solver_cache_manager.progress()[0]}%"
+            self.dashboard.kpi_cap.setValue({"ready": "READY", "building": building,
                                              "failed": "FAILED"}.get(state, "NOT BUILT"))
             return
         total_games = sum(self.window_stats[i]["games"] for i in range(MAX_WINDOWS))
@@ -6867,8 +7126,10 @@ class FishbotWindow(QMainWindow):
         # Every fish/item gets an action the bot knows: unset or broken ones
         # (an empty action from an older version) are "keep"
         actions = self.config.setdefault("fish_actions", {})
-        for asset in [a for _, a, _ in FISH_DISPLAY + ITEM_DISPLAY] + list(actions):
-            actions[asset] = normalize_fish_action(actions.get(asset))
+        for asset in [a for _, a, _ in FISH_DISPLAY + BAIT_DISPLAY + ITEM_DISPLAY] + list(actions):
+            actions[asset] = normalize_fish_action(actions.get(asset, default_fish_action(asset)), asset)
+        # The dead fish follow their living fish (no choice of their own)
+        self.config["fish_actions"] = with_dead_fish_actions(actions)
 
         # Workers from the previous run must have exited, otherwise two bots
         # would drive the same window (and fight over the cursor). Wait at most
@@ -6978,7 +7239,6 @@ class FishbotWindow(QMainWindow):
         self.settings.setPaused(False)
         self.inventory.setDisabled(False)
         self._set_mode_switch_free(True)
-        self.header.setStatus("● IDLE", "idle")
         self._update_kpis()
         self._end_diag_session("stopped by user", wait_threads=list(self._stopping_threads))
 
@@ -7080,7 +7340,6 @@ class FishbotWindow(QMainWindow):
         if isinstance(profile, dict) or profile is None:
             # None: the bot found the saved profile does not work and dropped it.
             self.config["detection_profile"] = profile
-            self.settings.setLearnedProfile(profile)
             self.save_config()
 
     def _on_bot_stopped_ui(self, bot_id: int, bot: object = None) -> None:
@@ -7135,7 +7394,6 @@ class FishbotWindow(QMainWindow):
             self.settings.setPaused(False)
             self.inventory.setDisabled(False)
             self._set_mode_switch_free(True)
-            self.header.setStatus("● IDLE", "idle")
             self._update_kpis()
             self._maybe_play_no_bait_alert()
 
@@ -7264,8 +7522,7 @@ class FishbotWindow(QMainWindow):
 
     # ---------------- Diagnostics ----------------
     def _apply_diag_settings(self) -> None:
-        diag.configure(bool(self.config.get("diagnostics_enabled", False)),
-                       bool(self.config.get("diagnostics_verbose", False)))
+        diag.configure(bool(self.config.get("diagnostics_enabled", False)))
         folder, fallback = diag.location(create=False)
         self.settings.setDiagLocation(folder, fallback)
 
@@ -7317,10 +7574,30 @@ class FishbotWindow(QMainWindow):
             if folder:
                 self.settings.setDiagLast(f"Recording this run: {folder}")
                 self._apply_diag_settings()
+                if self.config.get("diagnostics_record_screens", False):
+                    self._start_screen_recording(folder, selected, all_windows)
         except Exception:
             diag.exc("starting diagnostic session")
 
+    def _start_screen_recording(self, folder: str, selected, all_windows) -> None:
+        """'Record game windows': a video of each selected game window into
+        the session folder (screen_recorder). Own WindowManagers: the
+        recorders never touch the bots' objects."""
+        from screen_recorder import SessionRecorder
+        windows = {}
+        for i, name in selected:
+            if name in all_windows:
+                wm = WindowManager()
+                wm.selected_window = all_windows[name]
+                wm.diag_tag = f"W{i + 1}"
+                windows[f"W{i + 1}"] = wm
+        self._screen_recorder = SessionRecorder()
+        self._screen_recorder.start(windows, folder, str(self.config.get("capture_backend", "auto")))
+
     def _end_diag_session(self, reason: str, wait_threads=()) -> None:
+        recorder, self._screen_recorder = self._screen_recorder, None
+        if recorder is not None:
+            wait_threads = list(wait_threads) + recorder.stop()   # videos closed before the zip
         if not diag.session_active():
             return
         diag.end_session(reason, wait_threads=wait_threads, on_done=self._sig_diag_done.emit)
@@ -7508,7 +7785,13 @@ def main() -> int:
     app.setStyleSheet(build_qss())
     w = FishbotWindow()
     w.show()
-    return app.exec()
+    code = app.exec()
+    if w._restart_on_close:
+        try:
+            disguise.restart()
+        except Exception:
+            diag.exc("restart")
+    return code
 
 
 if __name__ == "__main__":

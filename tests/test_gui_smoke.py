@@ -78,21 +78,17 @@ class GuiSmokeTests(GuiFixture):
 
     def test_builds_and_round_trips_settings(self):
         w = self._window()
-        self.assertTrue(w.settings.adaptive_check.isChecked())
         self.assertTrue(w.settings.window_capture_check.isChecked())
-        self.assertFalse(w.settings.forget_profile_btn.isEnabled())
 
-        w.settings.adaptive_check.setChecked(False)
         w.settings.window_capture_check.setChecked(False)
         w.settings.human_check.setChecked(True)
         saved = self._saved()
-        self.assertFalse(saved["adaptive_detection"])
+        self.assertTrue(saved["adaptive_detection"])      # always on, no setting
         self.assertEqual(saved["capture_backend"], "screen")
         self.assertTrue(saved["human_like_clicking"])
         self.assertFalse(os.path.exists("bot_config.json.tmp"))
 
         w2 = self._window()
-        self.assertFalse(w2.settings.adaptive_check.isChecked())
         self.assertFalse(w2.settings.window_capture_check.isChecked())
         self.assertEqual(w2.config["timing_minigame_timeout"], 6.0)
 
@@ -171,21 +167,12 @@ class GuiSmokeTests(GuiFixture):
         self.assertTrue(os.path.exists("bot_config.json.corrupt"))
         self.assertFalse(w.config["human_like_clicking"])
 
-    def test_learned_profile_is_stored_and_forgotten(self):
+    def test_learned_profile_is_stored(self):
         w = self._window()
         profile = {"name": "learned", "window_lower": [50, 100, 100], "window_upper": [70, 255, 255],
                    "fish_lower": [0, 100, 100], "fish_upper": [8, 255, 255], "learned": True}
         w._on_profile_learned_ui(profile)
         self.assertEqual(self._saved()["detection_profile"]["name"], "learned")
-        self.assertTrue(w.settings.forget_profile_btn.isEnabled())
-        orig = QMessageBox.question
-        QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.Yes)   # "Forget the learned colors?"
-        try:
-            w.settings.forget_profile.emit()
-        finally:
-            QMessageBox.question = orig
-        self.assertIsNone(self._saved()["detection_profile"])
-        self.assertFalse(w.settings.forget_profile_btn.isEnabled())
 
     def test_discarded_profile_is_cleared(self):
         w = self._window()
@@ -193,14 +180,21 @@ class GuiSmokeTests(GuiFixture):
                                   "window_upper": [70, 255, 255], "learned": True})
         w._on_profile_learned_ui(None)        # the bot found it does not work
         self.assertIsNone(self._saved()["detection_profile"])
-        self.assertFalse(w.settings.forget_profile_btn.isEnabled())
 
-    def test_recast_tuning_setting_round_trips(self):
+    def test_former_options_are_always_on(self):
+        # Golden Tuna, re-skin learning and the recast tuning have no
+        # checkbox any more: a file saved with one of them off turns it on.
+        with open("bot_config.json", "w") as f:
+            json.dump({"golden_tuna": False, "adaptive_detection": False, "adaptive_recast_wait": False}, f)
         w = self._window()
-        self.assertTrue(w.settings.recast_tune_check.isChecked())
-        w.settings.recast_tune_check.setChecked(False)
-        self.assertFalse(self._saved()["adaptive_recast_wait"])
-        self.assertFalse(self._window().settings.recast_tune_check.isChecked())
+        for key in qt_gui.ALWAYS_ON_KEYS:
+            self.assertTrue(w.config[key], key)
+        w.settings.human_check.setChecked(True)
+        saved = self._saved()
+        for key in qt_gui.ALWAYS_ON_KEYS:
+            self.assertTrue(saved[key], key)
+        self.assertFalse(hasattr(w.settings, "tuna_enable"))
+        self.assertFalse(hasattr(w.settings, "adaptive_check"))
 
     def _jigsaw_mode(self, w):
         # Never build (or load) the real solver tables in a GUI test
@@ -236,13 +230,58 @@ class GuiSmokeTests(GuiFixture):
         w = self._window()
         self._jigsaw_mode(w)
         chips = w.dashboard.ready_chips.chips
-        self.assertEqual(list(chips), ["windows", "grid", "confirm", "solver"])
+        self.assertEqual(list(chips), ["windows", "grid", "pages", "confirm", "solver"])
         self.assertEqual(chips["grid"].property("state"), "bad")
+        self.assertEqual(chips["pages"].property("state"), "bad")     # required for Jigsaw too
         w._on_grid_confirmed([10, 20, 264, 176])
         self.assertEqual(chips["grid"].property("state"), "ok")
         self.assertIn("x=10", w.jigsaw_tab.grid_info_label.text())
         chips["confirm"].click()                                  # opens the JIGSAW tab
         self.assertEqual(w.tabs_bar.active(), "activity")
+        chips["pages"].click()                                    # opens the POSITIONS tab
+        self.assertEqual(w.tabs_bar.active(), "inventory")
+
+    def test_solver_chip_fills_while_building(self):
+        w = self._window()
+        self._jigsaw_mode(w)
+        cache = w.solver_cache_manager
+        cache._state = "building"
+        cache._set_progress(0.42, "Computing the moves: step 9 of 24")
+        chip = w.dashboard.ready_chips.chips["solver"]
+        self.assertIn("42%", chip.text())
+        self.assertEqual(chip.property("progress"), 0.42)
+        self.assertIn("qlineargradient", chip.styleSheet())
+        self.assertEqual(w.dashboard.kpi_cap._value.text(), "42%")
+        cache._state = "ready"
+        cache.state_changed.emit("ready", "Solver cache ready.")
+        chip = w.dashboard.ready_chips.chips["solver"]
+        self.assertEqual(chip.property("state"), "ok")
+        self.assertEqual(chip.styleSheet(), "")
+        self.assertFalse(hasattr(w.dashboard, "solver_card"))
+
+    def test_mode_is_shown_by_color_and_tag(self):
+        w = self._window()
+        self.assertEqual(w.mode_bar.property("mode"), qt_gui.MODE_FISHING)
+        self.assertIn("FISHBOT MODE", w.tabs_bar.mode_tag.text())
+        self._jigsaw_mode(w)
+        self.assertEqual(w.mode_bar.property("mode"), qt_gui.MODE_JIGSAW)
+        self.assertIn("JIGSAW PUZZLE SOLVER MODE", w.tabs_bar.mode_tag.text())
+        self.assertEqual(w.tabs_bar.mode_tag.property("mode"), qt_gui.MODE_JIGSAW)
+
+    def test_mode_bar_and_header(self):
+        w = self._window()
+        texts = [b.text() for b in w.mode_bar._buttons.values()]
+        self.assertTrue(any("FISHBOT" in t for t in texts))
+        self.assertTrue(any("JIGSAW PUZZLE SOLVER" in t for t in texts))
+        self.assertEqual(w.mode_bar.hint.text(), "")            # no idle hint
+        self.assertFalse(hasattr(w.header, "setStatus"))         # no status pill, Discord only
+
+    def test_auto_fish_handling_lives_on_the_fishing_tab(self):
+        w = self._window()
+        self.assertFalse(hasattr(w.inventory, "auto_check"))
+        w.settings.auto_check.setChecked(True)
+        self.assertTrue(self._saved()["auto_fish_handling"])
+        self.assertTrue(self._window().settings.auto_check.isChecked())
 
     def test_jigsaw_rows_follow_the_workers(self):
         w = self._window()

@@ -149,9 +149,26 @@ delete or move the tag. Finish by hand with
 `gh release create Mt2-Fishbot-vX.Y.Z dist/release-X.Y.Z/{*.exe,*.tar.gz,SHA256SUMS.txt} --repo hetzpvp/Mt2-Fishbot --verify-tag --title vX.Y.Z --notes-file ...`,
 or `gh release upload ... --clobber` for a missing asset.
 
-### 10. Report
+### 10. Generate the Discord and elitepvpers posts
 
-Give the release URL, the asset download URLs and the SHA-256 sums. Mention
+```bash
+.venv/bin/python tools/release.py announce --notes-file <scratchpad>/release-notes-X.Y.Z.md
+```
+
+This fills the templates in `tools/announce/` (`discord.md`,
+`elitepvpers.txt`, BBCode) and writes `dist/release-X.Y.Z/announce-discord.md`
+and `announce-elitepvpers.txt`. The "What's new" bullets come from the release
+notes, and the downloads point at the GitHub release assets. Add
+`--mediafire URL` and `--virustotal URL` if the user has them, and run it
+again when they add one later. Nothing gets posted: show both texts to the
+user in the report so they can copy them. If the user sends a newer post as
+the template, update the file in `tools/announce/` (keep the `{{...}}`
+placeholders) and commit it.
+
+### 11. Report
+
+Give the release URL, the asset download URLs, the SHA-256 sums and the two
+announcement texts. Mention
 that the README now links to the GitHub release assets. A MediaFire mirror or
 VirusTotal scan is optional and manual: if the user adds one, run
 `bump X.Y.Z --virustotal URL` and commit the README change.

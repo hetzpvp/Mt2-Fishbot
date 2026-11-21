@@ -21,7 +21,7 @@ import screen_capture
 from screen_capture import WindowCapture, frame_usable
 import inventory_layout
 import dialog_watch
-from utils import DEBUG_MODE_EN, DEBUG_PRINTS, get_project_root, input_lock
+from utils import DEBUG_MODE_EN, DEBUG_PRINTS, get_project_root, get_resource_path, input_lock
 from window_manager import WindowManager
 
 try:
@@ -242,6 +242,9 @@ class JigsawBot:
         self._tab_check_misses = 0
         self._tab_check_off = False
         self._current_inv_page = 0
+        # True once the inventory was seen to have room for this board's
+        # reward; looked at again when the next board starts.
+        self._room_checked = False
         self._crate_template_cache: Dict[str, List[Tuple[str, np.ndarray, int, int]]] = {}
         self._debug_lock = threading.Lock()
         self._debug_events: List[dict] = []
@@ -324,6 +327,7 @@ class JigsawBot:
             problem = self._point_layout_problem()
             if problem:
                 self.stop_reason = "bad_layout"
+                diag.event("DECISION", "STOP reason=bad_layout", kind="stop", tag=self.diag_tag, recent=True)
                 self._status(f"Not started: {problem}")
                 return
             self._run_loop()
@@ -523,6 +527,19 @@ class JigsawBot:
                 if not grid.grid_found:
                     continue  # lost during the refill; look again
                 available_sections = {section for section in slots.available if section in wanted}
+                if grid.board_mask != 0:
+                    self._room_checked = False      # looked at again when the next board starts
+                elif available_sections and not self._room_checked and not self.dry_run:
+                    # A new board: its reward goes into the inventory. With
+                    # every page full it would be lost, so nothing is played.
+                    room = self._inventory_has_room()
+                    if not self.running:
+                        return
+                    if room is False:
+                        self._pause("every inventory page is full — make room for the puzzle rewards, "
+                                    "then resume")
+                        continue
+                    self._room_checked = True
                 if not available_sections:
                     self._status("No jigsaw crates left in the slot or the inventory; stopping")
                     if DEBUG_PRINTS or diag.ENABLED:
@@ -755,6 +772,7 @@ class JigsawBot:
                          "Restore or uncover the window.")
         elif now - self._capture_bad_since >= self._CAPTURE_STOP_AFTER:
             self.stop_reason = "capture_unavailable"
+            diag.event("DECISION", "STOP reason=capture_unavailable", kind="stop", tag=self.diag_tag, recent=True)
             self._status(f"The game window could not be seen for {self._CAPTURE_STOP_AFTER:.0f} s; stopping")
             self.running = False
             return False
@@ -793,6 +811,7 @@ class JigsawBot:
         if capture.window_trusted:
             return True
         self.stop_reason = "capture_overlap"
+        diag.event("DECISION", "STOP reason=capture_overlap", kind="stop", tag=self.diag_tag, recent=True)
         self._status(f"This game window overlaps {', '.join(peers)}, and this client can only be read "
                      f"from the screen. Move the game windows apart so none covers another. Not started.")
         self.running = False
@@ -868,10 +887,11 @@ class JigsawBot:
         """Looks for the piece on the cursor, a few times: it appears a moment
         after the crate was confirmed."""
         piece = None
-        with diag.loop("look for cursor piece", tag=self.diag_tag, cursor=cursor_rel, attempts=attempts) as lp:
+        with diag.loop("look for cursor piece", tag=self.diag_tag, columns=("attempt", "piece", "conf"),
+                       cursor=cursor_rel, attempts=attempts) as lp:
             for attempt in range(max(1, attempts)):
                 piece = self._detect_cursor_piece(cursor_rel)
-                lp.frame(f"attempt {attempt + 1}: {piece.piece_id} conf={piece.confidence:.3f}")
+                lp.frame(attempt=attempt + 1, piece=piece.piece_id, conf=piece.confidence)
                 lp.score("confidence", piece.confidence)
                 if piece.piece_id is not None or not self.running:
                     break
@@ -1083,6 +1103,86 @@ class JigsawBot:
                 self._exhausted_sections |= needed
                 self._status(f"No {', '.join(sorted(needed))} jigsaw crate in the inventory")
         return placed_any
+
+    # The fishing bot's empty-slot template and score (FishingBot.
+    # _template_border_crop / _EMPTY_SLOT_THRESHOLD), measured on real clients.
+    _EMPTY_SLOT_BORDER = 7
+    _EMPTY_SLOT_THRESHOLD = 0.55
+    _empty_slot_template: Optional[np.ndarray] = None
+
+    @classmethod
+    def _load_empty_slot_template(cls) -> Optional[np.ndarray]:
+        if cls._empty_slot_template is None:
+            path = os.path.join(get_resource_path("assets"), "empty_slot.jpg")
+            image = cv2.imread(path) if os.path.exists(path) else None
+            if image is None:
+                return None
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            b = cls._EMPTY_SLOT_BORDER
+            if gray.shape[0] > 2 * b and gray.shape[1] > 2 * b:
+                gray = gray[b:-b, b:-b]
+            cls._empty_slot_template = gray
+        return cls._empty_slot_template
+
+    def _page_has_empty_slot(self) -> Optional[bool]:
+        """Whether the inventory page on screen shows an empty slot (None:
+        the strip could not be seen, or there is no template to judge by)."""
+        template = self._load_empty_slot_template()
+        if template is None:
+            return None
+        try:
+            # A minimized window has no room for the strip (negative size).
+            x, y, w, h = self._inventory_rect()
+            frame = self.capture.grab(x, y, w, h) if w > 0 and h > 0 else None
+        except Exception:
+            diag.exc(tag=self.diag_tag)
+            return None
+        if not frame_usable(frame):
+            return None
+        gray = cv2.cvtColor(np.ascontiguousarray(frame[:, :, :3]), cv2.COLOR_BGR2GRAY)
+        if gray.shape[0] < template.shape[0] or gray.shape[1] < template.shape[1]:
+            return None
+        try:
+            best = float(cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED).max())
+        except Exception:
+            diag.exc(tag=self.diag_tag)
+            return None
+        diag.log("ANALYSIS", f"inventory page {self._current_inv_page + 1}: best empty-slot score "
+                             f"{best:.2f} (empty from {self._EMPTY_SLOT_THRESHOLD})", tag=self.diag_tag)
+        return best >= self._EMPTY_SLOT_THRESHOLD
+
+    def _inventory_has_room(self) -> Optional[bool]:
+        """Before a new board: True when some inventory page has an empty
+        slot, False when every configured page was seen full, None when that
+        cannot be told (a page not seen, no tabs set): the bot plays on then,
+        as before this check existed. The page on screen is looked at first,
+        so a page with room costs no clicks."""
+        here = self._page_has_empty_slot()
+        if here:
+            return True
+        pages = self._configured_inventory_pages()
+        if not pages:
+            return None
+        self._status("Checking that the inventory has room for the puzzle reward")
+        unknown = here is None
+        for page_idx, page_pos in pages:
+            if not self.running:
+                return None
+            if not self._switch_to_inventory_page(page_idx, page_pos):
+                unknown = True
+                continue
+            seen = self._page_has_empty_slot()
+            if seen:
+                return True
+            unknown = unknown or seen is None
+        if unknown:
+            diag.log("DECISION", "no empty inventory slot seen, but not every page could be looked at: "
+                                 "playing on", tag=self.diag_tag)
+            return None
+        diag.log("DECISION", f"every configured inventory page ({len(pages)}) reads as full", tag=self.diag_tag)
+        if diag.ENABLED:
+            diag.image("jigsaw_inventory_full", self.capture_inventory_area(), tag=self.diag_tag)
+        return False
 
     def _configured_inventory_pages(self) -> List[Tuple[int, Tuple[int, int]]]:
         pages: List[Tuple[int, Tuple[int, int]]] = []
@@ -1566,10 +1666,11 @@ class JigsawBot:
         Returns (last reading, matched)."""
         deadline = time.perf_counter() + timeout
         grid = None
-        with diag.loop("await board", tag=self.diag_tag, expected=f"{expected:024b}", timeout=timeout) as lp:
+        with diag.loop("await board", tag=self.diag_tag, columns=("board", "found"),
+                       expected=f"{expected:024b}", timeout=timeout) as lp:
             while self.running:
                 grid = self._read_board()
-                lp.frame(f"board {grid.board_mask:024b} found={grid.grid_found}")
+                lp.frame(board=format(grid.board_mask, "024b"), found=grid.grid_found)
                 if grid.grid_found and grid.board_mask == expected:
                     lp.set("result", "board shows the placement")
                     return grid, True

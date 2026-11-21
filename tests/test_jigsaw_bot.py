@@ -122,3 +122,44 @@ class JigsawBotMathTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(HAS_JIGSAW_DEPS, f"Jigsaw bot runtime dependency is not installed: {MISSING_DEP}")
+class JigsawInventoryRoomTests(unittest.TestCase):
+    """Before a new board the solver checks that some inventory page has an
+    empty slot (the reward goes there); every page full pauses it."""
+
+    def _bot(self, pages_seen, switch_ok=True):
+        bot = JigsawBot(window_manager=None, config={"jigsaw_dry_run": True})
+        bot.running = True
+        seen = list(pages_seen)
+        clicked = []
+        bot._page_has_empty_slot = lambda: seen.pop(0)
+        bot._configured_inventory_pages = lambda: [(0, (10, 10)), (1, (40, 10))]
+        bot._switch_to_inventory_page = lambda i, p: clicked.append(i) or switch_ok
+        bot._status = lambda *_a: None
+        bot.capture_inventory_area = lambda: np.zeros((10, 10, 3), np.uint8)
+        return bot, clicked
+
+    def test_room_on_the_shown_page_costs_no_click(self):
+        bot, clicked = self._bot([True])
+        self.assertTrue(bot._inventory_has_room())
+        self.assertEqual(clicked, [])
+
+    def test_room_on_another_page(self):
+        bot, clicked = self._bot([False, False, True])
+        self.assertTrue(bot._inventory_has_room())
+        self.assertEqual(clicked, [0, 1])
+
+    def test_every_page_full(self):
+        bot, _ = self._bot([False, False, False])
+        self.assertIs(bot._inventory_has_room(), False)
+
+    def test_unseen_page_is_no_verdict(self):
+        bot, _ = self._bot([False, False, None])
+        self.assertIsNone(bot._inventory_has_room())
+        bot, _ = self._bot([False], switch_ok=False)
+        self.assertIsNone(bot._inventory_has_room())
+
+    def test_empty_slot_template_is_shipped(self):
+        self.assertIsNotNone(JigsawBot._load_empty_slot_template())

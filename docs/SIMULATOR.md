@@ -69,6 +69,8 @@ not publish them); both are options.
 | Skin | What it varies | Bot |
 |---|---|---|
 | `official` | the stock colors | plays |
+| `official-real` | the stock look at the real client's size, ring drawn over the fish | plays |
+| `real-mt2` | a real client's own textures and layout, pixel for pixel (see below) | plays |
 | `emerald`, `crimson` | every color | plays (learns the look) |
 | `charcoal` | near-gray panel: hue means nothing | plays |
 | `compact` | small panel, small off-center circle, small fish | plays |
@@ -83,6 +85,40 @@ not publish them); both are options.
 panel from the scene by color, and here there is no difference to find. The
 tests skip it; the benchmark runs it. A new look is one `Skin(...)` line in
 `SKINS`.
+
+### Real game textures (skin `real-mt2`)
+
+The `real-mt2` skin draws the fishing window from a real Metin2 client's own
+files (published with the server owner's permission): the texture atlas `fishing_01.dds`
+(water, ring, fish, ripples, counter, timer, Hit/Miss) placed as the client's
+uiscript `FishingGameWindow` places them, inside the real window frame. The
+panel the bot finds is the uiscript's box (248x196); at 800x600 it opens
+where the client opens it. How it is drawn (ring tint, fish heading, counter
+dimming after a hit, where "Hit" appears and how it rises) was measured on
+the recording of diagnostics 20261120_195925; `RealMt2Look` in
+`fishing_game.py` lists what was measured and what is assumed. Against a
+lossless shot of the real window it differs by 1.3 on average
+(`tests/test_real_mt2_sim.py`). Combine it with the real-client mode:
+`bench.realistic_game(skin="real-mt2")`.
+
+The textures live in `tools/minigame_sim/assets/real_mt2` and come from
+`tools/mt2_assets.py`:
+
+```bash
+python tools/mt2_assets.py packs <client folder>          # atlas + uiscript from data/pack
+python tools/mt2_assets.py capture diagnostics/20261120_195925.zip   # frame, slot, counter text, test fixtures
+python tools/mt2_assets.py templates <client folder>      # the bot's item templates from the game's icons
+```
+
+The packs are EterPack files: each entry is LZO-compressed and not encrypted,
+but the index that names them is (with the server's key), so the tool finds
+entries by their content. What is drawn on screen but not stored as one
+texture (the window frame, an empty slot, the counter's "n/3" in the system
+font) comes from the session's lossless shots and recording.
+
+`templates` replaces the pictures in `assets/fishing` with the game's icons
+on the real empty slot (the game draws icons exactly like that: 0.2 off on
+average). The file names stay: they are the item names everywhere.
 
 ### Hard mode
 
@@ -150,6 +186,27 @@ python tools/minigame_sim --demo --mode jigsaw   # jigsaw: special crates, resto
 does) and draws its cursor. The real mouse and keyboard are not used, so this
 shows the game and the bot's decisions, not the OS layer.
 
+### Real-client mode
+
+`bench.realistic_game()` (benchmark flag `--realistic`) sets the game up the
+way the real client behaved in a two-client session (diagnostics
+20261120_195925: 330 casts, 324 games, a recording of each window), and
+`bench.realistic_config(game)` sets the bot up like the player's: quick skip
+on the horse, auto handling, only the tabs of pages I and II. Tests:
+`tests/test_realistic_sim.py`.
+
+| Option | Real client | Simulated |
+|---|---|---|
+| `bite_steps=(1, 2, 3)` | the bite comes 1, 2 or 3 s after the cast (a third each), never in between | that, plus up to 60 ms |
+| `fish_motion="diagonal"` | the fish swims only at 45 degrees, bounces off the edges, ~75 px/s, stops rarely (1.7 times a game, ~0.15 s) | 45-degree lines at 30-210 px/s (mean 80), bounces, a 90-degree turn or a turn back now and then |
+| `frame_rate=60` | the fish moves every 16 ms | the fish moves only on 60 fps frames |
+| skin `official-real` | panel 247x195, ring r~63 with a glow drawn over the fish, small dark fish with a ripple, light caustics | the same; the bot loses the fish 60-66 px from the ring's center (real: 60-67) |
+| `catch_chance=0.35`, `catch_delay=(0.1, 0.2)` | 112 items from 324 won games; the item shows 0.1-0.2 s after the panel closes | the same (`stats["empty_catches"]` counts won games without an item) |
+| `living_world=True` | players and name tags move behind the windows, also inside the bot's inventory strip | walking figures with name tags |
+| `prefill=17` | stacks with counts, sparkling and blinking icons; holding Ctrl draws every count bigger | the same |
+| `rod_animation`, `mount_time` | after a game the rod is busy until a quick skip (Ctrl+G twice); a (dis)mount takes ~170 ms, a Ctrl+G meanwhile is lost; mounted, a cast does nothing | the same; `slow_mount_chance` makes mounts take `slow_mount_time` |
+| `FishingDesktop(click_latency=(0.015, 0.035))` | a click is lost when its window loses the focus 20-30 ms after it (37 of 63), not at 30 ms or later | a click reaches the game after the latency, and only if its window still has the focus (`clicks_lost`); `click_to_switch` records each gap |
+
 ## The benchmark
 
 ```bash
@@ -160,6 +217,7 @@ python tools/minigame_sim/bench.py --human            # human-like clicking
 python tools/minigame_sim/bench.py --hard             # wander + change-look + lag + hiccups + popups
 python tools/minigame_sim/bench.py --windows 4 --handling drop   # four clients on one desktop
 python tools/minigame_sim/bench.py --windows 3 --refuse-focus 0.3
+python tools/minigame_sim/bench.py --realistic --windows 2 --games 10   # the real client, two windows
 ```
 
 ```
@@ -174,5 +232,7 @@ any key or click reached a client other than the one it was meant for.
 
 ## Not simulated
 
-Classic fishing (no minigame), quick skip, bait running out, and the 3D scene
-behind the panel (the backdrop is blurred noise).
+Classic fishing (no minigame), bait running out, and the 3D scene behind the
+panel (the backdrop is blurred noise; `living_world` only adds moving
+figures). The rod animation's length without a quick skip was not measured
+(the real session always skipped it): `rod_animation=2.0` is an assumption.
