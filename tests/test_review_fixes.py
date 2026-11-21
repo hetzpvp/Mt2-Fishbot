@@ -283,7 +283,10 @@ class KeyTests(unittest.TestCase):
                                    release=lambda k: events.append(("release", k)))
         h = Humanizer(enabled=False)
         h.keyboard_controller = kb
-        with mock.patch("humanize.time.sleep", side_effect=KeyboardInterrupt):
+        # No focus-switch settle wait (a key or switch from an earlier test in
+        # this worker would make it sleep, and the interrupt would hit there)
+        with mock.patch("humanize.wait_focus_settled_for_keys", return_value=0.0), \
+                mock.patch("humanize.time.sleep", side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
                 h.tap_key("a")
         self.assertIn(("release", "a"), events)
