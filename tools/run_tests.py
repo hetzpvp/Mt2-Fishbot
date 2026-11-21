@@ -17,9 +17,15 @@ Runs the test suites, the same way on Windows, Linux and in CI.
     python tools/run_tests.py --serial     unit tests in one process (default:
                                            in parallel, see below).
 
-The unit tests run in parallel (pytest-xdist, one worker per physical CPU
-core): most of their time is the simulations waiting in real time, not CPU
-(about 2.5 min instead of 11.5 on 6 cores). ``-n N`` sets the number of workers. Without pytest-xdist
+The unit tests run in parallel (pytest-xdist, 1.5 workers per logical CPU,
+24 on an 8-core/16-thread machine). Most of their time is simulations playing
+whole fishing sessions in real time: ~2250 s of test time, but only ~500 s
+of CPU. So more workers than cores pays off (8 workers: ~6 min, 16: ~2.6 min,
+24: ~2 min, measured 2026-11-21 with a VM and two game clients running).
+32 workers was barely faster and the tightest timing assertions began to
+fail. conftest.SlowestFirst starts the slowest tests first, so the run is
+not left waiting on one 60 s simulation at the end. The floor is the
+longest test (~65 s). ``-n N`` sets the number of workers. Without pytest-xdist
 installed they run serially. The OS-layer tests always run serially: they
 share one desktop and its focus.
 
@@ -50,11 +56,13 @@ def _parallel_args(argv) -> list:
     except ImportError:
         print("(pytest-xdist not installed: unit tests run serially — pip install pytest-xdist)")
         return []
-    # One worker per physical core; tests handed out one by one (a single
-    # file of slow simulations would otherwise hold up the whole run). Each
-    # worker is its own process, so the stubbed OS modules stay isolated.
-    # More workers than cores made the real-time simulations flaky.
-    return ["-n", "auto", "--dist", "worksteal"]
+    # The simulations mostly wait in real time, so 1.5 workers per logical
+    # CPU (see the docstring for the numbers). worksteal plus
+    # conftest.SlowestFirst keeps the slow simulations spread over the
+    # workers. Each worker is its own process, so the stubbed OS modules
+    # stay isolated.
+    workers = max(2, (os.cpu_count() or 2) * 3 // 2)
+    return ["-n", str(workers), "--dist", "worksteal"]
 
 
 class VirtualDisplay:

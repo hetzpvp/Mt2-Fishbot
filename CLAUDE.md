@@ -139,7 +139,7 @@ This checks that HEAD carries the version, the work tree is clean (no
 changes to tracked files, no untracked files under `src/`, `packaging/` or
 `assets/`), both assets passed their smoke test, the branch is `main`, and
 that the tag and release don't exist yet. It then runs the unit tests on the
-committed tree (about 3 minutes, so use `run_in_background`) and stops if
+committed tree (about 2 minutes, so use `run_in_background`) and stops if
 they fail. Then it creates the annotated tag `Mt2-Fishbot-vX.Y.Z`, pushes `main` and the tag,
 and creates the GitHub release (title `vX.Y.Z`, marked latest) with the three
 assets.
