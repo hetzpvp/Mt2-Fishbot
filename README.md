@@ -1,11 +1,11 @@
-# MT2 Fishing Bot — v2.0.3
+# MT2 Fishing Bot — v2.0.4
 
 Free fishing-minigame bot for Metin2. No subscriptions, no licenses.
 **Built for educational and learning purposes only.**
 
-[Video tutorial](https://youtu.be/M0THxnio894) · [Download v2.0.3](https://github.com/hetzpvp/Mt2-Fishbot/releases/latest) · [Discord server support](https://discord.gg/vZaHCRFqW7)
+[Video tutorial](https://youtu.be/M0THxnio894) · [Download v2.0.4](https://github.com/hetzpvp/Mt2-Fishbot/releases/latest) · [Discord server support](https://discord.gg/vZaHCRFqW7)
 
-**Download v2.0.3:** [Windows .exe](https://github.com/hetzpvp/Mt2-Fishbot/releases/download/Mt2-Fishbot-v2.0.3/Fishing-Puzzle-Player-v2.0.3-windows.exe) · [Linux binary](https://github.com/hetzpvp/Mt2-Fishbot/releases/download/Mt2-Fishbot-v2.0.3/Fishing-Puzzle-Player-v2.0.3-linux.tar.gz) · [All releases](https://github.com/hetzpvp/Mt2-Fishbot/releases)
+**Download v2.0.4:** [Windows .exe](https://github.com/hetzpvp/Mt2-Fishbot/releases/download/Mt2-Fishbot-v2.0.4/Fishing-Puzzle-Player-v2.0.4-windows.exe) · [Linux binary](https://github.com/hetzpvp/Mt2-Fishbot/releases/download/Mt2-Fishbot-v2.0.4/Fishing-Puzzle-Player-v2.0.4-linux.tar.gz) · [All releases](https://github.com/hetzpvp/Mt2-Fishbot/releases)
 
 ![GUI](docs/gui_demo.png)
 
@@ -46,6 +46,7 @@ Quick skip needs a horse (Horse mode), or a spare armor in the inventory with it
 | Bottom of the window cut off by the screen | **Settings → Interface size**: pick a smaller size (or Auto) and restart the bot, or lower the Windows display scale. Below 70 % the window gets shorter and its tabs scroll instead |
 | Fish are not opened or dropped | Keep the inventory open, set the drop and confirm positions, then raise the item timings in **Timing Settings** (useful on high ping) |
 | Jigsaw pieces not detected | Keep the whole puzzle window visible and uncovered, then **Define Grid** (JIGSAW tab) again so the ghost grid covers the 24 cells exactly. Still failing: send a diagnostic log (below) |
+| Jigsaw pauses right after Start: "puzzle window not found at the configured grid" | A grid set with 2.0.2 or 2.0.3 on a 1080p or larger screen was saved in the wrong place. Update to 2.0.4 and **Define Grid** (JIGSAW tab) again |
 | Jigsaw won't start: "the Confirm point lies on the puzzle grid" | The game opens its confirm dialog in the middle of the screen. Move the puzzle window away from the centre (top left works), then Define Grid and Set Confirm (JIGSAW tab) again — see **Guide → Jigsaw: window placement** |
 | Pages stop switching | Re-set the page positions after changing resolution |
 | Stops with "Game screen lost" | The inventory vanished while no fish bit (disconnect, death, login screen). Log back in, open the inventory, start again |
@@ -75,6 +76,7 @@ It contains what the bot did, what it saw (screenshots of the game window only, 
 
 ## Version history
 
+- **2.0.4** — Jigsaw grid setup fixed on 1080p and larger screens
 - **2.0.3** — Golden Tuna dialog, dead and bait fish handling, fish selection tabs, Task Manager disguise, faster catches, drop fixes, smaller Windows exe
 - **2.0.2** — Lighter and faster with several clients, fishing and jigsaw loop fixes, diagnostic log, setup wizards and help pages
 - **2.0.1** — Clickable Discord server support button

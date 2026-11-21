@@ -206,5 +206,70 @@ class GridOverlayTests(GuiFixture):
         self.assertEqual(started, ["fishing"])
 
 
+class NativeToLogicalTests(unittest.TestCase):
+    """Diag 20261121_173554: interface size 115 % on a 1080p screen (Qt
+    devicePixelRatio 1.15); the overlay took the window rect in pixels as Qt
+    units, so the saved grid was ~15 % too small and off the puzzle."""
+
+    def test_scaled_screen(self):
+        rect, scale, (dx, dy) = qt_gui.native_rect_to_logical(569, 67, 1296, 839, [(0, 0, 1670, 939, 1.15)])
+        self.assertEqual(rect, (494, 58, 1128, 730))
+        self.assertEqual(scale, 1.15)
+        # The overlay corner lies just before the window corner (rounded
+        # outwards, so the overlay covers the whole window).
+        self.assertAlmostEqual(dx, 494 * 1.15 - 569)
+        self.assertAlmostEqual(dy, 58 * 1.15 - 67)
+        self.assertTrue(-1.15 < dx <= 0 and -1.15 < dy <= 0)
+
+    def test_unscaled_screen_is_unchanged(self):
+        self.assertEqual(qt_gui.native_rect_to_logical(569, 67, 1296, 839, [(0, 0, 1920, 1080, 1.0)]),
+                         ((569, 67, 1296, 839), 1.0, (0.0, 0.0)))
+
+    def test_second_screen_scales_from_its_own_corner(self):
+        screens = [(0, 0, 1670, 939, 1.15), (1920, 0, 1670, 939, 1.15)]
+        rect, scale, _ = qt_gui.native_rect_to_logical(2035, 115, 1150, 805, screens)
+        self.assertEqual(rect, (2020, 100, 1000, 700))
+        self.assertEqual(scale, 1.15)
+
+    def test_no_screens(self):
+        self.assertEqual(qt_gui.native_rect_to_logical(10, 20, 300, 200, []),
+                         ((10, 20, 300, 200), 1.0, (0.0, 0.0)))
+
+
+@unittest.skipUnless(HAS_QT, "PySide6 is not installed")
+class ScaledGridOverlayTests(GuiFixture):
+    """The overlay at interface size 115 %: drags in Qt units move and size
+    the grid in game-window pixels, and the saved grid is in pixels."""
+
+    def _drag(self, ov, start, end):
+        from PySide6.QtCore import QPointF
+        from PySide6.QtGui import QMouseEvent
+        for kind, pos, buttons in ((QEvent.MouseButtonPress, start, Qt.LeftButton),
+                                   (QEvent.MouseMove, end, Qt.LeftButton),
+                                   (QEvent.MouseButtonRelease, end, Qt.NoButton)):
+            ev = QMouseEvent(kind, QPointF(*pos), QPointF(*pos), Qt.LeftButton, buttons, Qt.NoModifier)
+            {QEvent.MouseButtonPress: ov.mousePressEvent, QEvent.MouseMove: ov.mouseMoveEvent,
+             QEvent.MouseButtonRelease: ov.mouseReleaseEvent}[kind](ev)
+
+    def test_grid_handled_in_window_pixels(self):
+        orig = qt_gui.JigsawGridOverlay.__dict__["_screens"]
+        qt_gui.JigsawGridOverlay._screens = staticmethod(lambda: [(0, 0, 1670, 939, 1.15)])
+        try:
+            ov = qt_gui.JigsawGridOverlay(569, 67, 1296, 839, [521, 361, 192, 128], "METIN2")
+        finally:
+            qt_gui.JigsawGridOverlay._screens = orig
+        got = []
+        ov.confirmed.connect(got.append)
+        dx, dy = ov._offset
+        # The resize handle (bottom-right corner, pixel (713, 489)) in Qt units.
+        handle = ((713 - dx) / 1.15, (489 - dy) / 1.15)
+        self._drag(ov, handle, (handle[0] + 20, handle[1] + 20))
+        # Then move it: the middle of the grid, 10 Qt units left and up.
+        mid = ((521 + 107 - dx) / 1.15, (361 + 75 - dy) / 1.15)
+        self._drag(ov, mid, (mid[0] - 10, mid[1] - 10))
+        QTest.keyClick(ov, Qt.Key_Return)
+        self.assertEqual(got, [[round(521 - 11.5), round(361 - 11.5), 215, 151]])
+
+
 if __name__ == "__main__":
     unittest.main()

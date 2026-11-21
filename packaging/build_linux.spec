@@ -40,7 +40,7 @@ pyz = PYZ(a.pure, a.zipped_data)
 
 exe = EXE(
     pyz, a.scripts, a.binaries, a.zipfiles, a.datas, [],
-    name='Fishing Puzzle Player v2.0.3 (linux)',
+    name='Fishing Puzzle Player v2.0.4 (linux)',
     debug=False, bootloader_ignore_signals=False,
     strip=False, upx=False, upx_exclude=[],
     runtime_tmpdir=None, console=False,

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import math
 import os
 import sys
 import threading
@@ -4593,13 +4594,59 @@ class SolverCacheManager(QObject):
         self.state_changed.emit("ready", "Solver cache ready.")
 
 
+def native_rect_to_logical(left: int, top: int, w: int, h: int,
+                           screens: List[Tuple[int, int, int, int, float]]):
+    """Where a rectangle in screen pixels (a game window rect) lies in Qt's
+    own coordinates, which are scaled by the interface size
+    (QT_SCALE_FACTOR, 115 % on a 1080p screen) and by the screen's DPI.
+
+    ``screens`` holds (x, y, w, h, devicePixelRatio) of each QScreen,
+    geometry in Qt coordinates. Qt 6 keeps a screen's top-left corner at
+    its pixel position and scales from there, so a pixel p on that screen is
+    at origin + (p - origin) / dpr in Qt. Returns ((x, y, w, h) in Qt,
+    dpr, (dx, dy)): (dx, dy) is where the Qt rectangle's corner, rounded to
+    whole Qt units, really lies relative to ``left, top`` in pixels. It is
+    rounded outwards, so the Qt rectangle covers the whole window:
+    -dpr < dx, dy <= 0."""
+    cx, cy = left + w / 2.0, top + h / 2.0
+    chosen = None
+    for sx, sy, sw, sh, dpr in screens:
+        if sx <= cx < sx + sw * dpr and sy <= cy < sy + sh * dpr:
+            chosen = (sx, sy, dpr)
+            break
+    if chosen is None:
+        chosen = (screens[0][0], screens[0][1], screens[0][4]) if screens else (0, 0, 1.0)
+    ox, oy, dpr = chosen
+    dpr = float(dpr) if dpr and dpr > 0 else 1.0
+    lx = int(math.floor(ox + (left - ox) / dpr + 1e-6))
+    ly = int(math.floor(oy + (top - oy) / dpr + 1e-6))
+    lw = int(math.ceil(ox + (left + w - ox) / dpr - 1e-6)) - lx
+    lh = int(math.ceil(oy + (top + h - oy) / dpr - 1e-6)) - ly
+    dx = ox + (lx - ox) * dpr - left
+    dy = oy + (ly - oy) * dpr - top
+    return (lx, ly, lw, lh), dpr, (dx, dy)
+
+
 class JigsawGridOverlay(QWidget):
     """
     Full-screen overlay placed over the game window for aligning the jigsaw
     puzzle grid.  Uses setWindowOpacity (same effect as Tk -alpha) which is
     reliable on every Windows DWM configuration, unlike WA_TranslucentBackground.
+
+    The grid is kept in game-window pixels, as the bots read it. The overlay
+    itself lives in Qt coordinates, which the interface size (115 % on a
+    1080p screen) and the screen DPI scale: it converts both ways, or the
+    saved grid lands off the puzzle by that factor.
     """
-    confirmed = Signal(list)  # [x, y, w, h] relative to game window
+    confirmed = Signal(list)  # [x, y, w, h] relative to game window, in pixels
+
+    @staticmethod
+    def _screens() -> List[Tuple[int, int, int, int, float]]:
+        out = []
+        for screen in QApplication.screens():
+            g = screen.geometry()
+            out.append((g.x(), g.y(), g.width(), g.height(), float(screen.devicePixelRatio())))
+        return out
 
     def __init__(self, win_left: int, win_top: int, win_w: int, win_h: int,
                  grid: list, target_name: str) -> None:
@@ -4612,7 +4659,12 @@ class JigsawGridOverlay(QWidget):
         self.setAttribute(Qt.WA_DeleteOnClose)
         self.setStyleSheet("background-color: #000000;")
         self.setWindowOpacity(0.65)
-        self.setGeometry(win_left, win_top, win_w, win_h)
+        logical, self._scale, self._offset = native_rect_to_logical(
+            win_left, win_top, win_w, win_h, self._screens())
+        diag.log("GUI", f"grid overlay: window ({win_left},{win_top},{win_w},{win_h}) px -> "
+                        f"Qt {logical} at scale {self._scale:g}, corner offset "
+                        f"({self._offset[0]:.2f},{self._offset[1]:.2f}) px")
+        self.setGeometry(*logical)
         self._win_w = win_w
         self._win_h = win_h
         self._grid = [float(v) for v in grid]
@@ -4632,13 +4684,23 @@ class JigsawGridOverlay(QWidget):
         self._grid[0] = max(0.0, min(self._grid[0], self._win_w - self._grid[2]))
         self._grid[1] = max(0.0, min(self._grid[1], self._win_h - self._grid[3]))
 
+    def _to_window(self, ev) -> Tuple[float, float]:
+        """A mouse event's position in game-window pixels."""
+        pos = ev.position()
+        return pos.x() * self._scale + self._offset[0], pos.y() * self._scale + self._offset[1]
+
     def paintEvent(self, _ev) -> None:
         from PySide6.QtGui import QPen
         p = QPainter(self)
         gx, gy, gw, gh = [int(v) for v in self._grid]
 
         # Dark overlay (window opacity handles the transparency vs background)
-        p.fillRect(0, 0, self._win_w, self._win_h, QColor(0, 0, 0))
+        p.fillRect(self.rect(), QColor(0, 0, 0))
+
+        # The grid in game-window pixels: Qt unit = (pixel - offset) / scale.
+        p.save()
+        p.scale(1.0 / self._scale, 1.0 / self._scale)
+        p.translate(-self._offset[0], -self._offset[1])
 
         # Grid border
         p.setPen(QPen(QColor("#FFD700"), 3))
@@ -4655,6 +4717,7 @@ class JigsawGridOverlay(QWidget):
 
         # Resize handle (bottom-right corner)
         p.fillRect(gx + gw - 12, gy + gh - 12, 14, 14, QColor("#FFD700"))
+        p.restore()
 
         # Instruction panel
         p.fillRect(10, 10, 490, 78, QColor(0, 0, 0))
@@ -4672,7 +4735,7 @@ class JigsawGridOverlay(QWidget):
         if ev.button() != Qt.LeftButton:
             return
         gx, gy, gw, gh = [int(v) for v in self._grid]
-        x, y = ev.x(), ev.y()
+        x, y = self._to_window(ev)
         self._drag_x, self._drag_y = x, y
         if abs(x - (gx + gw)) <= 18 and abs(y - (gy + gh)) <= 18:
             self._drag_mode = "resize"
@@ -4684,9 +4747,10 @@ class JigsawGridOverlay(QWidget):
     def mouseMoveEvent(self, ev) -> None:
         if not self._drag_mode:
             return
-        dx = ev.x() - self._drag_x
-        dy = ev.y() - self._drag_y
-        self._drag_x, self._drag_y = ev.x(), ev.y()
+        x, y = self._to_window(ev)
+        dx = x - self._drag_x
+        dy = y - self._drag_y
+        self._drag_x, self._drag_y = x, y
         if self._drag_mode == "resize":
             self._grid[2] += dx
             self._grid[3] += dy
@@ -4709,7 +4773,7 @@ class JigsawGridOverlay(QWidget):
     def keyPressEvent(self, ev) -> None:
         if ev.key() in (Qt.Key_Return, Qt.Key_Enter):
             self._clamp()
-            self.confirmed.emit([int(v) for v in self._grid])
+            self.confirmed.emit([int(round(v)) for v in self._grid])
             self.close()
         elif ev.key() == Qt.Key_Escape:
             self.close()
