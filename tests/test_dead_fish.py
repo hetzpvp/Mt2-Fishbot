@@ -19,7 +19,7 @@ install()
 from fishing_bot import FishingBot  # noqa: E402
 from test_fishing_bot import make_inventory_bot  # noqa: E402
 from test_real_client import window_bot  # noqa: E402
-from utils import item_display_name, normalize_fish_action  # noqa: E402
+from utils import item_display_name, normalize_fish_action, with_dead_fish_actions  # noqa: E402
 
 ASSETS = os.path.join(ROOT, "assets", "fishing")
 FIXTURE = os.path.join(ROOT, "tests", "fixtures", "dead_fish", "w2_strip.png")
@@ -211,6 +211,25 @@ class KilledByTheRightClickTests(unittest.TestCase):
         self.assertEqual(sure_calls, ["Zander_dead.png"])
         self.assertEqual(drops, ["Zander (dead)"])
 
+    def test_another_fish_read_after_the_right_click_is_a_misread(self):
+        # A stack whose count just changed (35 -> 34) read as Skygazer (dead),
+        # set to keep: the whole stack was kept. The right-click cannot turn
+        # a Zander into another fish; the strict drop check decides.
+        for misread in ("Skygazer_dead.png", "Goldfish_living.jpg", None):
+            bot, sure_calls, drops = self._bot("drop")
+            bot._item_in_slot = lambda x, y, m=misread: m
+            self.assertTrue(bot._handle_item("Zander_living.jpg", 40, 40, "drop"))
+            self.assertEqual(sure_calls, ["Zander_living.jpg"], misread)
+            self.assertEqual(drops, ["Zander"], misread)
+
+    def test_misread_is_not_dropped_when_the_drop_check_is_not_sure(self):
+        bot, sure_calls, drops = self._bot("drop")
+        bot._item_in_slot = lambda x, y: "Skygazer_dead.png"
+        bot._drop_match_sure = lambda fn, x, y: sure_calls.append(fn) or (False, "gray 0.70")
+        self.assertTrue(bot._handle_item("Zander_living.jpg", 40, 40, "drop"))
+        self.assertEqual(drops, [])
+        self.assertTrue(any(abs(x - 40) < 10 and abs(y - 40) < 10 for x, y in bot._ignored_positions))
+
     def test_dead_fish_of_a_dropped_fish_is_dropped(self):
         bot, _sure, _drops = self._bot("drop", dead_action="keep")    # hand-edited: overruled
         self.assertEqual(bot.config["fish_actions"]["Zander_dead.png"], "drop")
@@ -252,6 +271,47 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(out["Carp_dead.png"], "keep")
         self.assertEqual(out["Zander_dead.png"], "drop")
         self.assertEqual(out["Ayu_dead.png"], "keep")
+
+
+class LookalikeAndStackTests(unittest.TestCase):
+    """Realistic simulation under load, 2026-11-21: a fresh Large zander
+    matched the Goldfish dead icon first (0.99, not a confusable template)
+    and was kept as a Goldfish instead of opened; a Carp stack read dead on
+    one picture and living on the next (the count drawn over the icon) and
+    was kept instead of dropped, though both states were set to drop."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bot = window_bot(np.zeros((100, 100, 3), np.uint8))
+
+    def test_fresh_catch_matched_by_a_lookalike_icon_is_told_by_color(self):
+        for fish, other in (("Large_zander", "Goldfish"), ("Goldfish", "Large_zander")):
+            strip, (cx, cy) = strip_with(state_icon(fish, "living"))
+            for matched in (f"{other}_dead.png", f"{other}_grilled.png", f"{other}_living.jpg",
+                            f"{fish}_dead.png"):
+                got = self.bot._resolve_fish_state(strip, cx, cy, matched, fresh=True)
+                self.assertEqual(got, f"{fish}_living.jpg", (fish, matched))
+
+    def test_fresh_catch_of_other_fish_is_still_the_living_fish(self):
+        strip, (cx, cy) = strip_with(state_icon("Carp", "living"))
+        self.assertEqual(self.bot._resolve_fish_state(strip, cx, cy, "Carp_dead.png", fresh=True),
+                         "Carp_living.jpg")
+
+    def test_drop_goes_on_when_the_slot_reads_as_the_other_state_with_the_same_action(self):
+        bot, _m, _l = make_inventory_bot(InventoryScreen())
+        strip, (cx, cy) = strip_with(state_icon("Carp", "living"))
+        bot.capture_inventory_area = lambda: strip
+        bot.config["fish_actions"] = with_dead_fish_actions({"Carp_living.jpg": "drop"})
+        sure, why = bot._drop_match_sure("Carp_dead.png", cx, cy)
+        self.assertTrue(sure, why)
+
+    def test_drop_stops_when_the_other_state_has_another_action(self):
+        bot, _m, _l = make_inventory_bot(InventoryScreen())
+        strip, (cx, cy) = strip_with(state_icon("Carp", "living"))
+        bot.capture_inventory_area = lambda: strip
+        bot.config["fish_actions"] = {"Carp_living.jpg": "keep", "Carp_dead.png": "drop"}
+        sure, why = bot._drop_match_sure("Carp_dead.png", cx, cy)
+        self.assertFalse(sure, why)
 
 
 if __name__ == "__main__":

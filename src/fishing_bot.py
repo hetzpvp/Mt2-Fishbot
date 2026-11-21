@@ -1520,6 +1520,14 @@ class FishingBot:
             FishingBot._fish_state_cache = cache
             return cache
 
+    @staticmethod
+    def _fish_of(filename: Optional[str]) -> Optional[str]:
+        """'Carp' for Carp_living.jpg / Carp_dead.png / Carp_grilled.png, else None."""
+        if not filename:
+            return None
+        stem = os.path.splitext(filename)[0]
+        return next((stem[:-len(s)] for s in ("_living", "_dead", "_grilled") if stem.endswith(s)), None)
+
     def _resolve_fish_state(self, frame: np.ndarray, cx: int, cy: int, filename: str,
                             fresh: bool = False) -> Optional[str]:
         """The template name of the state (living / dead / grilled) of the fish
@@ -1531,13 +1539,18 @@ class FishingBot:
         with different actions it is ``<Fish>_unsure``, which is kept.
         Other items come back unchanged. A fresh catch is always the living
         fish (see identify_item_in_inventory)."""
-        stem = os.path.splitext(filename)[0]
-        fish = next((stem[:-len(s)] for s in ("_living", "_dead", "_grilled") if stem.endswith(s)), None)
+        fish = self._fish_of(filename)
         states = self._load_fish_states()
         if fish not in states:
             return filename
         if fresh:
-            return f"{fish}_living.jpg"
+            living = f"{fish}_living.jpg"
+            if living in self._confusable_fish:
+                # A dead / grilled icon matched first: the look-alike fish
+                # (Goldfish / Large zander, same shape) is told by its color,
+                # as a living match would have been.
+                return self._disambiguate_confusable_fish(frame, cx, cy, living)
+            return living
         group = next((g for g in self._STATE_LOOKALIKES if fish in g), {fish})
         h, w = frame.shape[:2]
         region = frame[max(0, cy - 22):min(h, cy + 22), max(0, cx - 22):min(w, cx + 22)]
@@ -2638,7 +2651,14 @@ class FishingBot:
                         # The right-click may have killed the fish: the slot
                         # then holds its dead kind, which has its own action.
                         now = self._item_in_slot(inv_x, inv_y)
-                        if now != filename:
+                        if now != filename and self._fish_of(now) != self._fish_of(filename):
+                            # A right-click only opens or kills this fish: another
+                            # fish (or nothing) is a misread, e.g. of a stack whose
+                            # count just changed. The drop check below decides.
+                            diag.log("DECISION", f"after the right-click the slot reads as {now}: not "
+                                                 f"{fish_name} in any state, so a misread; the drop "
+                                                 f"check decides", tag=self.diag_tag)
+                        elif now != filename:
                             now_action = normalize_fish_action(
                                 (self.config.get('fish_actions') or {}).get(now), now) if now else 'keep'
                             diag.log("DECISION", f"after the right-click the slot holds {now}: {now_action}",
@@ -2754,9 +2774,21 @@ class FishingBot:
         # cannot be undone: the state must still be the same on a new picture.
         state = self._resolve_fish_state(frame, inv_x, inv_y, filename)
         if state != filename:
-            diag.log("DECISION", f"drop of {filename} at ({inv_x},{inv_y}) not sure: the slot now reads "
-                                 f"as {state}", tag=self.diag_tag)
-            return False, f"reads as {item_display_name(state) if state else 'another item'} now"
+            # The other state of the same fish, when that one is set to drop
+            # too (a dead fish follows its living one), is still a drop: a
+            # stack count drawn over the icon can tip living / dead from one
+            # picture to the next.
+            actions = self.config.get("fish_actions") or {}
+            same = (state is not None and state in templates and self._fish_of(state) is not None
+                    and self._fish_of(state) == self._fish_of(filename)
+                    and normalize_fish_action(actions.get(state), state) == "drop")
+            if not same:
+                diag.log("DECISION", f"drop of {filename} at ({inv_x},{inv_y}) not sure: the slot now reads "
+                                     f"as {state}", tag=self.diag_tag)
+                return False, f"reads as {item_display_name(state) if state else 'another item'} now"
+            diag.log("DECISION", f"drop of {filename} at ({inv_x},{inv_y}): the slot now reads as {state}, "
+                                 f"the same fish, also set to drop: still a drop", tag=self.diag_tag)
+            filename, entry = state, templates[state]
         template, half_w, half_h = entry
         h, w = frame.shape[:2]
         x1, y1 = max(0, inv_x - half_w - 6), max(0, inv_y - half_h - 6)
