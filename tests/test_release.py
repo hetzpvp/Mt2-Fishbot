@@ -114,3 +114,55 @@ def test_announcements_fill_every_placeholder(kind):
     assert "https://mf.example/x" in with_links and "https://vt.example/y" in with_links
     if kind == "elitepvpers":
         assert "**" not in text and "[*]Golden Tuna dialog handled" in text
+
+
+def _png_with_text(path, key=None, value=None):
+    """A 1x1 PNG, with a tEXt chunk key=value before IEND when given."""
+    import struct
+    import zlib
+
+    def chunk(kind, body):
+        return (struct.pack(">I", len(body)) + kind + body
+                + struct.pack(">I", zlib.crc32(kind + body) & 0xFFFFFFFF))
+    data = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+    data += chunk(b"IDAT", zlib.compress(b"\x00\x00\x00\x00"))
+    if key is not None:
+        data += chunk(b"tEXt", key.encode() + b"\0" + value.encode())
+    data += chunk(b"IEND", b"")
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+def test_screenshot_version_stamp(tmp_path):
+    stamped, plain, other = tmp_path / "a.png", tmp_path / "b.png", tmp_path / "c.png"
+    _png_with_text(stamped, release.SCREENSHOT_KEY, V)
+    _png_with_text(plain)
+    _png_with_text(other, "Software", "Qt")
+    assert release.screenshot_version(str(stamped)) == V
+    assert release.screenshot_version(str(plain)) is None
+    assert release.screenshot_version(str(other)) is None
+    assert release.screenshot_version(str(tmp_path / "missing.png")) is None
+
+
+def test_readme_shows_every_screenshot_the_release_renews():
+    readme = release.read(release.README)
+    for name in release.SCREENSHOTS:
+        assert f"docs/{name}" in readme, name
+
+
+def test_screenshot_tool_renders_the_readme_pictures(tmp_path):
+    """tools/readme_screenshots.py, offscreen, into a temporary folder."""
+    import subprocess
+    import sys
+    pytest.importorskip("PySide6")
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
+    env.pop("FISHBOT_CONFIG_DIR", None)          # the tool sets its own
+    res = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "readme_screenshots.py"), str(tmp_path)],
+                         cwd=str(tmp_path), env=env, capture_output=True, text=True, timeout=180)
+    assert res.returncode == 0, res.stdout + res.stderr
+    version = release.current_version()
+    for name in release.SCREENSHOTS:
+        path = tmp_path / name
+        assert path.exists(), name
+        assert release.screenshot_version(str(path)) == version, name
+    assert not (tmp_path / "bot_config.json").exists()

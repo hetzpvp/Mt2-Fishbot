@@ -11,6 +11,12 @@ Release helper for MT2 Fishing Bot. The full flow is in CLAUDE.md
         packaging/build.spec, packaging/build_linux.spec, and README.md
         (title, download links, version history). Safe to run again.
 
+    python tools/release.py screenshots
+        Renders the README screenshots (docs/gui_demo.png, gui_inventory.png,
+        gui_settings.png) of the current version offscreen, with
+        tools/readme_screenshots.py. Headless; never touches the real
+        bot_config.json. Run it after bump, so the title shows the version.
+
     python tools/release.py build [--skip-windows] [--skip-linux] [--no-smoke]
         Builds both binaries into dist/release-X.Y.Z/, packs the release
         assets (Windows .exe, Linux .tar.gz) and writes SHA256SUMS.txt.
@@ -316,6 +322,11 @@ def cmd_status(args):
             p = os.path.join(rd, f)
             if os.path.isfile(p):
                 print(f"  {os.path.getsize(p) / 1e6:8.1f} MB  {f}")
+    print("README screenshots (docs/):")
+    for n in SCREENSHOTS:
+        got = screenshot_version(os.path.join(ROOT, "docs", n))
+        print(f"  {'ok ' if got == v else 'OUT'} {n}: {('v' + got) if got else 'no version stamp'}"
+              + ("" if got == v else "  -> run 'release.py screenshots'"))
     code, branch = out(["git", "rev-parse", "--abbrev-ref", "HEAD"])
     code, dirty = out(["git", "status", "--porcelain"])
     print(f"git: branch {branch}, {len(dirty.splitlines()) if dirty else 0} changed/untracked paths")
@@ -588,6 +599,10 @@ def cmd_publish(args):
     if unverified:
         sys.exit("no passed smoke test recorded for " + ", ".join(unverified)
                  + f" ({VERIFIED}): run build again (without --no-smoke)")
+    stale = stale_screenshots(v)
+    if stale:
+        sys.exit("README screenshots are not of v" + v + ": " + ", ".join(f"{n} ({g or 'no stamp'})" for n, g in stale)
+                 + ": run 'release.py screenshots' and commit docs/")
     problem = worktree_problem()
     if problem:
         sys.exit(problem)
@@ -614,6 +629,66 @@ def cmd_publish(args):
         cmd.append("--latest")
     run(cmd)
     print(f"\nreleased: https://github.com/{REPO}/releases/tag/{tag}")
+
+
+# ---------------------------------------------------------------- screenshots
+
+SCREENSHOTS = ("gui_demo.png", "gui_inventory.png", "gui_settings.png")
+SCREENSHOT_KEY = "Fishbot-Version"     # PNG text chunk written by readme_screenshots.py
+
+
+def screenshot_version(path):
+    """The version stamped into a README screenshot, None if it has none."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    pos = 8
+    while pos + 8 <= len(data):
+        length = int.from_bytes(data[pos:pos + 4], "big")
+        kind = data[pos + 4:pos + 8]
+        body = data[pos + 8:pos + 8 + length]
+        if kind == b"tEXt" and b"\0" in body:
+            key, value = body.split(b"\0", 1)
+            if key.decode("latin-1") == SCREENSHOT_KEY:
+                return value.decode("latin-1")
+        if kind == b"IEND":
+            break
+        pos += 12 + length
+    return None
+
+
+def stale_screenshots(v):
+    """README screenshots not made for version v: [(name, stamped version)]."""
+    docs = os.path.join(ROOT, "docs")
+    out = []
+    for n in SCREENSHOTS:
+        got = screenshot_version(os.path.join(docs, n))
+        if got != v:
+            out.append((n, got))
+    return out
+
+
+def cmd_screenshots(args):
+    v = current_version()
+    py = VENV_PY if os.path.exists(VENV_PY) else sys.executable
+    docs = os.path.join(ROOT, "docs")
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
+    code = subprocess.run([py, os.path.join(ROOT, "tools", "readme_screenshots.py"), docs],
+                          cwd=ROOT, env=env, timeout=180).returncode
+    if code:
+        sys.exit(f"screenshots failed (exit {code})")
+    stale = stale_screenshots(v)
+    if stale:
+        sys.exit("screenshots not stamped with v" + v + ": " + ", ".join(f"{n} ({g})" for n, g in stale))
+    readme = read(README)
+    unused = [n for n in SCREENSHOTS if f"docs/{n}" not in readme]
+    if unused:
+        print("note: README.md does not show " + ", ".join(unused))
+    print(f"README screenshots updated for v{v}: commit docs/ with the release")
 
 
 # ---------------------------------------------------------------- announce
@@ -700,6 +775,7 @@ def main():
     b.add_argument("--notes", help="one-line changelog for version.py and the README history")
     b.add_argument("--virustotal", help="VirusTotal URL to add to the README download line")
     b.set_defaults(fn=cmd_bump)
+    sub.add_parser("screenshots").set_defaults(fn=cmd_screenshots)
     bd = sub.add_parser("build")
     bd.add_argument("--skip-windows", action="store_true")
     bd.add_argument("--skip-linux", action="store_true")

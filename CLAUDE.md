@@ -71,6 +71,25 @@ VirusTotal link.
 Then read the README and fix anything the release made untrue (features,
 troubleshooting, quick start). Only correct facts; don't rewrite it.
 
+Then renew the README screenshots for the new version (always, every
+release; after `bump`, so the window title shows the new version):
+
+```bash
+.venv/bin/python tools/release.py screenshots
+```
+
+It renders `docs/gui_demo.png` (Dashboard, three windows running),
+`docs/gui_inventory.png` (Positions) and `docs/gui_settings.png` (Fishing
+tab) offscreen with `tools/readme_screenshots.py`: fake game windows and
+bots, a throwaway config, no display, never the real `bot_config.json`, so
+it's safe while the user plays. Look at the three pictures. If the GUI
+changed so much that a picture shows the wrong thing (a tab renamed, a
+locked or empty page), fix the script, not the picture. If the README
+should show a new picture, add it to the script and to the README.
+
+The README and the screenshots reach GitHub with the release commit (step 8)
+and the push in `publish` (step 9).
+
 ### 5. Run the tests
 
 ```bash
@@ -112,15 +131,16 @@ Use AskUserQuestion and show:
 - the version and the one-line summary
 - the release notes (or their path)
 - the asset sizes and the test result
-- what goes into the release commit: a `git status --short` summary
+- what goes into the release commit: a `git status --short` summary (it must
+  include `README.md` and the three `docs/gui_*.png` screenshots)
 
 Offer three options: **Publish**, **Publish as draft** or **Stop**. Nothing
 leaves the machine before the user answers.
 
 ### 8. Commit
 
-Stage the release: the version bump plus all uncommitted project work the
-user confirmed in step 7. Never stage `bot_config.json`, `dist/`, `build/`,
+Stage the release: the version bump, the README, the renewed screenshots in
+`docs/`, plus all uncommitted project work the user confirmed in step 7. Never stage `bot_config.json`, `dist/`, `build/`,
 `*.exe` or other local or secret files. Use the existing message style:
 
 ```
@@ -168,8 +188,10 @@ placeholders) and commit it.
 ### 11. Report
 
 Give the release URL, the asset download URLs, the SHA-256 sums and the two
-announcement texts. Mention
-that the README now links to the GitHub release assets. A MediaFire mirror or
+announcement texts. Check that the README on GitHub
+(https://github.com/hetzpvp/Mt2-Fishbot) shows the new version and the new
+screenshots, and say so. Mention that the README links to the GitHub release
+assets. A MediaFire mirror or
 VirusTotal scan is optional and manual: if the user adds one, run
 `bump X.Y.Z --virustotal URL` and commit the README change.
 
