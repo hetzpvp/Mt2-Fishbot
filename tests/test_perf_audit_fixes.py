@@ -143,11 +143,23 @@ class BoardAreaTests(unittest.TestCase):
         self.assertLess(aw * ah, w * h)
         return detector.detect_grid(frame[y:y + ah, x:x + aw].copy(), origin=(x, y), window_size=(w, h))
 
+    # These read a grid defined by hand; the puzzle window search is off
+    # (see test_found_puzzle_reads_the_same for the found window).
+    MANUAL = {"jigsaw_grid_auto": False}
+
     def test_real_boards_read_the_same(self):
-        detector = JigsawDetector({"jigsaw_grid_bounds": list(self.BOUNDS)})
+        detector = JigsawDetector({"jigsaw_grid_bounds": list(self.BOUNDS), **self.MANUAL})
         for t in LABELS["board"]:
             frame = image(f"board_{float(t):07.2f}.png")
             self.assertTrue(_equal(self._crop_read(detector, frame), detector.detect_grid(frame)), t)
+
+    def test_found_puzzle_reads_the_same(self):
+        for t in LABELS["board"]:
+            frame = image(f"board_{float(t):07.2f}.png")
+            detector = JigsawDetector({})
+            whole = detector.detect_grid(frame)          # finds the window
+            self.assertEqual(whole.source, "auto", t)
+            self.assertTrue(_equal(self._crop_read(detector, frame), whole), t)
 
     def test_grid_at_the_window_edges_reads_the_same(self):
         frame = image("board_0551.02.png")
@@ -157,7 +169,7 @@ class BoardAreaTests(unittest.TestCase):
             shifted = np.roll(frame, (dy, dx), axis=(0, 1))
             win = shifted[:max(1, y + dy + h - cut_bottom), :max(1, x + dx + w - cut_right)] \
                 if cut_right or cut_bottom else shifted
-            detector = JigsawDetector({"jigsaw_grid_bounds": [x + dx, y + dy, w, h]})
+            detector = JigsawDetector({"jigsaw_grid_bounds": [x + dx, y + dy, w, h], **self.MANUAL})
             self.assertTrue(_equal(self._crop_read(detector, win), detector.detect_grid(win)),
                             (dx, dy, cut_right, cut_bottom))
 
@@ -170,7 +182,8 @@ class BoardAreaTests(unittest.TestCase):
         wm = WM()
         h, w = frame.shape[:2]
         wm.rect = (0, 0, w, h)
-        bot = JigsawBot(wm, {"confirm_button_pos": (10, 10), "jigsaw_grid_bounds": list(self.BOUNDS)}, bot_id=0)
+        bot = JigsawBot(wm, {"confirm_button_pos": (10, 10), "jigsaw_grid_bounds": list(self.BOUNDS),
+                             **self.MANUAL}, bot_id=0)
         bot.mouse_backend = bot.human.mouse = FakeMouse()
         grabs = []
 
@@ -200,7 +213,7 @@ class ResultPollTests(unittest.TestCase):
                              "jigsaw_completion_poll_interval": 0.01}, bot_id=0)
         bot.mouse_backend = bot.human.mouse = FakeMouse()
         bot.running = True
-        bot._result_baseline = np.zeros((16, 40), np.uint8)
+        bot._result_baseline = {(160, 126): np.zeros((16, 40), np.uint8)}
         bot._dialog_grab = lambda x, y, w, h: np.zeros((h, w, 3), np.uint8)
         bot.detector.has_confirm_template = lambda discard=False: False
         bot.capture_full_window = lambda: self.fail("whole window grabbed without a template")

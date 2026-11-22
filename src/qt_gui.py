@@ -3934,7 +3934,7 @@ class SetupWizard(QDialog):
         if name == "Quick skip":
             return win._armor_skip_problem() is None
         if name == "Puzzle grid":
-            return valid_grid_bounds(cfg.get("jigsaw_grid_bounds"))
+            return grid_ready(cfg)
         if name == "Confirm":     # Jigsaw: the crate dialog's Yes and the page tabs
             return bool(cfg.get("confirm_button_pos")) and bool(cfg.get("inv_page_1_pos"))
         return None
@@ -4282,10 +4282,13 @@ class SetupWizard(QDialog):
 
     def _build_grid(self) -> QWidget:
         w, l = self._page(
-            "Lay the grid on the puzzle",
-            "Open the <b>Fish Puzzle</b> window in the game. Press <b>Define Grid</b>: a ghost grid "
-            "appears over the game; drag and resize it until it covers the 24 cells exactly, then "
-            "press Enter (Esc cancels).")
+            "Open the puzzle window",
+            "Open the <b>Fish Puzzle</b> window in every game client, away from the middle of the "
+            "screen (the game opens its dialogs there). The bot finds the window by itself in each "
+            "client, wherever you put it, and takes the grid and both crate slots from it; nothing "
+            "needs to be set here.<br><br>Only if the bot reports that it cannot find the window "
+            "(a server whose puzzle looks different): press <b>Define Grid</b> and lay the ghost grid "
+            "exactly on the 24 cells, then press Enter (Esc cancels).")
         btn = QPushButton("  Define Grid")
         btn.setProperty("class", "Btn")
         btn.setIcon(make_icon("grid", 12, C["text"]))
@@ -4444,8 +4447,13 @@ class SetupWizard(QDialog):
                                                          if cfg.get("armor_slot_page") else "")}
                                               [choice]))
         if "grid" in st:
-            st["grid"].setText(self._ok("The grid is set") if valid_grid_bounds(cfg.get("jigsaw_grid_bounds"))
-                               else self._bad("The grid is not set yet"))
+            if auto_grid(cfg):
+                st["grid"].setText(self._ok("Found by itself in each window"
+                                            + (" (a defined grid is the fallback)"
+                                               if valid_grid_bounds(cfg.get("jigsaw_grid_bounds")) else "")))
+            else:
+                st["grid"].setText(self._ok("The grid is set") if valid_grid_bounds(cfg.get("jigsaw_grid_bounds"))
+                                   else self._bad("The grid is not set yet"))
         if "confirm" in st:
             confirm_ok, page_ok = bool(cfg.get("confirm_button_pos")), bool(cfg.get("inv_page_1_pos"))
             st["confirm"].setText(self._ok("Confirm and Page 1 are set") if confirm_ok and page_ok
@@ -4832,7 +4840,8 @@ class JigsawTab(QWidget):
 
         for r, (caption, label, btn, hint) in enumerate((
             ("PUZZLE GRID", self.grid_info_label, self.define_grid_btn,
-             "Open the Fish Puzzle window in the game, then lay the ghost grid on its 24 cells."),
+             "Found by itself in every game window, wherever the Fish Puzzle window is. Define Grid "
+             "only if the bot reports it cannot find the window (a server with another look)."),
             ("CONFIRM (YES)", self.confirm_info_label, self.set_confirm_btn,
              "Open a crate by hand; while the 'open the crate?' dialog is up, capture its Yes button. "
              "Shared with Fishing (Positions tab)."),
@@ -4909,10 +4918,13 @@ class JigsawTab(QWidget):
         self.setConfirm(None)
 
     # -- state from the window ------------------------------------------------
-    def setGrid(self, bounds) -> None:
+    def setGrid(self, bounds, auto: bool = False) -> None:
         big = f"font-family: {MONO}; font-size: 13px; font-weight: 600;"
         ok = valid_grid_bounds(bounds)
-        if ok:
+        if auto:
+            self.grid_info_label.setText("✓ automatic" + (" (+ defined grid as fallback)" if ok else ""))
+            self.grid_info_label.setStyleSheet(f"color: {C['green']}; {big}")
+        elif ok:
             x, y, w, h = [int(v) for v in bounds]
             self.grid_info_label.setText(f"✓ x={x} y={y} w={w} h={h}")
             self.grid_info_label.setStyleSheet(f"color: {C['green']}; {big}")
@@ -4959,6 +4971,30 @@ class JigsawTab(QWidget):
             self.priority_changed.emit(self.priority())
 
 
+_PUZZLE_TEMPLATE_PRESENT: Optional[bool] = None
+
+
+def auto_grid(cfg: dict) -> bool:
+    """True when the bot finds the Fish Puzzle window by itself in every game
+    window (the default): Define Grid is then only a fallback."""
+    global _PUZZLE_TEMPLATE_PRESENT
+    if not cfg.get("jigsaw_grid_auto", True):
+        return False
+    if _PUZZLE_TEMPLATE_PRESENT is None:
+        try:
+            from jigsaw_detector import JigsawDetector
+            _PUZZLE_TEMPLATE_PRESENT = JigsawDetector({}).auto_grid()
+        except Exception:
+            diag.exc("puzzle template")
+            _PUZZLE_TEMPLATE_PRESENT = False
+    return _PUZZLE_TEMPLATE_PRESENT
+
+
+def grid_ready(cfg: dict) -> bool:
+    """Nothing is missing for the grid: found by itself, or defined."""
+    return auto_grid(cfg) or valid_grid_bounds(cfg.get("jigsaw_grid_bounds"))
+
+
 def valid_grid_bounds(bounds) -> bool:
     try:
         return (bool(bounds) and len(bounds) == 4
@@ -4977,6 +5013,7 @@ class JigsawRunner(QObject):
     progress_line = Signal(int, int)
     stopped = Signal(int, object)  # bot_id, bot instance
     paused_changed = Signal(int, bool)
+    setting_learned = Signal(str, object)   # a position / fact a worker found once: saved
 
     STOP_GRACE_MS = 5000     # after STOP, workers that still run are let go (UI unlocked)
 
@@ -4992,6 +5029,17 @@ class JigsawRunner(QObject):
         self.progress_line.connect(self._on_progress)
         self.stopped.connect(self._on_stopped)
         self.paused_changed.connect(self._on_paused_changed)
+        self.setting_learned.connect(self._on_setting_learned)
+
+    def _on_setting_learned(self, key: str, value: object) -> None:
+        """A worker found something on screen that stays put (the result
+        dialog's OK, whether the server asks before placing): saved, so the
+        next runs use it instead of looking for it again."""
+        if self.win.config.get(key) == value:
+            return
+        diag.log("GUI", f"learned setting saved: {key} = {diag.summarize(value)}", tag="Jigsaw")
+        self.win.config[key] = value
+        self.win.save_config()
 
     # -- queries ---------------------------------------------------------------
     def is_running(self) -> bool:
@@ -5000,11 +5048,20 @@ class JigsawRunner(QObject):
     def any_paused(self) -> bool:
         return any(getattr(b, "paused", False) for b in self.bots.values())
 
+    def all_paused(self) -> bool:
+        return bool(self.bots) and all(getattr(b, "paused", False) for b in self.bots.values())
+
     # -- start / stop ----------------------------------------------------------
     def layout_ok(self, name: str, all_windows: dict) -> bool:
         """Before a start: the Confirm point and the cursor's resting point
         must not lie on the grid, a crate slot or the inventory. Shows what
-        to do (with a picture) and returns False when they do."""
+        to do (with a picture) and returns False when they do.
+
+        With the puzzle window found by itself, each worker checks this for
+        the place it finds it in its own window (and pauses with the same
+        message): a defined grid may be from another client."""
+        if auto_grid(self.win.config):
+            return True
         try:
             from jigsaw_bot import layout_problem
             wm = WindowManager()
@@ -5051,7 +5108,7 @@ class JigsawRunner(QObject):
                               "crate by hand, and while the dialog is up press Set Confirm (JIGSAW "
                               "tab) and click Yes.")
             return False
-        if not valid_grid_bounds(win.config.get("jigsaw_grid_bounds")):
+        if not grid_ready(win.config):
             show_help(win, "jigsaw_grid", title="Puzzle grid not set",
                       problem="The bot needs to know where the puzzle grid is. Press Define Grid (JIGSAW tab) "
                               "and lay the ghost grid exactly on the 24 cells of the Fish Puzzle window.")
@@ -5095,6 +5152,7 @@ class JigsawRunner(QObject):
 
         self.bots.clear()
         self._threads.clear()
+        JigsawBot.reset_learned_settings()   # a new run starts from the saved settings
         session_cfg = dict(win.config)
         session_cfg["jigsaw_solver_enabled"] = True
         win._begin_diag_session("jigsaw", selected, all_windows, session_cfg)
@@ -5112,6 +5170,7 @@ class JigsawRunner(QObject):
             # Bind the instance so a late stop from a previous run of this slot
             # is not mistaken for the worker running there now.
             bot.on_bot_stop = lambda _worker_id, i=bot_id, b=bot: self.stopped.emit(i, b)
+            bot.on_setting_learned = self.setting_learned.emit
             thread = threading.Thread(target=bot.start, daemon=True, name=f"JigsawBot-{bot_id + 1}")
             self.bots[bot_id] = bot
             self._threads[bot_id] = thread
@@ -5155,11 +5214,13 @@ class JigsawRunner(QObject):
             self.stopped.emit(i, self.bots[i])
 
     def toggle_pause(self) -> None:
-        """Dashboard PAUSE / RESUME: same decision as F5 — if any window is
-        paused everything resumes, otherwise everything pauses."""
+        """Dashboard PAUSE / RESUME: same decision as F5 (pause_target) —
+        while any window still runs everything pauses; only when all are
+        paused does everything resume."""
         if not self.bots:
             return
-        target = not self.any_paused()
+        from jigsaw_bot import pause_target
+        target = pause_target(getattr(b, "paused", False) for b in self.bots.values())
         for bot in list(self.bots.values()):
             try:
                 bot._on_f5_pressed(target)
@@ -5208,7 +5269,10 @@ class JigsawRunner(QObject):
                 rows[i].setStatus("warn", "PAUSED")
             else:
                 rows[i].setStatus("active", "RUNNING")
-        self.win._on_activity_paused(MODE_JIGSAW, self.any_paused())
+        # The button and the status say PAUSE while any window still runs
+        # (what F5 / the button will do: pause_target); the chime still
+        # tells when a window paused itself.
+        self.win._on_activity_paused(MODE_JIGSAW, self.all_paused(), chime=self.any_paused())
 
     # Messages that say why a worker stopped: kept on the row (red) so the
     # "Jigsaw bot stopped" that follows does not replace them.
@@ -5982,13 +6046,14 @@ class FishbotWindow(QMainWindow):
             items = [("windows", "Window", "ok" if selected else "bad",
                       "At least one game window is selected" if selected else "Select a game window (Dashboard)")]
         if mode == MODE_JIGSAW:
-            grid_ok = valid_grid_bounds(cfg.get("jigsaw_grid_bounds"))
+            grid_ok = grid_ready(cfg)
             confirm_ok = bool(cfg.get("confirm_button_pos"))
             pages_ok = bool(cfg.get("inv_page_1_pos"))
             state = self.solver_cache_manager.state()
             items += [
                 ("grid", "Puzzle grid", "ok" if grid_ok else "bad",
-                 "Grid is set" if grid_ok else "JIGSAW tab → Define Grid"),
+                 ("Found by itself in each window" if auto_grid(cfg) else "Grid is set")
+                 if grid_ok else "JIGSAW tab → Define Grid"),
                 ("pages", "Inventory pages", "ok" if pages_ok else "bad",
                  "Inventory page 1 is set" if pages_ok else "POSITIONS tab → set the page tabs"),
                 ("confirm", "Confirm", "ok" if confirm_ok else "bad",
@@ -6152,8 +6217,8 @@ class FishbotWindow(QMainWindow):
         if self.config.get("sound_on_pause", True):
             threading.Thread(target=play_pause_beep, args=(paused,), name="pause-chime", daemon=True).start()
 
-    def _on_activity_paused(self, mode: str, paused: bool) -> None:
-        self._pause_chime(paused)
+    def _on_activity_paused(self, mode: str, paused: bool, chime: Optional[bool] = None) -> None:
+        self._pause_chime(paused if chime is None else chime)
         self.dashboard.setPaused(paused)
         self.settings.setPaused(paused)
         self._running_status(mode, paused)
@@ -6223,7 +6288,10 @@ class FishbotWindow(QMainWindow):
                                 "Could not read game window position.")
             return
         existing = self.config.get("jigsaw_grid_bounds")
-        if existing and len(existing) == 4:
+        found = self._find_puzzle_grid(wm, w, h)
+        if found is not None:
+            grid = [float(v) for v in found]     # where the bot finds it: a check at a glance
+        elif existing and len(existing) == 4:
             grid = [float(v) for v in existing]
         else:
             dw, dh = 264, 176
@@ -6248,6 +6316,27 @@ class FishbotWindow(QMainWindow):
         self._grid_overlay.activateWindow()
         self._grid_overlay.setFocus()
 
+    def _find_puzzle_grid(self, wm: WindowManager, w: int, h: int):
+        """The grid of the Fish Puzzle window the bot finds in this game
+        window, or None."""
+        if not auto_grid(self.config):
+            return None
+        try:
+            grab, release = self._grab_with(wm)
+            try:
+                frame = grab(0, 0, w, h)
+            finally:
+                release()
+            if frame is None:
+                return None
+            from jigsaw_detector import JigsawDetector
+            found = JigsawDetector(self.config).locate_puzzle(frame)
+        except Exception:
+            diag.exc("find the puzzle window for Define Grid")
+            return None
+        diag.log("GUI", f"Define Grid: puzzle window {'found, grid ' + str(found.grid) if found else 'not found'}")
+        return found.grid if found else None
+
     def _on_grid_confirmed(self, bounds: list, sender_dialog=None, wm: Optional[WindowManager] = None) -> None:
         self.config["jigsaw_grid_bounds"] = bounds
         if wm is not None:
@@ -6258,7 +6347,7 @@ class FishbotWindow(QMainWindow):
                 diag.exc()
         self.save_config()
         self.add_status(f"Jigsaw grid set: {bounds}")
-        self.jigsaw_tab.setGrid(bounds)
+        self.jigsaw_tab.setGrid(bounds, auto_grid(self.config))
         self._refresh_readiness()
         if wm is not None:
             # The overlay was over the grid: bring the game back in front and
@@ -6369,7 +6458,8 @@ class FishbotWindow(QMainWindow):
         if "wizard_done_fishing" not in saved:
             saved["wizard_done_fishing"] = bool(saved.get("inv_page_1_pos"))
         if "wizard_done_jigsaw" not in saved:
-            saved["wizard_done_jigsaw"] = valid_grid_bounds(saved.get("jigsaw_grid_bounds"))
+            saved["wizard_done_jigsaw"] = valid_grid_bounds(saved.get("jigsaw_grid_bounds")) or bool(
+                saved.get("confirm_button_pos"))
         self._merge_config(saved)
         if self._config_fixed:
             info.append(f"invalid values reset to defaults: {self._config_fixed}")
@@ -6595,7 +6685,7 @@ class FishbotWindow(QMainWindow):
             self._set_coord_ui(k, self.config.get(cfg_key))
         self.settings.setAutoFish(self.config.get("auto_fish_handling", False))
         # Jigsaw options
-        self.jigsaw_tab.setGrid(self.config.get("jigsaw_grid_bounds"))
+        self.jigsaw_tab.setGrid(self.config.get("jigsaw_grid_bounds"), auto_grid(self.config))
         self.jigsaw_tab.setConfirm(self.config.get("confirm_button_pos"))
         self.jigsaw_tab.setPriority(self.config.get("jigsaw_crate_priority", "normal_first"))
         # Dashboard rows
@@ -7320,12 +7410,13 @@ class FishbotWindow(QMainWindow):
                 print("toggle_pause_all: no bots running")
             return
         
-        # Get current state BEFORE any changes
-        any_paused = any(b.paused for b in self.bots.values())
-        new_paused = not any_paused
-        
+        # While any window still runs, pause them all; resume only when all
+        # are paused. (Resuming as soon as one was paused left the others
+        # running when that one had paused itself.)
+        new_paused = not all(b.paused for b in self.bots.values())
+
         if DEBUG_PRINTS:
-            print(f"toggle_pause_all: any_paused={any_paused}, new_paused={new_paused}")
+            print(f"toggle_pause_all: new_paused={new_paused}")
         
         diag.log("GUI", f"{'PAUSE' if new_paused else 'RESUME'} (F5 / button) for {len(self.bots)} bots")
         # Apply pause state to all bots

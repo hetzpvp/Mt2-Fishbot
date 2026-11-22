@@ -44,6 +44,10 @@ class Humanizer:
         self.diag_tag = None
         self.window_rect = None   # callable -> (left, top, width, height)
         self._last_move = None
+        # Called before every cursor move and click (None: no check). A bot
+        # sets it to stop sending input the moment it is paused or stopped:
+        # the gate raises, and the action is not sent.
+        self.gate = None
 
     def _where(self, x, y) -> str:
         """'screen=(x,y) win=(x,y)' for the diagnostic log."""
@@ -66,10 +70,43 @@ class Humanizer:
 
     def move_to(self, x: float, y: float) -> None:
         """Move cursor directly to (x, y)."""
+        if self.gate is not None:
+            self.gate()
         if diag.ENABLED:
             self._last_move = (x, y)
             self._act(f"move_to {self._where(x, y)}")
         self.mouse.move_to(x, y)
+
+    def glide_to(self, x: float, y: float, duration: float) -> None:
+        """Moves the cursor to (x, y) in a few steps over ``duration`` seconds
+        instead of one jump. A game reads the cursor once per frame: after a
+        jump it may only notice the new place frames later, and the button
+        under the cursor is not "hovered" yet when the click comes. A plain
+        ``move_to`` when ``duration`` is 0, the start is unknown or the
+        distance is a few pixels."""
+        if self.gate is not None:
+            self.gate()
+        start = None
+        if duration > 0:
+            try:
+                pos = self.mouse.position()
+                start = (float(pos[0]), float(pos[1]))
+            except Exception:
+                start = None
+        if start is not None:
+            dx, dy = float(x) - start[0], float(y) - start[1]
+            dist = (dx * dx + dy * dy) ** 0.5
+            steps = int(max(2, min(8, dist // 30)))
+            if dist >= 4:
+                for i in range(1, steps):
+                    t = i / steps
+                    t = 1.0 - (1.0 - t) * (1.0 - t)   # ease out: slows down onto the target
+                    self.mouse.move_to(start[0] + dx * t, start[1] + dy * t)
+                    time.sleep(duration / steps)
+                if diag.ENABLED:
+                    diag.trace("ACTION", f"glide from ({int(start[0])},{int(start[1])}) in {steps} steps "
+                                         f"over {duration * 1000:.0f} ms", tag=self.diag_tag, depth=1)
+        self.move_to(x, y)
 
     def click(self, button: str = "left", hold: Optional[float] = None) -> None:
         """Single click.
@@ -84,6 +121,8 @@ class Humanizer:
           that need a guaranteed hold duration (e.g. game UI overlays that
           require the down-event to be visible long enough) keep working.
         """
+        if self.gate is not None:
+            self.gate()
         if diag.ENABLED:
             at = self._where(*self._last_move) if self._last_move else "at current cursor"
             self._act(f"click {button} hold={'instant' if hold is None and not self.enabled else hold} "
@@ -113,6 +152,8 @@ class Humanizer:
                 note_click_event()
 
     def mouse_down(self, button: str = "left") -> None:
+        if self.gate is not None:
+            self.gate()     # never gates mouse_up: a pressed button is always released
         if diag.ENABLED:
             self._act(f"mouse_down {button}")
         self.mouse.mouse_down(button=button)

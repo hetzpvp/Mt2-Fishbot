@@ -170,7 +170,10 @@ def game_frame(ww, wh, gx, gy):
 
 
 def detector(bounds):
-    return JigsawDetector({"jigsaw_grid_bounds": list(bounds)})
+    # The grid defined by hand is what these tests check (the overlay saves
+    # it): the puzzle window search, which would find the fixture anywhere,
+    # is off.
+    return JigsawDetector({"jigsaw_grid_bounds": list(bounds), "jigsaw_grid_auto": False})
 
 
 class FixtureTests(unittest.TestCase):

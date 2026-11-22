@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
+from typing import Optional
 
 try:
     import winsound
@@ -75,13 +76,15 @@ class PriorityInputLock:
             self._take()
             return True
 
-    def release(self) -> None:
+    def release(self, long_hold: Optional[float] = None) -> None:
+        """``long_hold``: log the hold only when longer than this (default
+        LONG_HOLD), for a holder that keeps the lock this long on purpose."""
         with self._cond:
             held_for = time.perf_counter() - self._since
             self._held = False
             self._owner = None
             self._cond.notify_all()
-        if held_for > self.LONG_HOLD:
+        if held_for > (self.LONG_HOLD if long_hold is None else long_hold):
             try:
                 import diag
                 if diag.ENABLED:

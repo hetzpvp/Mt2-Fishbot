@@ -1,16 +1,28 @@
 """
 Computer-vision helpers for the Fishing Jigsaw event window.
 
-The grid location is user-defined. The detector does not search for the grid;
-it checks that the configured rectangle really shows it (the frame and the
-cell dividers sit where a 6 x 4 grid puts them, see ``grid_structure``) and
-only then reads the occupancy of its cells.
+Where the grid is: the detector finds the Fish Puzzle window by itself in
+every game window (``locate_puzzle``). The window's look and layout are the
+same on every server seen so far (uiscript MiniGameFishEventGamePage): the
+grid image's rim and the two crate slot frames, which pieces and crates
+never cover, are matched as one masked template (assets/jigsaw/
+puzzle_frame.png). That gives the grid to the pixel and both crate slots,
+wherever the player put the window, in each client separately, with pieces
+already placed. It is then followed at that place frame by frame, and
+searched for again when it moved.
+
+A grid defined by hand (``jigsaw_grid_bounds``) is the fallback for a
+client where the window is not found (another look): there the detector
+checks that the configured rectangle really shows the grid (the frame and
+the cell dividers sit where a 6 x 4 grid puts them, see ``grid_structure``)
+before it reads the cells.
 """
 
 from __future__ import annotations
 
 import os
 import sys
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -33,6 +45,20 @@ class JigsawGridResult:
     board_mask: int
     confidence: float
     filled_cells: Optional[Set[int]] = None
+    # Crate slot centers of the found puzzle window (None: the grid was
+    # defined by hand, the slots are placed relative to it)
+    crate_slots: Optional[Dict[str, Point]] = None
+    source: str = "manual"     # "auto": the puzzle window was found; "manual": the defined grid
+
+
+@dataclass
+class PuzzleLocation:
+    """The Fish Puzzle window found in a game window (window coordinates)."""
+    corner: Point              # where the frame template's corner lies
+    grid: Rect
+    slots: Dict[str, Point]
+    score: float
+    second: float = -1.0       # the best score anywhere else (full searches only)
 
 
 @dataclass
@@ -111,8 +137,27 @@ class JigsawDetector:
         "discard_confirm": "jigsaw_discard_confirm.png",
     }
 
+    # The Fish Puzzle window's layout (uiscript MiniGameFishEventGamePage):
+    # the frame template (puzzle_frame.png) starts at the grid image, (14, 30)
+    # in the window; the 6 x 4 cells of 32 px start 4 px inside it; the
+    # crate slots (32 x 32) are centered at (248, 77) and (248, 128) in the
+    # window. The game draws its interface 1:1 at every resolution.
+    PUZZLE_TEMPLATE = "puzzle_frame.png"
+    PUZZLE_GRID_IN_TEMPLATE = (4, 4, 192, 128)
+    PUZZLE_SLOTS_IN_TEMPLATE = {"special": (248 - 14, 77 - 30), "normal": (248 - 14, 128 - 30)}
+    _PUZZLE_MIN_SCORE = 0.60     # full search: real windows 0.79-1.0, anything else at most 0.48
+    _PUZZLE_MIN_MARGIN = 0.15    # ... and this far above the best score anywhere else
+    _PUZZLE_TRACK_SCORE = 0.50   # at the place it was found (a held piece over the frame: >= 0.74)
+    _PUZZLE_TRACK_PX = 2         # how far it may have shifted there (a client moved it by 1 px)
+    _PUZZLE_EXCLUDE_PX = 12      # "anywhere else": this far from the best place
+    _PUZZLE_RESEARCH_S = 2.0     # with a defined grid in use: search for the window this often
+
     def __init__(self, config: Optional[dict] = None):
         self.config = config or {}
+        self.puzzle: Optional[PuzzleLocation] = None   # where the puzzle window was found last
+        self._puzzle_tpl: Optional[Tuple[np.ndarray, np.ndarray]] = None
+        self._puzzle_tpl_loaded = False
+        self._next_puzzle_search = 0.0
         self.threshold = float(self.config.get("jigsaw_detection_threshold", 0.80))
         # Cursor-piece templates often score lower than crate/slot templates because the
         # cursor sprite occludes part of the piece; use a separate, more permissive threshold.
@@ -217,11 +262,144 @@ class JigsawDetector:
         """How far (px) grid_structure looks for a line around where it should be."""
         return max(3, int(round(min(w / cls.COLS, h / cls.ROWS) * 0.09)))
 
+    # ------------------------------------------------------------ puzzle window
+
+    def auto_grid(self) -> bool:
+        """True when the puzzle window is searched for (the default) and its
+        template is there."""
+        return bool(self.config.get("jigsaw_grid_auto", True)) and self._puzzle_template() is not None
+
+    def _puzzle_template(self) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """(gray template, mask) of the puzzle frame, or None."""
+        if not self._puzzle_tpl_loaded:
+            self._puzzle_tpl_loaded = True
+            path = self._find_asset(self.PUZZLE_TEMPLATE)
+            img = cv2.imread(path, cv2.IMREAD_UNCHANGED) if path else None
+            if img is None or img.ndim != 3 or img.shape[2] != 4:
+                diag.log("ANALYSIS", f"puzzle frame template {self.PUZZLE_TEMPLATE} not found: "
+                                     f"only a grid defined by hand can be used")
+            else:
+                mask = np.where(img[:, :, 3] > 0, 255, 0).astype(np.uint8)
+                self._puzzle_tpl = (cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2GRAY), mask)
+        return self._puzzle_tpl
+
+    def _puzzle_location(self, corner: Point, score: float, second: float = -1.0) -> PuzzleLocation:
+        x, y = corner
+        gx, gy, gw, gh = self.PUZZLE_GRID_IN_TEMPLATE
+        slots = {k: (x + dx, y + dy) for k, (dx, dy) in self.PUZZLE_SLOTS_IN_TEMPLATE.items()}
+        return PuzzleLocation((x, y), (x + gx, y + gy, gw, gh), slots, score, second)
+
+    @staticmethod
+    def _match(gray: np.ndarray, template: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        result = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED, mask=mask)
+        # a flat area (zero variance under the mask) gives inf / nan
+        return np.nan_to_num(result, nan=-1.0, posinf=-1.0, neginf=-1.0)
+
+    def locate_puzzle(self, frame: np.ndarray, origin: Point = (0, 0)) -> Optional[PuzzleLocation]:
+        """Searches ``frame`` (a whole game window, or a part of it whose
+        corner is ``origin``) for the Fish Puzzle window. The best place must
+        score _PUZZLE_MIN_SCORE and stand _PUZZLE_MIN_MARGIN above every place
+        more than a few pixels away; otherwise None (closed, covered, or a
+        client with another look). 0.1 s at 1024x768, 0.25 s at 1920x1080."""
+        tpl = self._puzzle_template()
+        if tpl is None or frame is None or frame.ndim != 3:
+            return None
+        template, mask = tpl
+        th, tw = template.shape
+        if frame.shape[0] < th or frame.shape[1] < tw:
+            return None
+        result = self._match(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), template, mask)
+        _, best, _, (bx, by) = cv2.minMaxLoc(result)
+        ex = self._PUZZLE_EXCLUDE_PX
+        result[max(0, by - ex):by + ex + 1, max(0, bx - ex):bx + ex + 1] = -1.0
+        second = float(result.max()) if result.size else -1.0
+        corner = (bx + origin[0], by + origin[1])
+        found = best >= self._PUZZLE_MIN_SCORE and best - second >= self._PUZZLE_MIN_MARGIN
+        diag.log("ANALYSIS", f"puzzle window search in {frame.shape[1]}x{frame.shape[0]}: best {best:.3f} at "
+                             f"frame corner {corner}, elsewhere {second:.3f} -> "
+                             f"{'FOUND' if found else 'not found'}")
+        if not found:
+            return None
+        return self._puzzle_location(corner, float(best), second)
+
+    def _puzzle_near(self, frame: np.ndarray, origin: Point, corner: Point) -> Optional[PuzzleLocation]:
+        """The puzzle window at the place it was found (within a few px)."""
+        tpl = self._puzzle_template()
+        if tpl is None:
+            return None
+        template, mask = tpl
+        th, tw = template.shape
+        r = self._PUZZLE_TRACK_PX
+        x0, y0 = corner[0] - origin[0] - r, corner[1] - origin[1] - r
+        x1, y1 = x0 + tw + 2 * r, y0 + th + 2 * r
+        fx0, fy0 = max(0, x0), max(0, y0)
+        fx1, fy1 = min(frame.shape[1], x1), min(frame.shape[0], y1)
+        if fx1 - fx0 < tw or fy1 - fy0 < th:
+            return None
+        gray = cv2.cvtColor(frame[fy0:fy1, fx0:fx1], cv2.COLOR_BGR2GRAY)
+        _, best, _, (bx, by) = cv2.minMaxLoc(self._match(gray, template, mask))
+        if best < self._PUZZLE_TRACK_SCORE:
+            diag.log("ANALYSIS", f"puzzle window not at {corner} any more (score {best:.3f})")
+            return None
+        return self._puzzle_location((fx0 + bx + origin[0], fy0 + by + origin[1]), float(best))
+
+    def _find_puzzle(self, frame: np.ndarray, origin: Point,
+                     window_size: Optional[Tuple[int, int]]) -> Optional[PuzzleLocation]:
+        """Where the puzzle window is in this frame: at the place it was
+        found last, else anywhere (a whole-window frame only). Remembered in
+        ``self.puzzle``."""
+        if not self.auto_grid():
+            return None
+        if self.puzzle is not None:
+            loc = self._puzzle_near(frame, origin, self.puzzle.corner)
+            if loc is not None:
+                if loc.corner != self.puzzle.corner:
+                    diag.log("ANALYSIS", f"puzzle window shifted {self.puzzle.corner} -> {loc.corner}")
+                self.puzzle = loc
+                return loc
+        win_w, win_h = window_size if window_size is not None else (frame.shape[1], frame.shape[0])
+        if origin != (0, 0) or frame.shape[1] < win_w or frame.shape[0] < win_h:
+            return None          # a part of the window: the caller looks at the whole window
+        now = time.monotonic()
+        if self.config.get("jigsaw_grid_bounds") and self.puzzle is None and now < self._next_puzzle_search:
+            return None          # the defined grid is in use; the window is searched for again later
+        loc = self.locate_puzzle(frame, origin)
+        if loc is None:
+            self._next_puzzle_search = now + self._PUZZLE_RESEARCH_S
+            return None
+        if self.puzzle is None or loc.corner != self.puzzle.corner:
+            diag.log("ANALYSIS", f"puzzle window found: grid {loc.grid}, crate slots {loc.slots}, "
+                                 f"score {loc.score:.3f} (elsewhere {loc.second:.3f})")
+        self.puzzle = loc
+        return loc
+
+    def current_grid_bounds(self) -> Optional[Rect]:
+        """The grid in use: where the puzzle window was found last, else the
+        grid defined by hand (None: neither)."""
+        if self.puzzle is not None and self.auto_grid():
+            return self.puzzle.grid
+        value = self.config.get("jigsaw_grid_bounds")
+        try:
+            x, y, w, h = [int(round(float(v))) for v in value]
+        except (TypeError, ValueError):
+            return None
+        return (x, y, w, h) if w > 0 and h > 0 else None
+
     def board_area(self, win_w: int, win_h: int) -> Optional[Rect]:
-        """The window rectangle detect_grid reads: the configured grid plus the
-        margin grid_structure looks at around it. A capture of just this
-        rectangle, passed with its corner as ``origin``, reads the same as the
-        whole window. None when the configured grid is not in the window."""
+        """The window rectangle detect_grid reads: the found puzzle frame (plus
+        the few pixels it may shift), or the configured grid plus the margin
+        grid_structure looks at around it. A capture of just this rectangle,
+        passed with its corner as ``origin``, reads the same as the whole
+        window. None when neither is known or in the window."""
+        tpl = self._puzzle_template() if self.auto_grid() else None
+        if self.puzzle is not None and tpl is not None:
+            th, tw = tpl[0].shape
+            r = self._PUZZLE_TRACK_PX
+            x0, y0 = max(0, self.puzzle.corner[0] - r), max(0, self.puzzle.corner[1] - r)
+            x1 = min(win_w, self.puzzle.corner[0] + tw + r)
+            y1 = min(win_h, self.puzzle.corner[1] + th + r)
+            if x1 > x0 and y1 > y0:
+                return (x0, y0, x1 - x0, y1 - y0)
         bounds = self._configured_grid_bounds(None, (win_w, win_h))
         if bounds is None:
             return None
@@ -242,7 +420,14 @@ class JigsawDetector:
         ``frame`` is the whole window, or only the board_area() part of it:
         then ``origin`` is that part's corner and ``window_size`` the window's
         (w, h). The bounds and cell centers returned are window coordinates
-        either way."""
+        either way.
+
+        The puzzle window found in the frame (see _find_puzzle) comes first;
+        the grid defined by hand is the fallback."""
+        puzzle = self._find_puzzle(frame, origin, window_size)
+        if puzzle is not None:
+            return self._read_cells(frame, origin, puzzle.grid, puzzle.score,
+                                    crate_slots=dict(puzzle.slots), source="auto")
         bounds = self._configured_grid_bounds(frame, window_size)
         if bounds is None:
             diag.log("ANALYSIS", f"grid NOT found: configured jigsaw_grid_bounds="
@@ -269,7 +454,18 @@ class JigsawDetector:
                 return JigsawGridResult(False, bounds, [], 0, confidence)
             if diag.ENABLED:
                 diag.trace("ANALYSIS", f"grid structure at {bounds}: {confidence:.2f} ({detail})")
+        return self._read_cells(frame, origin, bounds, confidence)
 
+    def _read_cells(self, frame: np.ndarray, origin: Point, bounds: Rect, confidence: float,
+                    crate_slots: Optional[Dict[str, Point]] = None, source: str = "manual") -> JigsawGridResult:
+        """The occupancy of the 24 cells of the grid at ``bounds`` (window
+        coordinates; ``frame``'s corner is ``origin``)."""
+        local = (bounds[0] - origin[0], bounds[1] - origin[1], bounds[2], bounds[3])
+        if (local[0] < 0 or local[1] < 0 or local[0] + local[2] > frame.shape[1]
+                or local[1] + local[3] > frame.shape[0]):
+            diag.log("ANALYSIS", f"grid NOT read: {bounds} is not inside the captured part "
+                                 f"{frame.shape[1]}x{frame.shape[0]} at {origin}")
+            return JigsawGridResult(False, None, [], 0, 0.0)
         x, y, w, h = bounds
         cell_w = w / self.COLS
         cell_h = h / self.ROWS
@@ -318,7 +514,8 @@ class JigsawDetector:
             diag.trace("ANALYSIS", f"grid {bounds}: filled cells {sorted(filled_cells)} "
                                    f"board_mask={board_mask:024b} ({len(filled_cells)}/24), grid area "
                                    f"{diag.array_summary(grid_roi)}")
-        return JigsawGridResult(True, bounds, centers, board_mask, confidence, filled_cells)
+        return JigsawGridResult(True, bounds, centers, board_mask, confidence, filled_cells,
+                                crate_slots=crate_slots, source=source)
 
     _GRID_EDGE_TOLERANCE = 2   # px the configured grid may stick out of the frame
 
@@ -668,12 +865,15 @@ class JigsawDetector:
 
     def _slot_looks_empty(self, frame: np.ndarray, gray: Optional[np.ndarray], center: Point, grid_bounds: Optional[Rect]) -> Tuple[bool, float]:
         cx, cy = center
+        # The inside of the slot only. A wider sample took in the slot's
+        # golden frame, whose colored pixels made an empty slot read as
+        # "crate present" on a real client.
         if grid_bounds is not None:
             _, _, gw, gh = grid_bounds
-            half_w = max(18, int(gw * 0.10))
-            half_h = max(18, int(gh * 0.13))
+            half_w = max(6, int(round(gw * 0.057)))
+            half_h = max(6, int(round(gh * 0.086)))
         else:
-            half_w, half_h = 24, 24
+            half_w, half_h = 11, 11
         frame_h, frame_w = frame.shape[:2]
         y1, y2 = max(0, cy - half_h), min(frame_h, cy + half_h)
         x1, x2 = max(0, cx - half_w), min(frame_w, cx + half_w)
@@ -684,8 +884,13 @@ class JigsawDetector:
         mean = float(np.mean(crop))
         std = float(np.std(crop))
         hsv = cv2.cvtColor(color_crop, cv2.COLOR_BGR2HSV)
-        sat_ratio = float(np.mean(hsv[:, :, 1] > int(self.config.get("jigsaw_slot_saturation_min", 45))))
+        # Saturation of near-black pixels is noise (the empty slot's dark
+        # texture reads 50% "saturated"): only visible color counts.
+        sat_ratio = float(np.mean((hsv[:, :, 1] > int(self.config.get("jigsaw_slot_saturation_min", 45)))
+                                  & (hsv[:, :, 2] >= 60)))
         bright_ratio = float(np.mean(crop > int(self.config.get("jigsaw_slot_bright_min", 66))))
+        # Logged only: the empty slot's own texture has edges (0.2-0.26 on a
+        # real client) and failed the old edge limit every time.
         edges = cv2.Canny(crop, 35, 90)
         edge_ratio = float(np.mean(edges > 0))
 
@@ -694,9 +899,8 @@ class JigsawDetector:
             and std < float(self.config.get("jigsaw_empty_slot_std_max", 24.0))
             and sat_ratio < float(self.config.get("jigsaw_empty_slot_saturation_ratio_max", 0.10))
             and bright_ratio < float(self.config.get("jigsaw_empty_slot_bright_ratio_max", 0.08))
-            and edge_ratio < float(self.config.get("jigsaw_empty_slot_edge_ratio_max", 0.065))
         )
-        available_score = min(1.0, max(bright_ratio * 3.0, sat_ratio * 2.5, edge_ratio * 5.0, std / 55.0))
+        available_score = min(1.0, max(bright_ratio * 3.0, sat_ratio * 2.5, std / 55.0))
         if diag.ENABLED:
             diag.trace("ANALYSIS", f"crate slot at {center}: mean={mean:.1f} std={std:.1f} sat_ratio={sat_ratio:.3f} "
                                    f"bright_ratio={bright_ratio:.3f} edge_ratio={edge_ratio:.3f} -> "
@@ -891,6 +1095,10 @@ class JigsawDetector:
         return None
 
     def _crate_slot_centers(self, grid: JigsawGridResult) -> Dict[str, Point]:
+        if grid.crate_slots:
+            # The found puzzle window's own slots (its layout, to the pixel).
+            # Fixed pixel positions from the settings cannot follow the window.
+            return dict(grid.crate_slots)
         configured = self.config.get("jigsaw_crate_slot_centers")
         if isinstance(configured, dict):
             centers: Dict[str, Point] = {}
@@ -909,9 +1117,16 @@ class JigsawDetector:
         gx, gy, gw, gh = grid.grid_bounds
         right_mid_x = gx + gw
         right_mid_y = gy + (gh // 2)
-        x_offset = int(self.config.get("jigsaw_crate_slot_x_offset", 50))
-        special_y_offset = int(self.config.get("jigsaw_special_crate_slot_y_offset", -20))
-        normal_y_offset = int(self.config.get("jigsaw_normal_crate_slot_y_offset", 35))
+        # Measured on two real clients (tests/fixtures/jigsaw_grid): the slot
+        # frames are centered 37 px right of the grid and 21 px above / 30 px
+        # below its middle, for a grid of about 192x128. Kept in proportion to
+        # the grid: the old fixed 50 / -20 / +35 px fitted a 264x176 board
+        # (the simulator's) and put the click on the right edge of a real
+        # slot, 13 px beside its center (diag 20261122_002413). The pixel
+        # settings still override.
+        x_offset = int(self.config.get("jigsaw_crate_slot_x_offset", round(gw * 0.193)))
+        special_y_offset = int(self.config.get("jigsaw_special_crate_slot_y_offset", -round(gh * 0.168)))
+        normal_y_offset = int(self.config.get("jigsaw_normal_crate_slot_y_offset", round(gh * 0.234)))
         return {
             "special": (right_mid_x + x_offset, right_mid_y + special_y_offset),
             "normal": (right_mid_x + x_offset, right_mid_y + normal_y_offset),

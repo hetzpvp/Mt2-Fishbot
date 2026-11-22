@@ -118,6 +118,63 @@ class PickupTests(unittest.TestCase):
         self.assertTrue(any("item put back" in m for m in logs), logs[-10:])
         self.assertGreaterEqual(game.stats["dropped"], 1, logs[-10:])
 
+    def test_item_without_drop_sell_step_is_dropped(self):
+        # Dyes on the real client (diag 20261121_200639): no Drop / Sell
+        # popup, the game asks yes / no at once. The bot gave up after the
+        # quiet Drop / Sell point and left the dialog open, so the casts
+        # that followed did nothing.
+        game, cfg = game_and_config(direct_yes_no=True)
+        bot, logs = run(game, cfg, catches=4)
+        self.assertGreaterEqual(game.stats["dropped"], 2, logs[-10:])
+        self.assertEqual(game.stats["drop_cancelled"], 0, logs[-10:])
+        self.assertIsNone(game.dialog, "dialog left open")
+        self.assertIsNone(game.carrying, "item left on the cursor")
+
+    def test_the_same_item_can_switch_dialog(self):
+        # One item, and the client does not stick to one dialog: yes / no,
+        # then Drop / Sell, then yes / no again. Remembering the last one
+        # must not make the next drop click the wrong button.
+        game, cfg = game_and_config(dialog_steps=("confirm", "drop", "confirm", "drop"),
+                                    catch_names=("Bleach_item.jpg",))
+        bot, logs = run(game, cfg, catches=5)
+        self.assertGreaterEqual(game.stats["dropped"], 3, logs[-12:])
+        self.assertEqual(game.stats["drop_cancelled"], 0, logs[-12:])
+        self.assertEqual(bot._drop_failures, 0)
+        self.assertIsNone(game.dialog, "dialog left open")
+        self.assertIsNone(game.carrying, "item left on the cursor")
+
+    def test_a_dye_and_a_ring_in_one_session_both_drop(self):
+        game, cfg = game_and_config(
+            direct_yes_no={"Bleach_item.jpg"},
+            catch_names=("Carp_living.jpg", "Bleach_item.jpg"))
+        bot, logs = run(game, cfg, catches=4)
+        self.assertGreaterEqual(game.stats["dropped"], 2, logs[-12:])
+        self.assertEqual(game.stats["drop_cancelled"], 0, logs[-12:])
+        self.assertEqual(bot._drop_failures, 0)
+        self.assertIsNone(game.dialog, "dialog left open")
+
+    def test_drop_that_ends_at_the_drop_button_is_not_a_failure(self):
+        # The client has no yes / no after Drop. The slot is empty and no
+        # dialog is left, so the drop stands.
+        game, cfg = game_and_config(drop_completes=True)
+        bot, logs = run(game, cfg, catches=4)
+        self.assertGreaterEqual(game.stats["dropped"], 2, logs[-12:])
+        self.assertEqual(game.stats["drop_cancelled"], 0, logs[-12:])
+        self.assertEqual(bot._drop_failures, 0)
+        self.assertIsNone(game.dialog, "dialog left open")
+        self.assertIsNone(game.carrying, "item left on the cursor")
+
+    def test_confirm_area_that_does_not_return_to_baseline_still_drops(self):
+        # After YES the world behind the button stays 17 levels off, including
+        # the first drop, before any dialog look is known. That used to be
+        # "dialog still open" and three of them stopped the bot.
+        game, cfg = game_and_config(shift_confirm_world=True)
+        bot, logs = run(game, cfg, catches=4)
+        self.assertGreaterEqual(game.stats["dropped"], 2, logs[-12:])
+        self.assertEqual(game.stats["drop_cancelled"], 0, logs[-12:])
+        self.assertEqual(bot._drop_failures, 0, logs[-12:])
+        self.assertIsNone(game.dialog, "dialog left open")
+
 
 if __name__ == "__main__":
     unittest.main()

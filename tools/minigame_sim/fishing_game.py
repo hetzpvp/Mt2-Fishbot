@@ -38,6 +38,15 @@ awkward clients and connections the bot has to cope with:
                     the cursor hit some UI instead: no drop dialog, the item
                     stays on the cursor
 - ``lost_drop_buttons``  this many clicks on DROP are lost (no confirm dialog)
+- ``direct_yes_no``  the ground click asks yes / no at once, with no DROP step
+                    (dyes on a real client, diag 20261121_200639). A set of item
+                    names does this for those items only
+- ``catch_names``   catches cycle through these item names
+- ``dialog_steps``  ``"drop"`` or ``"confirm"`` per ground click, in order;
+                    the last entry repeats. Overrides ``direct_yes_no``
+- ``shift_confirm_world``  after the first YES, the world behind that button
+                    stays 17 gray levels off (the rod and character moved)
+- ``drop_completes``  the DROP click drops the item; no YES dialog follows
 - ``pickup_hides_slot``  the slot of a picked-up item shows empty (a client
                     that does not keep drawing it there)
 - ``held_icon_anchor``  where the copy on the cursor is drawn: "center" on the
@@ -297,7 +306,9 @@ class FishingGame:
                  answer_delay=0.0, lost_confirm_clicks=0, golden_tuna_games=(), tuna_confirm=False,
                  tuna_delay=0.1, tuna_ok=(True, True, True), bite_steps=None, fish_motion="free",
                  frame_rate=0, living_world=False, prefill=0, rod_animation=0.0, mount_time=(0.15, 0.2),
-                 slow_mount_chance=0.0, slow_mount_time=0.3, mount_key="g"):
+                 slow_mount_chance=0.0, slow_mount_time=0.3, mount_key="g", direct_yes_no=False,
+                 dialog_steps=None, shift_confirm_world=False, drop_completes=False,
+                 catch_names=None):
         self.W, self.H = size
         self.rng = random.Random(seed)
         self.clock = clock
@@ -324,6 +335,14 @@ class FishingGame:
         self.blank_chance = blank_chance
         self.blocked_ground_clicks = blocked_ground_clicks
         self.lost_drop_buttons = lost_drop_buttons
+        self.direct_yes_no = direct_yes_no
+        self.dialog_steps = list(dialog_steps) if dialog_steps else None
+        self._dialog_step = 0
+        self.catch_names = list(catch_names) if catch_names else None
+        self._catch_i = 0
+        self.shift_confirm_world = shift_confirm_world
+        self._confirm_shifted = False
+        self.drop_completes = drop_completes
         self.pickup_hides_slot = pickup_hides_slot
         self.ring_feedback = ring_feedback
         self._ring_white_until = 0.0       # after a hit the ring stays white this long
@@ -695,7 +714,11 @@ class FishingGame:
         self.stats["caught"] += 1
         if not (self.inventory_enabled and self._item_names):
             return
-        name = self.rng.choice(self._item_names)
+        if self.catch_names:
+            name = self.catch_names[self._catch_i % len(self.catch_names)]
+            self._catch_i += 1
+        else:
+            name = self.rng.choice(self._item_names)
         for page in self.pages:
             for slot in range(INV_COLS * INV_ROWS):
                 if slot not in page:
@@ -784,6 +807,28 @@ class FishingGame:
                 self._new_popup(now)
             self._emit("cast")
 
+    def _ground_asks_yes_no(self) -> bool:
+        """The dialog this ground click opens: yes / no, or Drop / Sell first."""
+        if self.dialog_steps:
+            step = self.dialog_steps[min(self._dialog_step, len(self.dialog_steps) - 1)]
+            self._dialog_step += 1
+            return step == "confirm"
+        names = self.direct_yes_no
+        if isinstance(names, (set, frozenset)):
+            return self.carrying is not None and self.carrying[2] in names
+        return bool(names)
+
+    def _shift_confirm_world(self) -> None:
+        """Leaves the confirm button's patch 17 levels off, and leaves it there."""
+        if not self.shift_confirm_world or self._confirm_shifted:
+            return
+        x, y = self.confirm_button
+        w, h = 40, 16
+        x0, y0 = x - w // 2, y - h // 2
+        area = self.background[y0:y0 + h, x0:x0 + w].astype(np.int16)
+        self.background[y0:y0 + h, x0:x0 + w] = np.clip(area + 17, 0, 255).astype(np.uint8)
+        self._confirm_shifted = True
+
     @staticmethod
     def _near(x, y, point, rx, ry):
         return abs(x - point[0]) <= rx and abs(y - point[1]) <= ry
@@ -867,6 +912,16 @@ class FishingGame:
                         self.lost_drop_buttons -= 1
                         self.stats["lost_drop_buttons"] += 1
                         return
+                    if self.drop_completes:
+                        page, slot, _ = self.carrying
+                        self._forget_slot(page, slot)
+                        if not self.pickup_hides_slot:
+                            del self.pages[page][slot]
+                        self.dialog = None
+                        self.carrying = None
+                        self.stats["dropped"] += 1
+                        self._emit("dropped")
+                        return
                     self.dialog = "confirm"
                 elif button == "left" and self.dialog == "confirm" and self._near(x, y, self.confirm_button, 32, 12):
                     if self.lost_confirm_clicks > 0:
@@ -880,6 +935,7 @@ class FishingGame:
                     self.dialog = None
                     self.carrying = None
                     self.stats["dropped"] += 1
+                    self._shift_confirm_world()
                     self._emit("dropped")
                 else:
                     # Anything else cancels: the item goes back to its slot
@@ -938,7 +994,7 @@ class FishingGame:
                     self.blocked_ground_clicks -= 1
                     self.stats["blocked_ground_clicks"] += 1
                     return
-                self.dialog = "drop"
+                self.dialog = "confirm" if self._ground_asks_yes_no() else "drop"
 
     BAIT_FISH = ("Shrimp_living.jpg", "Vai_living.jpg")
 

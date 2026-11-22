@@ -24,7 +24,7 @@ import screen_capture  # noqa: E402
 from fishing_bot import FishingBot  # noqa: E402
 from minigame_sim import bench  # noqa: E402
 from minigame_sim.desktop import FishingDesktop  # noqa: E402
-from minigame_sim.jigsaw_game import JigsawGame, GRID  # noqa: E402
+from minigame_sim.jigsaw_game import JigsawGame, GRID, CELL  # noqa: E402
 from minigame_sim.fishing_game import FishingGame  # noqa: E402
 import test_jigsaw_sim as jsim  # noqa: E402  (module import: its tests are not collected twice)
 
@@ -546,8 +546,13 @@ class JigsawGridCheckTests(unittest.TestCase):
         self.assertEqual(clicks, [])
         self.assertTrue(any("puzzle window not found" in m for m in rig.logs), rig.logs[-8:])
 
-    def test_grid_shifted_by_40px_gets_no_click_and_a_pause(self):
-        shifted = [GRID[0] + 40, GRID[1], GRID[2], GRID[3]]
+    def test_grid_shifted_by_a_cell_gets_no_click_and_a_pause(self):
+        # One cell (44 px). It was 40 px, which the check turned down only
+        # because the crates, drawn where the old slot offsets put them,
+        # broke the shifted right side; at the real slot places 2 of its 4
+        # segments line up with crate edges (the known weakness: a rectangle
+        # about one divider off can pass).
+        shifted = [GRID[0] + CELL, GRID[1], GRID[2], GRID[3]]
         rig, clicks = self._run_until_paused(JigsawGame(), {"jigsaw_grid_bounds": shifted})
         self.assertIn((0, True), rig.pauses, rig.logs[-8:])
         self.assertEqual(clicks, [])

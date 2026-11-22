@@ -20,6 +20,8 @@ Two sources:
     python tools/mt2_assets.py packs <client folder>
     python tools/mt2_assets.py capture diagnostics/20261120_195925.zip
     python tools/mt2_assets.py templates <client folder>   (rewrites assets/fishing)
+    python tools/mt2_assets.py puzzle <client folder> diagnostics/20261122_091635.zip
+                                (the jigsaw puzzle frame template + sim window)
 
 ``templates`` puts the exact game icon of every item the bot knows into
 assets/fishing, drawn on the real empty slot (the game blends icons over the
@@ -325,6 +327,98 @@ def extract_capture(diag_zip):
     print("board, slot, counter text ->", SIM_ASSETS, "; fixtures ->", FIXTURES)
 
 
+# ------------------------------------------------------------ jigsaw puzzle
+
+# The Fish Puzzle window (uiscript MiniGameFishEventGamePage, the same on
+# every server seen so far): 288x208, grid image at (14, 30) (200x136, the
+# 6x4 cells of 32 px at (18, 34)), special / normal crate slot frames
+# (46x46) at (225, 54) / (225, 105), use counter field (51x18) at (219, 178).
+# Texture atlas "fishingevnet001.dds" (256x272): grid image at (0, 0), slot
+# frames at (205, 0) / (205, 46), counter field at (205, 95), the pieces
+# below y = 139.
+PUZZLE_WINDOW = (288, 208)
+PUZZLE_GRID_IMAGE = (14, 30)
+PUZZLE_SLOTS = {"special": (225, 54), "normal": (225, 105)}
+PUZZLE_COUNTER = (219, 178)
+PUZZLE_SHOT = "_W1_jigsaw_grid_not_found.png"   # diag 20261122_091635: an empty board
+
+
+def _puzzle_atlas(game_dir):
+    pack = os.path.join(game_dir, "data", "pack")
+    for blob in pack_entries(os.path.join(pack, "ui.to")):
+        if blob[:4] != b"DDS " or struct.unpack_from("<II", blob, 12) != (272, 256):
+            continue
+        img = _image(blob)
+        if img is None:
+            continue
+        # The grid image: opaque, dark cells, a lighter divider every 32 px
+        cells = img[8:36, 8:36, :3].mean()
+        line = img[4:132, 36, :3].mean()
+        if img[50, 50, 3] == 255 and cells < 40 and line > cells + 8:
+            return _bgra(img)
+    sys.exit("puzzle atlas (256x272 DDS with the 6x4 grid image) not found in ui.to")
+
+
+def extract_puzzle(game_dir, diag_zip):
+    """The detector's puzzle frame template (assets/jigsaw/puzzle_frame.png),
+    and the simulator's puzzle window + atlas."""
+    atlas = _puzzle_atlas(game_dir)
+    grid = atlas[0:136, 0:200]
+    slots = {"special": atlas[0:46, 205:251], "normal": atlas[46:92, 205:251]}
+
+    # Template: what of the window pieces and crates never cover. The grid
+    # image's 4 px rim and the two slot frames (7 px around the 32x32 slot),
+    # where they are opaque; alpha is the mask.
+    gx, gy = PUZZLE_GRID_IMAGE
+    w = PUZZLE_SLOTS["special"][0] + 46 - gx
+    template = np.zeros((136, w, 4), np.uint8)
+
+    def put(img, x, y, inner):
+        h, iw = img.shape[:2]
+        part = img.copy()
+        part[:, :, 3] = np.where(img[:, :, 3] > 240, 255, 0)
+        ix, iy, cw, ch = inner
+        part[iy:iy + ch, ix:ix + cw, 3] = 0
+        region = template[y:y + h, x:x + iw]
+        keep = part[:, :, 3] > 0
+        region[keep] = part[keep]
+
+    put(grid, 0, 0, (4, 4, 192, 128))
+    for section, (sx, sy) in PUZZLE_SLOTS.items():
+        put(slots[section], sx - gx, sy - gy, (7, 7, 32, 32))
+    os.makedirs(os.path.join(ROOT, "assets", "jigsaw"), exist_ok=True)
+    cv2.imwrite(os.path.join(ROOT, "assets", "jigsaw", "puzzle_frame.png"), template)
+
+    # Simulator: the window of a lossless shot, emptied (grid, slots and
+    # counter field from the atlas), and the atlas for the pieces.
+    z = zipfile.ZipFile(diag_zip)
+    shot = _read_zip_png(z, next(n for n in z.namelist() if n.endswith(PUZZLE_SHOT)))
+    gray_t = cv2.cvtColor(template[:, :, :3], cv2.COLOR_BGR2GRAY)
+    found = cv2.matchTemplate(cv2.cvtColor(shot, cv2.COLOR_BGR2GRAY), gray_t, cv2.TM_CCOEFF_NORMED,
+                              mask=template[:, :, 3])
+    _, score, _, (tx, ty) = cv2.minMaxLoc(np.nan_to_num(found, nan=-1.0, posinf=-1.0, neginf=-1.0))
+    if score < 0.9:
+        sys.exit(f"no puzzle window in the shot (best {score:.2f})")
+    wx, wy = tx - gx, ty - gy
+    ww, wh = PUZZLE_WINDOW
+    window = shot[wy:wy + wh, wx:wx + ww].copy()
+
+    def paste(img, x, y):
+        h, iw = img.shape[:2]
+        a = img[:, :, 3:4].astype(np.float32) / 255.0
+        window[y:y + h, x:x + iw] = (window[y:y + h, x:x + iw] * (1 - a) + img[:, :, :3] * a).astype(np.uint8)
+
+    paste(grid, gx, gy)
+    for section, (sx, sy) in PUZZLE_SLOTS.items():
+        paste(slots[section], sx, sy)
+    paste(atlas[95:113, 205:256], *PUZZLE_COUNTER)
+    os.makedirs(SIM_ASSETS, exist_ok=True)
+    cv2.imwrite(os.path.join(SIM_ASSETS, "puzzle_window.png"), window)
+    cv2.imwrite(os.path.join(SIM_ASSETS, "puzzle_atlas.png"), atlas)
+    print(f"puzzle frame -> assets/jigsaw/puzzle_frame.png; window (found at {wx},{wy}, "
+          f"score {score:.3f}) + atlas -> {SIM_ASSETS}")
+
+
 # ----------------------------------------------------------------- templates
 
 def _on_slot(icon, slot):
@@ -400,9 +494,14 @@ def main(argv=None):
     sub.add_parser("packs").add_argument("game_dir")
     sub.add_parser("capture").add_argument("diag_zip")
     sub.add_parser("templates").add_argument("game_dir")
+    puzzle = sub.add_parser("puzzle")
+    puzzle.add_argument("game_dir")
+    puzzle.add_argument("diag_zip")
     args = ap.parse_args(argv)
     if args.cmd == "packs":
         extract_packs(os.path.expanduser(args.game_dir))
+    elif args.cmd == "puzzle":
+        extract_puzzle(os.path.expanduser(args.game_dir), os.path.expanduser(args.diag_zip))
     elif args.cmd == "capture":
         extract_capture(os.path.expanduser(args.diag_zip))
     else:

@@ -23,7 +23,7 @@ Free fishing-minigame bot for Metin2. No subscriptions, no licenses.
 - Reads the screen only; it never touches game memory
 - Auto fish handling per fish type (keep / open / drop, or use bait fish like Vai and Shrimp as bait), dead fish included, across up to 8 inventory pages
 - Handles the Golden Tuna dialog with the choice you set
-- Built-in jigsaw solver for the fishing puzzle
+- Built-in jigsaw solver for the fishing puzzle: finds the puzzle window by itself in every client, wherever it is
 - Up to 8 bait hotkeys (1–4, F1–F4), quick skip (horse or armor), adjustable timings, human-like clicking
 - Adapts to re-skinned minigames, saves and loads profiles
 - **F5** pauses and resumes every bot, with a short chime you hear while the game is in front
@@ -45,9 +45,9 @@ Quick skip needs a horse (Horse mode), or a spare armor in the inventory with it
 |---|---|
 | Bottom of the window cut off by the screen | **Settings → Interface size**: pick a smaller size (or Auto) and restart the bot, or lower the Windows display scale. Below 70 % the window gets shorter and its tabs scroll instead |
 | Fish are not opened or dropped | Keep the inventory open, set the drop and confirm positions, then raise the item timings in **Timing Settings** (useful on high ping) |
-| Jigsaw pieces not detected | Keep the whole puzzle window visible and uncovered, then **Define Grid** (JIGSAW tab) again so the ghost grid covers the 24 cells exactly. Still failing: send a diagnostic log (below) |
-| Jigsaw pauses right after Start: "puzzle window not found at the configured grid" | A grid set with 2.0.2 or 2.0.3 on a 1080p or larger screen was saved in the wrong place. Update to 2.0.4 and **Define Grid** (JIGSAW tab) again |
-| Jigsaw won't start: "the Confirm point lies on the puzzle grid" | The game opens its confirm dialog in the middle of the screen. Move the puzzle window away from the centre (top left works), then Define Grid and Set Confirm (JIGSAW tab) again — see **Guide → Jigsaw: window placement** |
+| Jigsaw pieces not detected | Keep the whole puzzle window visible and uncovered. Still failing: send a diagnostic log (below) |
+| Jigsaw pauses: "puzzle window not found in this game window" | Open the Fish Puzzle window in that client, away from the middle of the screen, with nothing over it, then press F5. If your server's puzzle looks different and it is still not found, press **Define Grid** (JIGSAW tab) and lay the ghost grid on the 24 cells |
+| Jigsaw won't start or pauses: "the Confirm point lies on the puzzle grid" | The game opens its confirm dialog in the middle of the screen. Move the puzzle window away from the centre (top left works), then Set Confirm (JIGSAW tab) again — see **Guide → Jigsaw: window placement** |
 | Pages stop switching | Re-set the page positions after changing resolution |
 | Stops with "Game screen lost" | The inventory vanished while no fish bit (disconnect, death, login screen). Log back in, open the inventory, start again |
 

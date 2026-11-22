@@ -231,8 +231,17 @@ class GuiSmokeTests(GuiFixture):
         self._jigsaw_mode(w)
         chips = w.dashboard.ready_chips.chips
         self.assertEqual(list(chips), ["windows", "grid", "pages", "confirm", "solver"])
-        self.assertEqual(chips["grid"].property("state"), "bad")
+        # The puzzle window is found by itself in every game window
+        self.assertEqual(chips["grid"].property("state"), "ok")
+        self.assertIn("automatic", w.jigsaw_tab.grid_info_label.text())
         self.assertEqual(chips["pages"].property("state"), "bad")     # required for Jigsaw too
+        w._on_grid_confirmed([10, 20, 264, 176])                     # defined anyway: the fallback
+        self.assertEqual(chips["grid"].property("state"), "ok")
+        self.assertIn("fallback", w.jigsaw_tab.grid_info_label.text())
+        w.config["jigsaw_grid_auto"] = False                         # search switched off
+        w.config["jigsaw_grid_bounds"] = None
+        w._refresh_readiness()
+        self.assertEqual(chips["grid"].property("state"), "bad")
         w._on_grid_confirmed([10, 20, 264, 176])
         self.assertEqual(chips["grid"].property("state"), "ok")
         self.assertIn("x=10", w.jigsaw_tab.grid_info_label.text())
@@ -318,9 +327,16 @@ class GuiSmokeTests(GuiFixture):
         runner.paused_changed.emit(1, True)
         self.assertIn("PAUSED", rows[1].pill.text())
         self.assertIn("RUNNING", rows[0].pill.text())
+        # One window still runs: the button pauses (it said RESUME, and a
+        # click let the other window go on clicking: diag 20261122_091635)
+        self.assertNotIn("RESUME", w.dashboard.start_btn.text())
+        self.assertIn("PAUSE", w.dashboard.start_btn.text())
+        w.dashboard.start_btn.click()                             # Pause, not Stop
+        self.assertTrue(a.paused and b.paused)
         self.assertIn("RESUME", w.dashboard.start_btn.text())
-        w.dashboard.start_btn.click()                             # Resume, not Stop
-        self.assertFalse(b.paused)
+        w.dashboard._last_click = float("-inf")                  # a later click, not a double click
+        w.dashboard.start_btn.click()                             # all paused: resume all
+        self.assertFalse(a.paused or b.paused)
         self.assertIn("PAUSE", w.dashboard.start_btn.text())
 
         w.dashboard.stop_btn.click()

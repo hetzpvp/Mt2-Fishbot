@@ -554,9 +554,10 @@ def draw_jigsaw_grid(c: Canvas) -> None:
         c.p.drawLine(QPointF(gx, gy + k * gh / 4), QPointF(gx + gw, gy + k * gh / 4))
     c.caption(20, 26, 300, "ghost grid exactly on the 6 x 4 cells", OK, 7.0)
     c.text(345, 20, 165, 270,
-           "Open the Fish Puzzle window in the game, then press Define Grid.\n\nDrag and resize the "
-           "green ghost grid until its lines lie on the cells' borders: its outer edge on the outer "
-           "edge of the 24 cells.\n\nThe two crate slots on the right are found from the grid.",
+           "The bot finds the Fish Puzzle window by itself in every game window, wherever it is, "
+           "and takes the grid and both crate slots from it.\n\nOnly if it reports that it cannot "
+           "find the window: press Define Grid and drag the green ghost grid until its lines lie on "
+           "the cells' borders (outer edge on the outer edge of the 24 cells).",
            size=7.2, color=QColor(THEME["text_dim"]), align=Qt.AlignLeft | Qt.AlignTop)
 
 
@@ -590,8 +591,8 @@ def draw_jigsaw_layout(c: Canvas) -> None:
     c.text(265, 202, 245, 40, "The dialog opens on free ground: Yes is clear of the grid and the crate slots.",
            size=6.6, color=QColor(THEME["text_dim"]))
     c.text(10, 246, 500, 54,
-           "Move the puzzle window away from the centre of the game screen, then press Define Grid and "
-           "Set Confirm again. The window stays where you put it.",
+           "Move the puzzle window away from the centre of the game screen, then press Set Confirm "
+           "again. The bot finds the window wherever you put it.",
            size=7.2, align=Qt.AlignLeft | Qt.AlignTop)
 
 
@@ -687,9 +688,11 @@ TOPICS: Dict[str, dict] = {
                "Drop needs the Confirm coordinate (and Drop / Sell if your client asks drop or sell first)."],
         draw=draw_fish_handling),
     "jigsaw_grid": dict(
-        title="Jigsaw: define the grid",
-        steps=["Open the Fish Puzzle window in the game, away from the middle of the screen.",
-               "Press Define Grid and lay the ghost grid exactly on the 24 cells."],
+        title="Jigsaw: the puzzle grid",
+        steps=["Open the Fish Puzzle window in every game client, away from the middle of the screen.",
+               "The bot finds it by itself in each client, with or without pieces on it.",
+               "Only if it reports it cannot find the window: press Define Grid and lay the ghost grid "
+               "exactly on the 24 cells."],
         draw=draw_jigsaw_grid),
     "jigsaw_confirm": dict(
         title="Jigsaw: the Confirm point",
@@ -699,8 +702,8 @@ TOPICS: Dict[str, dict] = {
     "jigsaw_layout": dict(
         title="Jigsaw: window placement",
         steps=["Move the Fish Puzzle window away from the middle of the screen (top left works well).",
-               "Press Define Grid again.",
-               "Open a crate by hand and press Set Confirm again."],
+               "Open a crate by hand and press Set Confirm again.",
+               "If you defined the grid by hand, press Define Grid again."],
         draw=draw_jigsaw_layout),
     "jigsaw_crates": dict(
         title="Jigsaw: crates",

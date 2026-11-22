@@ -532,6 +532,7 @@ class FishingBot:
         self._tab_check_off = False       # this client's tabs cannot be read: fixed wait
         self._fill_page_pending = False   # armor quick skip left another page on screen
         self._drop_failures = 0           # drops in a row that failed at a dialog step
+        self._direct_yes_no_items = set() # last drop of this item was yes / no, with no Drop / Sell step
         # The held-item probe saw an item that a drop dialog then proved was
         # on the cursor: from then on its "nothing held" is trusted too.
         self._held_probe_proven = False
@@ -2936,12 +2937,27 @@ class FishingBot:
                     return there
                 time.sleep(0.05)
 
+        def button_dialog_open() -> bool:
+            """A dialog at Drop / Sell or at Confirm, including one the
+            expected step did not recognise. The item then sits in the
+            dialog, not on the cursor, and an empty cursor is not 'home'."""
+            for pt, base, what in ((drop_pt, base_drop, "drop dialog"), (confirm_pt, base_confirm, "confirm dialog")):
+                if pt is not None and base is not None and dialog_watch.still_up(
+                        grab, pt, base, what=what, owner=self.bot_id):
+                    return True
+            return False
+
         def put_back(why: str, dialog_up: bool = False) -> None:
             """The item may be on the cursor and must not be carried into the
             next click: a click on its own slot puts it back. Not clicked when
             the cursor is seen empty, since that click would pick it up —
             unless a drop dialog is up: the item waits in it, not on the
             cursor, and the click cancels it."""
+            if not dialog_up and not state["bitten"] and button_dialog_open():
+                dialog_up = True
+                why = "a dialog was open that the expected step did not match"
+                diag.log("DECISION", f"drop {fish_name}: a dialog is open at a button point; cancelling it",
+                         tag=self.diag_tag)
             held = True if dialog_up else item_held(True, wait=0.15)
             if held is False and self._held_probe_proven:
                 back = True
@@ -3084,10 +3100,32 @@ class FishingBot:
         #    it may still carry covers neither button area while they are read.
         click_at(ground_screen, settle=False)
         self.human.move_to(*slot_screen)
-        first_pt, first_base = (drop_pt, base_drop) if drop_pt else (confirm_pt, base_confirm)
-        seen = dialog_watch.wait(grab, first_pt, first_base, timeout, keep_going,
-                                 minimum=self._t_drop_settle, what="drop dialog", tag=self.diag_tag,
-                                 owner=self.bot_id)
+        # Every item, every time: the ground click may open Drop / Sell, or
+        # yes / no straight away (dyes, diag 20261121_200639). Which one this
+        # item used last time is only the order they are listed in; both
+        # points are watched for the whole timeout. accept_strong on Confirm:
+        # a yes / no that does not match the look learned from another item
+        # is still the dialog when the change is dialog-sized.
+        remembered_direct = bool(drop_pt) and fish_name in self._direct_yes_no_items
+        confirm_choice = ("confirm", confirm_pt, base_confirm, "confirm dialog", True)
+        drop_choice = ("drop", drop_pt, base_drop, "drop dialog", False)
+        choices = [confirm_choice, drop_choice] if remembered_direct else [drop_choice, confirm_choice]
+        if not drop_pt:
+            choices = [confirm_choice]
+        which = dialog_watch.wait_first(grab, choices, timeout, keep_going, minimum=self._t_drop_settle,
+                                        tag=self.diag_tag, owner=self.bot_id)
+        direct = which == "confirm" and bool(drop_pt)
+        if which == "confirm" and drop_pt and not remembered_direct:
+            diag.log("DECISION", f"drop {fish_name}: no Drop / Sell step, the game asked yes / no at once",
+                     tag=self.diag_tag)
+        elif which == "drop" and remembered_direct:
+            diag.log("DECISION", f"drop {fish_name}: Drop / Sell showed, after this item had asked yes / no",
+                     tag=self.diag_tag)
+        if direct:
+            self._direct_yes_no_items.add(fish_name)
+        elif which == "drop":
+            self._direct_yes_no_items.discard(fish_name)
+        seen = which is not None
         if seen and self._in_cast_window and self._minigame_showing():
             state["bitten"] = True       # the change was the panel opening, not (only) the dialog
             seen = False
@@ -3103,8 +3141,8 @@ class FishingBot:
                      if running else "bot stopped")
             if running:
                 self._drop_failed(
-                    "nothing changed at the Drop / Sell point after a fish was dropped on the ground. Check "
-                    "Drop / Sell, or clear it if your client asks only yes / no." if drop_pt else
+                    "nothing changed at the Drop / Sell or the Confirm point after a fish was dropped on the "
+                    "ground. Check both." if drop_pt else
                     "nothing changed at the Confirm point after a fish was dropped on the ground. Check "
                     "Confirm, and set Drop / Sell if your client asks drop or sell first.")
             return
@@ -3112,13 +3150,15 @@ class FishingBot:
         if held:
             self._held_probe_proven = True
 
-        # 3. Drop button, then the confirm dialog
-        if drop_pt:
+        # 3. Drop button, then the confirm dialog. Skipped when the ground
+        #    click already opened yes / no.
+        finished_at_drop = False
+        if drop_pt and not direct:
             click_at((win_left + drop_pt[0], win_top + drop_pt[1]), settle=False)
             self.human.move_to(*slot_screen)
             seen = dialog_watch.wait(grab, confirm_pt, base_confirm, timeout, keep_going,
                                      minimum=self._t_drop_settle, what="confirm dialog", tag=self.diag_tag,
-                                     owner=self.bot_id)
+                                     owner=self.bot_id, accept_strong=True)
             if seen and self._in_cast_window and self._minigame_showing():
                 state["bitten"] = True
                 seen = False
@@ -3126,12 +3166,23 @@ class FishingBot:
                 if state["bitten"]:
                     put_back("the minigame opened", dialog_up=True)
                     return
-                running = self.running
-                put_back("no confirm dialog after the drop button" if running else "bot stopped", dialog_up=True)
-                if running:
-                    self._drop_failed("nothing changed at the Confirm point after the Drop / Sell click. "
-                                      "Check Drop / Sell and Confirm.")
-                return
+                # The Drop click can be the whole dialog: the slot is empty
+                # and neither button still shows one. A dialog that is still
+                # there is cancelled, for this item as for any other.
+                still = dialog_watch.still_up(grab, confirm_pt, base_confirm, what="confirm dialog",
+                                              owner=self.bot_id) or dialog_watch.still_up(
+                    grab, drop_pt, base_drop, what="drop dialog", owner=self.bot_id)
+                if not slot_has_item() and not still and self.running:
+                    diag.log("DECISION", f"drop {fish_name}: the Drop / Sell click finished it, no yes / no followed",
+                             tag=self.diag_tag)
+                    finished_at_drop = True
+                else:
+                    running = self.running
+                    put_back("no confirm dialog after the drop button" if running else "bot stopped", dialog_up=True)
+                    if running:
+                        self._drop_failed("nothing changed at the Confirm point after the Drop / Sell click. "
+                                          "Check Drop / Sell and Confirm.")
+                    return
 
         # 4. Confirm, then check the dialog went away and the slot stayed
         #    empty. A Confirm click the game missed leaves the dialog up with
@@ -3142,27 +3193,31 @@ class FishingBot:
         #    waiting up to 2 s per Confirm (3.3 s once, diag 20261121_110550).
         #    The lock is taken back, and the window brought to the front
         #    again, before any further click.
-        confirm_what = "confirm dialog" if drop_pt else "drop dialog"
-        for attempt in range(1 + self._CONFIRM_RETRIES):
-            if attempt:
-                refocus()
-            click_at((win_left + confirm_pt[0], win_top + confirm_pt[1]), settle=False)
-            self.human.move_to(*ground_screen)
-            time.sleep(0.03)
-            with self._input_lock_released("drop: the game answers the Confirm click"):
-                gone = dialog_watch.wait(grab, confirm_pt, base_confirm, timeout, lambda: self.running,
-                                         want_change=False, minimum=self._t_drop_settle, what="confirm dialog",
-                                         tag=self.diag_tag, owner=self.bot_id)
-                empty = not slot_has_item(wait=self._DROP_EMPTY_WAIT, move=False)
-                again = not empty and not (
-                    gone or attempt >= self._CONFIRM_RETRIES or not self.running
-                    or not dialog_watch.still_up(grab, confirm_pt, base_confirm, what=confirm_what,
-                                                 owner=self.bot_id))
-            if not again:
-                break
-            diag.log("DECISION", f"drop {fish_name}: item still in its slot and the dialog still up after the "
-                                 f"Confirm click -> Confirm once more", tag=self.diag_tag)
-        if slot_has_item() and self.running and dialog_watch.still_up(
+        # The yes button is always "confirm dialog", including clients with
+        # no Drop / Sell point: one learned look for that button.
+        confirm_what = "confirm dialog"
+        gone = True
+        if not finished_at_drop:
+            for attempt in range(1 + self._CONFIRM_RETRIES):
+                if attempt:
+                    refocus()
+                click_at((win_left + confirm_pt[0], win_top + confirm_pt[1]), settle=False)
+                self.human.move_to(*ground_screen)
+                time.sleep(0.03)
+                with self._input_lock_released("drop: the game answers the Confirm click"):
+                    gone = dialog_watch.wait(grab, confirm_pt, base_confirm, timeout, lambda: self.running,
+                                             want_change=False, minimum=self._t_drop_settle, what=confirm_what,
+                                             tag=self.diag_tag, owner=self.bot_id)
+                    empty = not slot_has_item(wait=self._DROP_EMPTY_WAIT, move=False)
+                    again = not empty and not (
+                        gone or attempt >= self._CONFIRM_RETRIES or not self.running
+                        or not dialog_watch.still_up(grab, confirm_pt, base_confirm, what=confirm_what,
+                                                     owner=self.bot_id))
+                if not again:
+                    break
+                diag.log("DECISION", f"drop {fish_name}: item still in its slot and the dialog still up after the "
+                                     f"Confirm click -> Confirm once more", tag=self.diag_tag)
+        if not finished_at_drop and slot_has_item() and self.running and dialog_watch.still_up(
                 grab, confirm_pt, base_confirm, what=confirm_what, owner=self.bot_id):
             # Still asking: the item waits in the dialog. Cancelled with a
             # click on its slot, not left open for the next click to answer.
@@ -3178,18 +3233,25 @@ class FishingBot:
                                     self._diag_inv_rect)
             self._mark_occupied(inv_x, inv_y)
             self._drop_failed("the fish was still in its slot after the Confirm click. Check Confirm.")
-        elif not gone and base_confirm is not None:
+        elif not finished_at_drop and not gone and base_confirm is not None and dialog_watch.still_up(
+                grab, confirm_pt, base_confirm, what=confirm_what, owner=self.bot_id):
+            # The slot is empty and the dialog is still the dialog. Close it
+            # so the next cast can run; an empty slot whose patch merely
+            # moved (15-19, diag 20261121_200639) is a success.
+            refocus()
             self._log(f"The drop dialog for {fish_name} is still open after the confirm — check the "
                       f"Confirm coordinate")
             diag.log("DECISION", "confirm dialog still up after the confirm click", tag=self.diag_tag)
+            put_back("the dialog was still open after the Confirm click", dialog_up=True)
             self._drop_failed("the dialog was still open after the Confirm click. Check Confirm.")
         else:
             self._drop_failures = 0
             # The whole drop happened: what was seen at the button points
             # really was the dialog. Later drops then need that look, not
             # just any change (moving scenery changes the patch too).
-            dialog_watch.confirm(confirm_pt, "confirm dialog" if drop_pt else "drop dialog", owner=self.bot_id)
-            if drop_pt:
+            if not finished_at_drop:
+                dialog_watch.confirm(confirm_pt, confirm_what, owner=self.bot_id)
+            if drop_pt and not direct:
                 dialog_watch.confirm(drop_pt, "drop dialog", owner=self.bot_id)
 
     def _update_region_cache(self):

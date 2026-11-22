@@ -7,8 +7,9 @@ from __future__ import annotations
 import os
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, replace as dc_replace
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 import cv2
 import numpy as np
@@ -53,16 +54,31 @@ def _shared_on_press(key) -> None:
             return
         _last_f5 = now
         subscribers = list(_listener_subscribers)
-    # One decision for all windows: if any is paused, F5 resumes everything,
-    # otherwise it pauses everything. Toggling each bot on its own left the
-    # windows out of step as soon as one of them had paused itself.
-    target = not any(bot.paused for bot in subscribers)
+    target = pause_target([bot.paused for bot in subscribers])
     for bot in subscribers:
         try:
             bot._on_f5_pressed(target)
         except Exception:
             diag.exc()
             pass
+
+
+def pause_target(paused_states: Iterable[bool]) -> bool:
+    """One F5 / PAUSE decision for all windows: True (pause everything) while
+    any window is still running, False (resume everything) only when all are
+    paused. The old rule, "resume when any window is paused", turned F5 into
+    a resume as soon as one window had paused itself (puzzle not found):
+    the others went on clicking however often F5 was pressed (diag
+    20261122_091635)."""
+    states = list(paused_states)
+    return not states or not all(states)
+
+
+class InputInterrupted(BaseException):
+    """Raised by the input gate (Humanizer.gate) when the bot was paused or
+    stopped in the middle of a round: the move or click is not sent, and
+    the round ends there. A BaseException, so the ``except Exception``
+    guards around single steps do not swallow it."""
 
 
 def _register_pause_subscriber(bot: "JigsawBot") -> None:
@@ -126,7 +142,49 @@ class LayoutProblem:
     help_topic: str      # help_visuals topic that shows it
 
 
-def layout_problem(config: dict, win_w: Optional[int] = None, win_h: Optional[int] = None) -> Optional[LayoutProblem]:
+# dialog_watch.PATCH half width, plus a margin: the watched Confirm area
+CONFIRM_PATCH_HALF_W = 20 + 6
+
+
+def piece_watch_point(confirm: Tuple[int, int], grid_w: Optional[float],
+                      win_w: Optional[int]) -> Optional[Tuple[int, int]]:
+    """Where a held piece leaves the watched Confirm area uncovered: far
+    enough beside Confirm for the widest piece (3 cells) drawn at the cursor.
+    Right of Confirm, else left of it; None when neither fits in the window."""
+    cx, cy = int(confirm[0]), int(confirm[1])
+    try:
+        cell = float(grid_w) / 6.0
+    except (TypeError, ValueError):
+        cell = JigsawDetector.DEFAULT_GRID_SIZE[0] / 6.0
+    half_piece = int(round(1.5 * cell))
+    offset = CONFIRM_PATCH_HALF_W + half_piece + 1
+    if win_w is None or cx + offset + half_piece < win_w:
+        return (cx + offset, cy)
+    if cx - offset - half_piece >= 0:
+        return (cx - offset, cy)
+    return None
+
+
+def rest_point(config: dict, grid_w: Optional[float], win_w: Optional[int]) -> Optional[Tuple[int, int]]:
+    """Where the cursor rests between clicks, holding a piece or not. The
+    discard dialog is watched with the piece there (piece_watch_point), so a
+    discard right-clicks where the cursor already is: resting 24 px right of
+    Confirm instead, every discard went to the watch point, back for the
+    right-click and over again (diag 20261122_093507)."""
+    confirm = config.get("confirm_button_pos")
+    try:
+        cx, cy = int(confirm[0]), int(confirm[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    point = piece_watch_point((cx, cy), grid_w, win_w)
+    if point is not None:
+        return point
+    return (cx + int(config.get("jigsaw_post_crate_cursor_right_px", 24)), cy)
+
+
+def layout_problem(config: dict, win_w: Optional[int] = None, win_h: Optional[int] = None,
+                   grid_bounds=None, crate_slots: Optional[Dict[str, Tuple[int, int]]] = None
+                   ) -> Optional[LayoutProblem]:
     """Checks the jigsaw layout before a start: the Confirm point and the
     point the cursor rests at (beside it, holding a piece) must lie clear of
     the puzzle grid, the crate slots and the inventory. The bot clicks the
@@ -136,17 +194,21 @@ def layout_problem(config: dict, win_w: Optional[int] = None, win_h: Optional[in
     The usual cause is the puzzle window itself: the game opens its confirm
     dialog ("open the crate?") in the middle of the screen, so a puzzle
     window placed under it has the dialog's buttons over its grid.
+    ``grid_bounds`` / ``crate_slots``: where the puzzle window was found in
+    this game window (default: the grid defined by hand, slots placed
+    relative to it).
     Returns None when the layout is fine or cannot be checked."""
     confirm = config.get("confirm_button_pos")
-    bounds = config.get("jigsaw_grid_bounds")
+    bounds = grid_bounds if grid_bounds is not None else config.get("jigsaw_grid_bounds")
     try:
         cx, cy = int(confirm[0]), int(confirm[1])
         gx, gy, gw, gh = [int(round(float(v))) for v in bounds]
     except (TypeError, ValueError, IndexError):
         return None
-    shift_px = int(config.get("jigsaw_post_crate_cursor_right_px", 24))
+    park = rest_point(config, gw, win_w) or (cx, cy)
     detector = JigsawDetector(config)
-    slots = detector._crate_slot_centers(JigsawGridResult(True, (gx, gy, gw, gh), [], 0, 1.0))
+    slots = detector._crate_slot_centers(JigsawGridResult(True, (gx, gy, gw, gh), [], 0, 1.0,
+                                                          crate_slots=crate_slots))
     strip = None
     if win_w and win_h:
         try:
@@ -160,9 +222,9 @@ def layout_problem(config: dict, win_w: Optional[int] = None, win_h: Optional[in
             diag.exc("layout check: inventory strip")
     pad = 6
     fix_window = ("Move the puzzle window away from the middle of the game screen (for example to the "
-                  "top left), so the game's confirm dialog no longer covers it. Then press Define Grid and "
-                  "Set Confirm again.")
-    for what, (x, y) in (("confirm", (cx, cy)), ("park", (cx + shift_px, cy))):
+                  "top left), so the game's confirm dialog no longer covers it. Then press Set Confirm "
+                  "again (and Define Grid, if you defined the grid by hand).")
+    for what, (x, y) in (("confirm", (cx, cy)), ("park", park)):
         lies_on = None
         if gx - pad <= x < gx + gw + pad and gy - pad <= y < gy + gh + pad:
             lies_on = "puzzle grid"
@@ -182,9 +244,9 @@ def layout_problem(config: dict, win_w: Optional[int] = None, win_h: Optional[in
                     f"confirms a dialog; there it would click the {lies_on} instead whenever the dialog is "
                     f"slow to appear.")
         else:
-            head = (f"While it holds a piece, the bot rests the cursor {shift_px} px right of the Confirm "
-                    f"point, at ({x}, {y}) — that is on the {lies_on}, where the held piece could be "
-                    f"dropped by accident.")
+            head = (f"While it holds a piece, the bot rests the cursor beside the Confirm point, at "
+                    f"({x}, {y}) — that is on the {lies_on}, where the held piece could be dropped by "
+                    f"accident.")
         if lies_on == "inventory":
             fix = ("Move the puzzle window so the game's confirm dialog does not open over the inventory "
                    "(or move the inventory), then press Set Confirm again.")
@@ -256,6 +318,7 @@ class JigsawBot:
         # Crate kinds that were searched for in every inventory page and not
         # found: not searched again in this run.
         self._exhausted_sections: Set[str] = set()
+        self._layout_checked_for: Optional[Tuple[int, int, int, int]] = None   # grid the layout was checked for
         self._check_hand: Optional[Tuple[int, int]] = None  # look for a held piece here before the next crate
         self._crate_confirm_baseline: Optional[np.ndarray] = None  # confirm area before the last crate click
         self._confirm_clear: Optional[np.ndarray] = None   # confirm area last seen with no dialog up
@@ -267,13 +330,38 @@ class JigsawBot:
         self._suspect_mask = 0          # cells a refused placement aimed at: treated as filled
         self._suspect_board = 0         # the board read when they became suspect
         self._last_click_sent = False   # the last _click_window_point really clicked
-        self._result_baseline = None    # result-button area with no dialog up (taken before a crate)
+        self._result_baseline = None    # {OK point: its area with no dialog up} (taken before a crate)
         self._last_placement_matched = False   # the last placement showed up exactly as predicted
         self.boards_completed = 0
         self._switched = False          # the last _focus() was a real window switch
         self._capture_bad_since: Optional[float] = None   # first unusable full-window frame in a row
         self.stop_reason: Optional[str] = None
         self._last_focus_log = 0.0
+        # How a click is sent (see _press): the fishing bot's UI click (cursor
+        # settles 100 ms, button held 50 ms), which works on the same clients.
+        # The game reads the mouse once per frame: a press and release in the
+        # same millisecond, 12 ms after the cursor jumped onto a button, was
+        # lost on a real client (diag 20261122_002413).
+        self._glide = max(0.0, float(config.get("jigsaw_cursor_glide", 0.0)))
+        self._hover_settle = max(0.0, float(config.get("jigsaw_click_hover", 0.10)))
+        self._click_hold = max(0.0, float(config.get("jigsaw_click_hold", 0.05)))
+        self._release_settle = max(0.0, float(config.get("jigsaw_click_release", 0.02)))
+        # Does this server ask "Place the piece here?" after a click on the
+        # board? Learned once (see _place_click) and saved; None until known.
+        self.on_setting_learned = None   # callback(key, value): the GUI saves it in the settings
+        saved = self._setting("jigsaw_place_dialog")
+        self._place_dialog: Optional[bool] = saved if isinstance(saved, bool) else None
+        self._place_baseline: Optional[np.ndarray] = None   # Confirm area right before the last placement click
+        self._last_place_confirmed = False   # the last placement was answered on its dialog
+        self._result_before: Optional[np.ndarray] = None   # gray window before the last piece of a board
+        self._learned_result_point: Optional[Tuple[int, int]] = None   # where the result OK was found last
+        self._stale_dialog_rounds = 0   # rounds in a row that found a dialog still open before a crate
+        # The last crate click brought up its dialog (and Yes went out): True;
+        # it did not: False; nothing could be clicked (window not in front): None.
+        self._crate_dialog_seen: Optional[bool] = True
+        self._no_dialog_rounds = 0      # rounds in a row whose crate never brought up a dialog
+        # This bot holds input_lock for its whole round (see _begin_round_hold).
+        self._round_held = False
         # Debug snapshots/events are expensive (frame copies, lock); skip when no UI is attached.
         self._debug_consumer = False
 
@@ -289,6 +377,7 @@ class JigsawBot:
         )
         self.human.diag_tag = self.diag_tag
         self.human.window_rect = getattr(window_manager, "get_window_rect", None)
+        self.human.gate = self._input_gate
 
     def start(self) -> None:
         diag.set_thread_tag(self.diag_tag)
@@ -309,7 +398,7 @@ class JigsawBot:
                 if DEBUG_PRINTS or diag.ENABLED:
                     self._dbg(f"[JigsawBot W{self.bot_id + 1}] start() aborted: confirm_button_pos not configured")
                 return
-            if not self.config.get("jigsaw_grid_bounds"):
+            if not self.config.get("jigsaw_grid_bounds") and not self.detector.auto_grid():
                 self._status("Jigsaw bot requires Define Grid setup before starting")
                 if DEBUG_PRINTS or diag.ENABLED:
                     self._dbg(f"[JigsawBot W{self.bot_id + 1}] start() aborted: jigsaw_grid_bounds not configured")
@@ -324,6 +413,12 @@ class JigsawBot:
             self._activate_window_for_jigsaw("Activate jigsaw window before solver loop")
             if not self._refuse_overlapping_windows():
                 return
+            if self.detector.auto_grid():
+                # Where the puzzle window is in this game window, for the
+                # layout check (not found yet: checked when it is found).
+                frame = self.capture_full_window()
+                if frame is not None:
+                    self.detector.detect_grid(frame)
             problem = self._point_layout_problem()
             if problem:
                 self.stop_reason = "bad_layout"
@@ -393,7 +488,64 @@ class JigsawBot:
         """Toggle whether debug snapshots/events are recorded. Default: off."""
         self._debug_consumer = bool(attached)
 
+    def _input_gate(self) -> None:
+        """Before every cursor move and click: nothing more is sent once the
+        bot is paused or stopped. Pausing used to be looked at only when a
+        round began, so the round in progress went on clicking (a crate's
+        Yes, a discard and its confirm) for up to a second after F5."""
+        if not self.running or self.paused:
+            raise InputInterrupted("stopped" if not self.running else "paused")
+
+    @contextmanager
+    def _hold(self):
+        """input_lock for one input sequence, unless this bot already holds
+        it for its whole round (the lock is not re-entrant)."""
+        if input_lock.held_by_me():
+            yield
+            return
+        with input_lock:
+            yield
+
+    def _begin_round_hold(self) -> None:
+        """Takes the shared mouse for the whole round: crate, Yes, the look at
+        the piece, its placement or discard and that Yes. Handed over after
+        every step instead, the two bots of diag 20261122_093507 swapped the
+        cursor about 10 times and the focus 5 times per crate (4-5 and 1 are
+        needed): a window stops drawing its held piece while the other one
+        has the cursor, so every look at it first took the focus and the
+        cursor back. The game answers within ~30 ms, so a round is the bot's
+        own click timing (~1 s) and taking turns per crate costs no speed.
+        Nothing to hold in a dry run (no input at all)."""
+        if self.dry_run or self._round_held or input_lock.held_by_me():
+            return
+        input_lock.acquire()
+        self._round_held = True
+
+    def _end_round_hold(self) -> None:
+        """Lets the other windows have the mouse (end of a round, or before a
+        wait that sends nothing, like the result dialog's)."""
+        if self._round_held:
+            self._round_held = False
+            # A round holds the mouse ~1 s by design; only an unusual one is logged.
+            input_lock.release(long_hold=float(self.config.get("jigsaw_round_hold_log", 3.0)))
+
     def _run_loop(self) -> None:
+        """Plays rounds until stopped. A pause or stop in the middle of a
+        round ends that round at its next move or click (_input_gate); after
+        a resume the next round first looks whether a piece is still on the
+        cursor (and plays or discards it) before opening another crate."""
+        while self.running:
+            try:
+                self._play_rounds()
+                return
+            except InputInterrupted as why:
+                diag.log("DECISION", f"round interrupted ({why}): no more input sent", tag=self.diag_tag)
+                if self.running and self._check_hand is None:
+                    self._check_hand = self._parked_point()
+            finally:
+                self._end_round_hold()
+
+    def _play_rounds(self) -> None:
         # Optimized timings for performance
         action_delay = float(self.config.get("jigsaw_action_delay", 0.08))  # Reduced from 0.15
         retry_delay = float(self.config.get("jigsaw_piece_detection_retry_delay", 0.20))  # Reduced from 0.2
@@ -402,6 +554,8 @@ class JigsawBot:
         if DEBUG_PRINTS or diag.ENABLED:
             self._dbg(f"[JigsawBot W{self.bot_id + 1}] _run_loop() started; action_delay={action_delay}s retry_delay={retry_delay}s")
         while self.running:
+            # A round that ended early (continue) hands the mouse over here.
+            self._end_round_hold()
             if self.paused:
                 time.sleep(0.1)
                 continue
@@ -453,7 +607,10 @@ class JigsawBot:
                 failure_count += 1
                 if DEBUG_PRINTS or diag.ENABLED:
                     self._dbg(f"[JigsawBot W{self.bot_id + 1}] grid not found; failure_count={failure_count}")
-                if grid.grid_bounds is None:
+                if grid.grid_bounds is None and self.detector.auto_grid():
+                    if failure_count == 1:
+                        self._status("Fish Puzzle window not found in this game window — looking again")
+                elif grid.grid_bounds is None:
                     self._status("Fishing Jigsaw grid is not configured or is outside the window")
                 elif failure_count == 1:
                     self._status(f"Puzzle window not found at the configured grid "
@@ -461,19 +618,34 @@ class JigsawBot:
                 self._save_debug(frame, "grid_not_found")
                 if diag.ENABLED and failure_count in (1, 5, 20):
                     diag.image("jigsaw_grid_not_found", frame, tag=self.diag_tag,
-                               note=f"grid bounds {self.config.get('jigsaw_grid_bounds')}, failure {failure_count}, "
+                               note=f"puzzle {self.detector.puzzle}, defined grid "
+                                    f"{self.config.get('jigsaw_grid_bounds')}, failure {failure_count}, "
                                     f"score {grid.confidence:.2f}")
                 if failure_count >= int(self.config.get("jigsaw_grid_misses_before_pause", 4)):
                     # Not a passing tooltip: the puzzle is closed, moved or
                     # covered. Nothing is clicked until the player looks.
                     failure_count = 0
-                    self._pause("puzzle window not found at the configured grid — open the Fishing Jigsaw "
-                                "window where the grid was defined (or define the grid again)")
+                    if self.detector.auto_grid():
+                        self._pause("puzzle window not found in this game window — open the Fish Puzzle window "
+                                    "(anywhere but the middle of the screen, where the game's dialogs "
+                                    "open) and make sure nothing covers it, then resume")
+                    else:
+                        self._pause("puzzle window not found at the configured grid — open the Fishing "
+                                    "Jigsaw window where the grid was defined (or define the grid again)")
                     continue
                 time.sleep(min(1.5, 0.25 + failure_count * 0.1))
                 continue
 
             failure_count = 0
+            if grid.grid_bounds != self._layout_checked_for:
+                # The puzzle window was found for the first time, or moved:
+                # the Confirm point and the parked cursor must still be
+                # clear of its grid and crate slots.
+                problem = self._point_layout_problem(grid)
+                if problem:
+                    self._pause(problem)
+                    continue
+                self._layout_checked_for = grid.grid_bounds
             if diag.ENABLED and diag.first_pending("jigsaw_board", self.diag_tag):
                 marked = frame.copy()
                 gx, gy, gw, gh = grid.grid_bounds
@@ -488,6 +660,9 @@ class JigsawBot:
             slots = None
             crate_opened = False   # this round opened a crate (not a piece still held from the last one)
 
+            # From here to the end of the placement or discard, the mouse
+            # stays with this window.
+            self._begin_round_hold()
             if self._check_hand is not None:
                 # The last round ended without knowing whether a piece is still
                 # on the cursor (a dialog may have been confirmed late). Opening
@@ -573,8 +748,8 @@ class JigsawBot:
                 # A full board is handled right after the last placement. Read
                 # as full here, any piece would be discarded: the result was
                 # missed, or the cells read wrong. A crate is not spent on that.
-                self._pause("the board reads as completely full — finish or close the result dialog, "
-                            "or re-align the grid with Define Grid")
+                self._pause("the board reads as completely full — finish or close the result dialog"
+                            + ("" if grid.source == "auto" else ", or re-align the grid with Define Grid"))
                 continue
 
             if piece is None:
@@ -597,12 +772,58 @@ class JigsawBot:
                     crate_center=crate.center,
                 )
 
+                if self._stale_dialog_up():
+                    # Left open by a confirm the game did not take. It asks
+                    # for what the bot wanted anyway (open a crate, discard
+                    # the piece in hand), so it is confirmed; the next round
+                    # looks at the hand first. Twice in a row means it does
+                    # not go away (or the area changed for good): the player
+                    # has to look rather than the bot clicking there forever.
+                    self._stale_dialog_rounds += 1
+                    if self._stale_dialog_rounds > 2:
+                        self._stale_dialog_rounds = 0
+                        self._pause("a dialog stays open over the Confirm button (or something covers "
+                                    "it) — close it by hand, check the Confirm coordinate, then resume")
+                        continue
+                    diag.log("DECISION", "a dialog is still open before the crate click: confirming it first",
+                             tag=self.diag_tag)
+                    self._status("A dialog from the last round is still open; confirming it first")
+                    self._click_window_point(self.confirm_button_pos, "Confirm the dialog left open",
+                                             park_at=self._parked_point())
+                    self._check_hand = self._parked_point()
+                    self._end_round_hold()
+                    time.sleep(retry_delay)
+                    continue
+                self._stale_dialog_rounds = 0
+
                 self._hand_rounds = 0
                 # What the result button's place looks like with no dialog up
                 # and the cursor parked as it will be after the last placement.
                 if not self.dry_run:
-                    self._result_baseline = dialog_watch.read_patch(self._dialog_grab, self._result_point())
+                    self._result_baseline = {point: dialog_watch.read_patch(self._dialog_grab, point)
+                                             for point in self._result_points()} or None
                 cursor_rel = self._open_crate_and_confirm(crate.center, crate.section)
+                if not self.running:
+                    return
+                if self._crate_dialog_seen is not True:
+                    # The crate never asked "Open this box?" (its clicks were
+                    # lost), so no Yes went out and no piece can be on the
+                    # cursor: nothing to look at and nothing to discard. A
+                    # "discard" of the world's colors there cost 3 s of right
+                    # clicks and waiting (diag 20261122_093507). A dialog that
+                    # comes after all is confirmed by the next round's check.
+                    if self._crate_dialog_seen is False:
+                        self._no_dialog_rounds += 1
+                    limit = int(self.config.get("jigsaw_max_unopened_crates", 3))
+                    if limit > 0 and self._no_dialog_rounds >= limit:
+                        self._no_dialog_rounds = 0
+                        self._pause("the crate did not open (no \"Open this box?\" came) several times in a "
+                                    "row — check that nothing covers the puzzle window and the Confirm "
+                                    "coordinate, then resume")
+                    self._end_round_hold()
+                    time.sleep(action_delay)
+                    continue
+                self._no_dialog_rounds = 0
                 crate_opened = True
                 piece = self._look_for_piece(cursor_rel, max_detection_retries, retry_delay)
                 if not self.running:
@@ -651,6 +872,7 @@ class JigsawBot:
                     self._unknown_streak = 0
                     self._pause("no piece could be recognized several times in a row — check that the "
                                 "puzzle window is open and not covered, and the Confirm coordinate")
+                self._end_round_hold()
                 time.sleep(action_delay)
                 continue
             self._unknown_streak = 0
@@ -711,6 +933,10 @@ class JigsawBot:
             )
             if DEBUG_PRINTS or diag.ENABLED:
                 self._dbg(f"[JigsawBot W{self.bot_id + 1}] completes_board={completes_board}; performing decision…")
+            if completes_board and not self.dry_run:
+                # The window as it looks before the result dialog is asked
+                # for: the dialog is found as what is new on top of this.
+                self._result_before = self._gray_window()
             self._perform_decision(decision, cursor_rel)
             placed_ok = False
             if decision.action == "place" and decision.target is not None and not self.dry_run:
@@ -741,6 +967,9 @@ class JigsawBot:
                     self._discard_streak = 0
                     self._pause(f"{limit} pieces in a row were discarded — check that the board is read "
                                 f"correctly (grid alignment, nothing covering the puzzle)")
+            # The round's input is done: the other windows get the mouse while
+            # this one waits for its result dialog (if any) and its next round.
+            self._end_round_hold()
             if crate_opened:
                 self.crates_completed += 1
                 if DEBUG_PRINTS or diag.ENABLED:
@@ -779,18 +1008,30 @@ class JigsawBot:
         time.sleep(0.25)
         return False
 
-    def _point_layout_problem(self) -> Optional[str]:
+    def _point_layout_problem(self, grid: Optional[JigsawGridResult] = None) -> Optional[str]:
         """The confirm point and the parked cursor point must lie clear of
-        the grid, the crate slots and the inventory (see layout_problem).
-        Returns what is wrong, or None."""
+        the grid, the crate slots and the inventory (see layout_problem), for
+        ``grid`` (default: where the puzzle window was found last, else the
+        grid defined by hand). Returns what is wrong, or None."""
         if self.dry_run:
             return None
+        bounds, slots = None, None
+        if grid is not None and grid.grid_found:
+            bounds, slots = grid.grid_bounds, grid.crate_slots
+        elif self.detector.puzzle is not None and self.detector.auto_grid():
+            bounds, slots = self.detector.puzzle.grid, self.detector.puzzle.slots
+        if bounds is not None:
+            self._layout_checked_for = tuple(bounds)
+        elif self.detector.auto_grid() and not self.config.get("jigsaw_grid_bounds"):
+            return None     # the puzzle window is not found yet: checked when it is
         try:
             _, _, win_w, win_h = self.window_manager.get_window_rect()
         except Exception:
             diag.exc("layout check: window size", tag=self.diag_tag)
             win_w = win_h = None
-        problem = layout_problem(self.config, win_w, win_h)
+        problem = layout_problem(self.config, win_w, win_h, grid_bounds=bounds, crate_slots=slots)
+        if problem:
+            self._layout_checked_for = None
         return problem.message if problem else None
 
     def _refuse_overlapping_windows(self) -> bool:
@@ -803,7 +1044,7 @@ class JigsawBot:
         peers = capture.overlapping_peers()
         if not peers:
             return True
-        with input_lock:
+        with self._hold():
             if self._focus():
                 while capture.needs_verification and not capture.window_trusted and self.running:
                     time.sleep(0.1)
@@ -863,6 +1104,14 @@ class JigsawBot:
             diag.exc(tag=self.diag_tag)
             return None
 
+    def _cursor_at(self, point: Tuple[int, int], tolerance: int = 2) -> bool:
+        """Is the shared cursor on this window's ``point`` (in front or not)?"""
+        current = self._cursor_position()
+        if current is None:
+            return False
+        left, top, _, _ = self.window_manager.get_window_rect()
+        return abs(current[0] - left - point[0]) <= tolerance and abs(current[1] - top - point[1]) <= tolerance
+
     def _restore_cursor(self, cursor_rel: Tuple[int, int]) -> None:
         """Puts the cursor back where this window's piece was parked.
 
@@ -912,7 +1161,7 @@ class JigsawBot:
         x1, y1 = cx - radius, cy - radius
         # Hold the lock across "cursor is in place" + capture so no other
         # window can pull the cursor (and the piece with it) out of the shot.
-        with input_lock:
+        with self._hold():
             if not self.dry_run:
                 self._restore_cursor(cursor_rel)
             frame = self.capture_window_region(x1, y1, radius * 2, radius * 2)
@@ -1203,13 +1452,12 @@ class JigsawBot:
             self._current_inv_page = page_idx
             return True
         sent = False
-        with input_lock:
+        with self._hold():
             if self._focus():
                 # Read after the focus: a minimized window was just restored.
                 win_left, win_top, _, _ = self.window_manager.get_window_rect()
-                self.human.move_to(win_left + page_pos[0], win_top + page_pos[1])
-                self.human.sleep(0.04)
-                self.human.click(hold=0.02)
+                self._glide_to(win_left + page_pos[0], win_top + page_pos[1])
+                self._press(switched=self._switched)
                 sent = True
         if not sent:
             diag.log("DECISION", f"inventory page {page_idx + 1} tab not clicked (no focus): page not searched",
@@ -1369,7 +1617,7 @@ class JigsawBot:
         park = self._parked_point()
         # Coalesce both clicks into a single lock hold so other bots aren't starved
         # by a back-to-back claim/release; activation happens once for both clicks.
-        with input_lock:
+        with self._hold():
             if not self._focus():
                 return False
             win_left, win_top, _, _ = self.window_manager.get_window_rect()   # after the focus
@@ -1377,15 +1625,12 @@ class JigsawBot:
             inv_y = win_top + strip_y + inventory_pos[1]
             slot_x = win_left + slot_pos[0]
             slot_y = win_top + slot_pos[1]
-            self.human.move_to(inv_x, inv_y)
-            if cursor_settle > 0:
-                self.human.sleep(cursor_settle)
-            self.human.click()
+            switched = self._switched
+            self._glide_to(inv_x, inv_y)
+            self._press(switched=switched)
             self.human.sleep(action_delay * 0.8)
-            self.human.move_to(slot_x, slot_y)
-            if cursor_settle > 0:
-                self.human.sleep(cursor_settle)
-            self.human.click()
+            self._glide_to(slot_x, slot_y)
+            self._press()
             if park is not None:
                 # Off the slot: a crate still hanging on the cursor there
                 # would look exactly like one that sits in the slot.
@@ -1540,11 +1785,56 @@ class JigsawBot:
         if decision.action == "place" and decision.target is not None:
             if DEBUG_PRINTS or diag.ENABLED:
                 self._dbg(f"[JigsawBot W{self.bot_id + 1}] placing piece at {decision.target}")
-            self._click_window_point(decision.target, f"Place jigsaw piece ({decision.reason})",
-                                     park_at=cursor_rel)
+            self._place_click(decision.target, f"Place jigsaw piece ({decision.reason})", cursor_rel)
             return
 
         self._discard_piece(cursor_rel, decision.reason)
+
+    def _place_click(self, target: Tuple[int, int], description: str,
+                     cursor_rel: Optional[Tuple[int, int]]) -> bool:
+        """Clicks the board to place the held piece, and answers the "Place
+        the piece here?" dialog some servers ask before they place it (diag
+        20261122_005427: every placement waited on that dialog, the bot took
+        the missing piece for a lost click and clicked the board again behind
+        the dialog). The Confirm area is read with the cursor on the board, so
+        the held piece does not cover it. Returns whether the click went out."""
+        self._last_place_confirmed = False
+        self._place_baseline = None
+        if self.dry_run or self.confirm_button_pos is None or self._place_dialog is False:
+            return self._click_window_point(target, description, park_at=cursor_rel)
+
+        def read_baseline():
+            self._place_baseline = self._confirm_area()
+
+        if not self._click_window_point(target, description, on_target=read_baseline):
+            if cursor_rel is not None:
+                self._park_cursor(cursor_rel)
+            return False
+        baseline = self._place_baseline
+        timeout = float(self.config.get("jigsaw_dialog_wait_timeout", 0.6))
+        if baseline is not None and self._dialog_up_within(baseline, timeout, "place dialog"):
+            self._confirm_clear = baseline
+            self._place_dialog = True
+            self._learn_setting("jigsaw_place_dialog", True)
+            self._last_place_confirmed = self._click_window_point(
+                self.confirm_button_pos, "Confirm placement", park_at=cursor_rel)
+            return True
+        if cursor_rel is not None and self.running:
+            self._park_cursor(cursor_rel)
+        return True
+
+    def _place_dialog_still_up(self) -> bool:
+        """Is the "Place the piece here?" of the last placement click open?"""
+        if self.dry_run or self.confirm_button_pos is None or self._place_baseline is None \
+                or self._place_dialog is False:
+            return False
+        # A piece still held (the click was lost) is drawn over the parked
+        # point, right on the watched Confirm area: it would look like a dialog.
+        watch = self._discard_watch_point()
+        if watch is not None:
+            self._move_held_piece(watch)
+        return dialog_watch.still_up(self._dialog_grab, self.confirm_button_pos, self._place_baseline,
+                                     what="place dialog")
 
     def _discard_piece(self, cursor_rel: Optional[Tuple[int, int]], reason: str,
                        verify: bool = True) -> None:
@@ -1561,10 +1851,15 @@ class JigsawBot:
         # the baseline included.
         watch = self._discard_watch_point()
         if watch is not None:
-            self._move_held_piece(watch)
+            self._move_held_piece(watch)    # nothing to do when it rests there already
         baseline = self._confirm_area()
-        self._right_click_current_position("Discard jigsaw piece", cursor_rel, then_move_to=watch)
-        dialog_up = self._wait_for_dialog(baseline, float(self.config.get("jigsaw_action_delay", 0.08)) * 0.6)
+        # Right-clicked where the piece now is: anywhere off the board asks
+        # "Discard this piece?", and the watched area stays clear of it.
+        at = watch if watch is not None else cursor_rel
+        self._right_click_current_position("Discard jigsaw piece", at)
+        dialog_up = self._wait_for_dialog(
+            baseline, float(self.config.get("jigsaw_action_delay", 0.08)) * 0.6,
+            click_again=lambda: self._right_click_current_position("Discard jigsaw piece (again)", at))
         if not self.running:
             return   # stopped while waiting: leave the dialog alone
         if not dialog_up and not self.dry_run and self.confirm_button_pos is not None:
@@ -1581,17 +1876,42 @@ class JigsawBot:
             self._check_hand = cursor_rel
             return
         self._click_window_point(self.confirm_button_pos, "Confirm discard",
-                                 park_at=cursor_rel if verify else None)
+                                 park_at=(cursor_rel if verify else None) or self._parked_point())
         if not verify or cursor_rel is None or self.dry_run or not self.running:
             return
-        # A piece that was recognized must be gone now. If it is still on the
-        # cursor the dialog came up after the confirm click: confirm again,
-        # and have the next round look at the hand before it opens a crate.
-        time.sleep(float(self.config.get("jigsaw_piece_detection_retry_delay", 0.20)) * 0.5)
-        if self._detect_cursor_piece(cursor_rel).piece_id is None:
-            return
-        self._status("The piece is still on the cursor after the discard; confirming again")
-        self._click_window_point(self.confirm_button_pos, "Confirm discard again", park_at=cursor_rel)
+        # A piece that was recognized must be gone now. The game takes it off
+        # the cursor only when the server answers, which on a real client
+        # was more than 150 ms after the Yes: the piece was still drawn
+        # 100 ms after it, and a "confirm again" sent then went out with no
+        # dialog up. A left click beside the board with a piece held asks
+        # "Discard this piece?" again, and that new dialog then blocked every
+        # crate click for 10 s (diag 20261122_002413). So the piece gets time
+        # to go, and a second confirm goes out only on a dialog that is
+        # really still open.
+        timeout = float(self.config.get("jigsaw_discard_gone_timeout", 1.0))
+        poll = max(0.02, float(self.config.get("jigsaw_piece_detection_retry_delay", 0.20)) * 0.5)
+        deadline = time.perf_counter() + timeout
+        while True:
+            time.sleep(poll)
+            if not self.running:
+                return
+            if self._detect_cursor_piece(cursor_rel).piece_id is None:
+                return
+            if time.perf_counter() >= deadline:
+                break
+        # Still held. The watched Confirm area must be clear of the piece to
+        # tell whether the dialog is there.
+        if watch is not None:
+            self._move_held_piece(watch)
+        if baseline is not None and dialog_watch.still_up(self._dialog_grab, self.confirm_button_pos, baseline):
+            self._status("The discard dialog is still open; confirming again")
+            self._click_window_point(self.confirm_button_pos, "Confirm discard again", park_at=cursor_rel)
+        else:
+            diag.log("DECISION", "discard: piece still held but no dialog open -> no second confirm "
+                                 "(a confirm click now would ask to discard again)", tag=self.diag_tag)
+            self._status("The piece is still on the cursor after the discard; looking at it again next round")
+            if watch is not None:
+                self._park_cursor(cursor_rel)
         self._check_hand = cursor_rel
 
     # ------------------------------------------------------------ verification
@@ -1623,40 +1943,98 @@ class JigsawBot:
         change = dialog_watch.difference(
             dialog_watch.read_patch(self._dialog_grab, self.confirm_button_pos,
                                     (baseline.shape[1], baseline.shape[0])), baseline)
-        up = change is not None and change > dialog_watch.CHANGED
+        # Dialog-sized on every read, not just "changed": the world behind the
+        # button shifts the patch by 15-19 for good once something moved
+        # there, and a confirm on no dialog is a click into the game world.
+        up = dialog_watch.still_up(self._dialog_grab, self.confirm_button_pos, baseline)
         diag.log("DECISION", f"no piece after the crate: confirm area change {change} -> dialog "
                              f"{'still up: confirm again' if up else 'not up: no second confirm'}",
                  tag=self.diag_tag)
         return up
 
-    def _wait_for_dialog(self, baseline: Optional[np.ndarray], minimum: float) -> bool:
+    def _stale_dialog_up(self) -> bool:
+        """Is a dialog still open over the Confirm button before a crate is
+        clicked? The dialog waits only look for a change from the area as it
+        was right before their own click, so a dialog that was already open
+        then is never seen: the crate click goes into a window blocked by it
+        and "no dialog appeared" repeats round after round (diag
+        20261122_002413: a "Discard this piece?" stayed open for 10 s). Needs
+        the area as last seen with no dialog up; without it there is no
+        telling, and the answer is no."""
+        if self.dry_run or self.confirm_button_pos is None or self._confirm_clear is None:
+            return False
+        parked = self._parked_point()
+        if parked is not None and self._cursor_over_confirm_area():
+            self._park_cursor(parked)   # nothing held now: just off the watched area
+        return dialog_watch.still_up(self._dialog_grab, self.confirm_button_pos, self._confirm_clear)
+
+    def _cursor_over_confirm_area(self) -> bool:
+        """Could the cursor be drawn over the watched Confirm area? Only then
+        must it be taken away before the area is read. Resting at the parked
+        point or in another window, it is not, and taking it back here cost
+        a focus switch and a cursor jump every round (diag 20261122_093507)."""
+        current = self._cursor_position()
+        if current is None:
+            return True
+        left, top, _, _ = self.window_manager.get_window_rect()
+        cx, cy = self.confirm_button_pos
+        x, y = current[0] - left, current[1] - top
+        # The cursor sprite reaches ~32 px right and down of its hot spot.
+        return cx - CONFIRM_PATCH_HALF_W - 34 <= x <= cx + CONFIRM_PATCH_HALF_W \
+            and cy - 8 - 34 <= y <= cy + 8 + 2
+
+    def _dialog_up_within(self, baseline: np.ndarray, timeout: float, what: str,
+                          minimum: float = 0.0) -> bool:
+        """dialog_watch.wait for the Confirm area, counting only a
+        dialog-sized change: the jigsaw never learns the dialog's look, and
+        the world behind the button alone moved the patch by up to 15.08 on a
+        real client, which passed the old threshold of 15 and sent a Yes onto
+        the world (diag 20261122_093507). Real dialogs: 38-45."""
+        return dialog_watch.wait(self._dialog_grab, self.confirm_button_pos, baseline, timeout,
+                                 lambda: self.running, minimum=minimum, what=what, tag=self.diag_tag,
+                                 strong_only=True)
+
+    def _wait_for_dialog(self, baseline: Optional[np.ndarray], minimum: float,
+                         click_again: Optional[Callable[[], None]] = None) -> bool:
         """Waits until the confirm-button area changes, i.e. the dialog is up.
 
         The dialog does not appear a fixed time after the click that asks for
         it — it depends on the client and, with several windows, on the focus
         switch — and a confirm click sent before it is there is simply lost.
         Always waits at least ``minimum``; gives up after the configured
-        timeout and lets the caller decide. Returns True when a change was seen."""
+        timeout and lets the caller decide. Returns True when a change was seen.
+
+        ``click_again``: re-sends the click that asks for the dialog when it
+        did not come within the usual wait. On a real client the dialog came
+        within ~30 ms every time it came at all; the ones that never came were
+        clicks the game did not take (diag 20261122_093507), and a 1.8 s
+        "late dialog" wait for them held the mouse from the other window."""
         if baseline is None:
             diag.log("DECISION", "dialog wait: no baseline (dry run / no confirm position): fixed delay only",
                      tag=self.diag_tag)
             time.sleep(max(0.0, minimum))
             return False
         timeout = float(self.config.get("jigsaw_dialog_wait_timeout", 0.6))
-        if dialog_watch.wait(self._dialog_grab, self.confirm_button_pos, baseline, timeout,
-                             lambda: self.running, minimum=minimum, what="dialog", tag=self.diag_tag):
+        if self._dialog_up_within(baseline, timeout, "dialog", minimum):
             self._confirm_clear = baseline   # a dialog came up over it: it was clear
             return True
         if not self.running:
             return False
-        # Not there yet. A slow client or a busy focus switch can be later
-        # than the usual wait; the confirm goes out only on a dialog, so a
-        # late one is worth a longer look before the round is given up.
         late = max(1.0, 3 * timeout)
-        diag.log("DECISION", f"dialog not up within {timeout:.2f}s: waiting up to {late:.2f}s more",
-                 tag=self.diag_tag)
-        if dialog_watch.wait(self._dialog_grab, self.confirm_button_pos, baseline, late,
-                             lambda: self.running, what="late dialog", tag=self.diag_tag):
+        if click_again is not None:
+            diag.log("DECISION", f"dialog not up within {timeout:.2f}s: the click was not taken, clicking again",
+                     tag=self.diag_tag)
+            click_again()
+            if not self.running:
+                return False
+        else:
+            # Not there yet. A slow client or a busy focus switch can be
+            # later than the usual wait; the confirm goes out only on a
+            # dialog, so a late one is worth a longer look before the round
+            # is given up.
+            diag.log("DECISION", f"dialog not up within {timeout:.2f}s: waiting up to {late:.2f}s more",
+                     tag=self.diag_tag)
+        if self._dialog_up_within(baseline, late, "late dialog"):
             self._confirm_clear = baseline
             return True
         return False
@@ -1696,7 +2074,12 @@ class JigsawBot:
             # Not the rectangle asked for (the window render was smaller than
             # its rectangle): read the whole window as before.
             return self.detector.detect_grid(self.capture_full_window())
-        return self.detector.detect_grid(frame, origin=(area[0], area[1]), window_size=(win_w, win_h))
+        grid = self.detector.detect_grid(frame, origin=(area[0], area[1]), window_size=(win_w, win_h))
+        if not grid.grid_found and self.detector.auto_grid():
+            # Not at the place it was found: the window may have moved,
+            # which only a search of the whole window can tell.
+            grid = self.detector.detect_grid(self.capture_full_window())
+        return grid
 
     def _confirm_placement(self, before: int, expected: int, decision: JigsawActionResult,
                            cursor_rel: Optional[Tuple[int, int]]) -> bool:
@@ -1720,6 +2103,10 @@ class JigsawBot:
             self._unverified_streak = 0
             self._refused_streak = 0
             self._last_placement_matched = True
+            if self._place_dialog is not False and first_sent and not self._last_place_confirmed:
+                # Placed on the click alone: this server asks nothing.
+                self._place_dialog = False
+                self._learn_setting("jigsaw_place_dialog", False)
             return True
         if not self.running:
             return False   # stopped while waiting: send nothing further
@@ -1730,8 +2117,21 @@ class JigsawBot:
             self._unverified_streak = 0
             return True
 
-        self._status("Placement did not show up on the board; clicking again")
-        retry_sent = self._click_window_point(decision.target, "Place jigsaw piece (retry)", park_at=cursor_rel)
+        if self._place_dialog is False:
+            # Saved as "no placement dialog", but the piece did not land: the
+            # server may ask now. The retry watches for the dialog again.
+            self._place_dialog = None
+        if self._place_dialog_still_up():
+            # The "Place the piece here?" came later than its wait: it is
+            # answered, not clicked through (a board click behind it does nothing).
+            self._status("The placement dialog is still open; confirming it")
+            retry_sent = self._click_window_point(self.confirm_button_pos, "Confirm placement (late dialog)",
+                                                  park_at=cursor_rel)
+            self._place_dialog = True
+            self._learn_setting("jigsaw_place_dialog", True)
+        else:
+            self._status("Placement did not show up on the board; clicking again")
+            retry_sent = self._place_click(decision.target, "Place jigsaw piece (retry)", cursor_rel)
         grid, matched = self._await_board(expected, timeout)
         self._last_placement_matched = matched
         if matched or grid is None or not grid.grid_found or grid.board_mask != before:
@@ -1763,21 +2163,43 @@ class JigsawBot:
             limit = int(self.config.get("jigsaw_max_refused_placements", 2))
             if limit > 0 and self._refused_streak >= limit:
                 self._refused_streak = 0
-                self._pause("the game refused placements on cells that read as empty — re-align the grid "
-                            "with Define Grid, or check that nothing covers the puzzle")
+                self._pause("the game refused placements on cells that read as empty — check that nothing "
+                            "covers the puzzle" + ("" if self.detector.puzzle is not None and self.detector.auto_grid()
+                                                   else ", or re-align the grid with Define Grid"))
             return False
         # No piece in hand and no change on the board: the piece went somewhere
         # the detector cannot see. Repeatedly => the grid is probably misaligned.
         self._unverified_streak += 1
         if self._unverified_streak >= 3:
             self._unverified_streak = 0
-            self._pause("placed pieces do not show up on the board — re-align the grid with Define Grid")
+            self._pause("placed pieces do not show up on the board — "
+                        + ("check that nothing covers the puzzle window"
+                           if self.detector.puzzle is not None and self.detector.auto_grid()
+                           else "re-align the grid with Define Grid"))
         return False
 
+    # Where the game holds each piece, in cells from the piece's top-left
+    # corner: it draws the piece at that offset from the cursor and, on the
+    # click, snaps the piece's top-left corner to the nearest cell. Measured
+    # on a real client (recordings of diags 20261122_002413/005427/010555):
+    # the cursor sits on the center of the top-left cell, except for the
+    # line of 3 (middle cell) and the Z (1.25 cells in, top row). Clicking
+    # the middle of the piece's outline instead put the Z half a cell too
+    # low: the game snapped it a row down, "the piece does not fit there",
+    # every time; the 2x2 pieces sat right on a snapping boundary.
+    _HOTSPOTS = {0: (0.5, 0.5), 1: (0.5, 1.5), 2: (0.5, 0.5), 3: (0.5, 0.5), 4: (0.5, 0.5), 5: (1.25, 0.5)}
+
+    def _piece_hotspot(self, spec: Optional[PieceSpec], width: int, height: int) -> Tuple[float, float]:
+        if spec is not None and spec.figure_index in self._HOTSPOTS:
+            return self._HOTSPOTS[spec.figure_index]
+        if (width, height) == (3, 2):
+            return self._HOTSPOTS[5]      # the special 3x2 piece: assumed held like the Z (not measured)
+        return (width / 2.0, height / 2.0)
+
     def _target_for_action(self, grid: JigsawGridResult, action: int, spec: Optional[PieceSpec] = None) -> Optional[Tuple[int, int]]:
-        """Window point to click for a placement: the geometric center of the
-        cells the piece will occupy (the game holds the piece centered on the
-        cursor and snaps it to the grid)."""
+        """Window point to click for a placement: where the cursor holds the
+        piece (_HOTSPOTS) with the piece's top-left corner on the top-left
+        target cell."""
         if spec is None:
             x, y = Jigsaw.action_to_offsets(action)
             idx = y * 6 + x
@@ -1794,9 +2216,8 @@ class JigsawBot:
 
         if grid.grid_bounds is not None:
             gx, gy, gw, gh = grid.grid_bounds
-            center_col = (min_col + max_col + 1) / 2.0
-            center_row = (min_row + max_row + 1) / 2.0
-            return (int(round(gx + center_col * gw / 6.0)), int(round(gy + center_row * gh / 4.0)))
+            hx, hy = self._piece_hotspot(spec, max_col - min_col + 1, max_row - min_row + 1)
+            return (int(round(gx + (min_col + hx) * gw / 6.0)), int(round(gy + (min_row + hy) * gh / 4.0)))
 
         # No bounds: derive the same point from the cell centers.
         min_idx = min_row * 6 + min_col
@@ -1833,11 +2254,12 @@ class JigsawBot:
         self._suspect_mask = self._suspect_board = 0   # the next board starts empty
         # After the last piece slots in, the game shows a 3 s "board complete" animation
         # before the result dialog appears. Wait it out before polling for the OK button.
-        post_complete_wait = float(self.config.get("jigsaw_post_complete_wait", 3.0))
+        # The result ("Puzzle complete! You received: ...") came 1.2 s after
+        # the last piece on a real client (diag 20261122_082918); a fixed
+        # 3 s wait came on top of that. A short pause for the last piece to
+        # be drawn, then the OK points are watched.
+        post_complete_wait = float(self.config.get("jigsaw_post_complete_wait", 0.3))
         if post_complete_wait > 0:
-            self._status(f"Board complete; waiting {post_complete_wait:.1f}s for animation")
-            if DEBUG_PRINTS or diag.ENABLED:
-                self._dbg(f"[JigsawBot W{self.bot_id + 1}] post-complete wait {post_complete_wait}s")
             self._debug_update("board_complete_wait", f"waiting {post_complete_wait:.1f}s")
             wait_end = time.perf_counter() + post_complete_wait
             while self.running and time.perf_counter() < wait_end:
@@ -1849,25 +2271,31 @@ class JigsawBot:
         offset_x = int(self.config.get("jigsaw_result_confirm_x_offset", 15))
         poll_interval = float(self.config.get("jigsaw_completion_poll_interval", 0.10))
 
-        self._status(f"Board complete; polling for result confirm (budget {total_budget:.1f}s)")
+        self._status("Board complete; waiting for the result dialog")
         if DEBUG_PRINTS or diag.ENABLED:
             self._dbg(f"[JigsawBot W{self.bot_id + 1}] _handle_completed_board: polling up to {total_budget}s")
         self._debug_update("board_complete", f"polling up to {total_budget:.1f}s for result")
 
         deadline = time.perf_counter() + total_budget
         frame = None
-        result_pt = self._result_point()
-        baseline = self._result_baseline
-        changed_polls = 0
+        configured = self._result_ok_point()
+        search_after = time.perf_counter() + float(self.config.get("jigsaw_result_search_after", 2.5))
+        baselines = {point: patch for point, patch in (self._result_baseline or {}).items() if patch is not None}
+        steady = {point: 0 for point in baselines}
+        prev_patch = {point: None for point in baselines}
+        before = self._result_before
+        self._result_before = None
+        prev_gray = None
+        last_pick = None
         # Without a shipped template there is no button to search the whole
-        # window for: grabbing it every poll (up to 13 s at 10 Hz) was wasted.
+        # window for, and with neither a set OK point nor a picture of the
+        # window from before the board was finished there is nothing to see.
         use_template = self.detector.has_confirm_template()
-        with diag.loop("poll result confirm", tag=self.diag_tag, budget=total_budget, at=result_pt,
-                       baseline=baseline is not None, template=use_template) as lp:
+        with diag.loop("poll result confirm", tag=self.diag_tag, budget=total_budget,
+                       at=configured or "found on screen", template=use_template) as lp:
             while self.running and time.perf_counter() < deadline:
                 lp.frame()
                 target = None
-                # A shipped template finds the button itself...
                 ok_pos = None
                 if use_template:
                     frame = self.capture_full_window()
@@ -1875,23 +2303,46 @@ class JigsawBot:
                 if ok_pos is not None:
                     target = (ok_pos[0] + offset_x, ok_pos[1])
                     lp.set("result", f"OK template at {ok_pos}, click {target}")
-                elif baseline is not None:
-                    # ... otherwise the dialog must be seen at the result
-                    # point: it looks different from before the crate (twice
-                    # in a row, so a passing effect does not count).
-                    change = dialog_watch.difference(
-                        dialog_watch.read_patch(self._dialog_grab, result_pt,
-                                                (baseline.shape[1], baseline.shape[0])), baseline)
-                    lp.score("change", change or 0.0)
-                    changed_polls = changed_polls + 1 if change is not None and change > dialog_watch.CHANGED else 0
-                    if changed_polls >= 2:
-                        target = result_pt
-                        lp.set("result", f"dialog seen at {result_pt} (change {change:.1f})")
+                if target is None and configured is not None and baselines:
+                    # The saved OK point (found on an earlier board, or set
+                    # by the player): only that spot is watched. The dialog
+                    # must be seen there, changed from before the crate and
+                    # drawn still.
+                    for point, baseline in baselines.items():
+                        patch = dialog_watch.read_patch(self._dialog_grab, point,
+                                                        (baseline.shape[1], baseline.shape[0]))
+                        change = dialog_watch.difference(patch, baseline)
+                        lp.score("change", change or 0.0)
+                        still = dialog_watch.difference(patch, prev_patch[point])
+                        prev_patch[point] = patch
+                        # Dialog-sized only (real result dialogs: 37-43); the
+                        # world behind the OK point moves it by up to ~15.
+                        up = change is not None and change >= dialog_watch.DIALOG \
+                            and still is not None and still < dialog_watch.STABLE * 2
+                        steady[point] = steady[point] + 1 if up else 0
+                        if steady[point] >= 2:
+                            target = point
+                            lp.set("result", f"dialog seen at {point} (change {change:.1f})")
+                if target is None and ok_pos is None and before is not None and (
+                        configured is None or not baselines or time.perf_counter() >= search_after):
+                    # No saved OK point (or nothing came up there): found on
+                    # screen, whatever dialog came up, wherever.
+                    gray = self._gray_window()
+                    pick = self._pick_result_button(before, gray, prev_gray)
+                    prev_gray = gray
+                    lp.set("seen", pick)
+                    if pick is not None and last_pick is not None \
+                            and abs(pick[0] - last_pick[0]) <= 4 and abs(pick[1] - last_pick[1]) <= 4:
+                        target = pick       # the same button twice in a row: drawn, not a passing effect
+                        lp.set("result", f"OK found at {pick}")
+                    last_pick = pick
                 if target is not None:
                     if DEBUG_PRINTS or diag.ENABLED:
                         self._dbg(f"[JigsawBot W{self.bot_id + 1}] clicking result confirm at {target}")
                     self._debug_update("result_confirm", f"click={target}", decision_target=target)
-                    self._click_window_point(target, "Confirm jigsaw result")
+                    self._click_window_point(target, "Confirm jigsaw result", park_at=self._parked_point())
+                    if target != configured and ok_pos is None and before is not None:
+                        self._check_result_gone(before, target)
                     time.sleep(float(self.config.get("jigsaw_action_delay", 0.08)))
                     return
                 time.sleep(poll_interval)
@@ -1904,16 +2355,142 @@ class JigsawBot:
             self._dbg(f"[JigsawBot W{self.bot_id + 1}] result dialog not seen within {total_budget}s")
         self._status("Jigsaw result dialog not seen — nothing clicked")
 
-    def _result_point(self) -> Tuple[int, int]:
-        """Window point of the result dialog's OK button: configured
-        (jigsaw_result_button_pos), or the lower middle of the window where
-        the game puts it (half width + jigsaw_result_confirm_x_offset, 63 %
-        of the height)."""
-        point = self._configured_point("jigsaw_result_button_pos")
-        if point is not None:
-            return point
-        _, _, w, h = self.window_manager.get_window_rect()
-        return (w // 2 + int(self.config.get("jigsaw_result_confirm_x_offset", 15)), int(h * 0.63))
+    # Positions and facts found on screen once and kept: they do not move
+    # between rounds (the game draws its dialogs at the same place every
+    # time), so they are not searched for again. Shared by the windows of a
+    # run (they have the same size) and saved in the settings through
+    # on_setting_learned for the next runs.
+    _learned_settings: Dict[str, object] = {}
+    _learned_lock = threading.Lock()
+
+    def _setting(self, key: str):
+        """A setting: what this run learned (newest), else the config."""
+        with JigsawBot._learned_lock:
+            if key in JigsawBot._learned_settings:
+                return JigsawBot._learned_settings[key]
+        return self.config.get(key)
+
+    def _learn_setting(self, key: str, value) -> None:
+        """Keeps a found position / fact for the rest of the run and has
+        the GUI save it, so the next runs do not look for it again."""
+        with JigsawBot._learned_lock:
+            if JigsawBot._learned_settings.get(key, self.config.get(key)) == value:
+                return
+            JigsawBot._learned_settings[key] = value
+        self.config[key] = value
+        diag.log("DECISION", f"learned {key} = {value}: kept and saved", tag=self.diag_tag)
+        if self.on_setting_learned is not None:
+            try:
+                self.on_setting_learned(key, value)
+            except Exception:
+                diag.exc("saving a learned setting", tag=self.diag_tag)
+
+    @classmethod
+    def reset_learned_settings(cls) -> None:
+        """A new run starts from the saved settings (the GUI passes them)."""
+        with cls._learned_lock:
+            cls._learned_settings.clear()
+
+    def _result_ok_point(self) -> Optional[Tuple[int, int]]:
+        """The saved OK point of the result dialog, if it belongs to this
+        window size (found or set on another size, it is looked for again)."""
+        value = self._setting("jigsaw_result_button_pos")
+        try:
+            point = (int(value[0]), int(value[1])) if value and len(value) == 2 else None
+        except (TypeError, ValueError):
+            return None
+        if point is None:
+            return None
+        size = (self._setting("position_window_sizes") or {}).get("jigsaw_result_button_pos")
+        if size:
+            try:
+                _, _, w, h = self.window_manager.get_window_rect()
+                if [int(w), int(h)] != [int(size[0]), int(size[1])]:
+                    return None
+            except Exception:
+                diag.exc("result OK point: window size", tag=self.diag_tag)
+        return point
+
+    def _result_points(self) -> List[Tuple[int, int]]:
+        """The player's OK point for the result dialog (jigsaw_result_button_pos),
+        watched as a patch; empty when it is not set: the dialog is then
+        found on screen (_pick_result_button)."""
+        point = self._result_ok_point()
+        return [point] if point is not None else []
+
+    def _gray_window(self) -> Optional[np.ndarray]:
+        self.capture.invalidate()
+        frame = self.capture_full_window()
+        if frame is None or frame.ndim != 3:
+            return None
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    def _pick_result_button(self, before: np.ndarray, gray: Optional[np.ndarray],
+                            prev: Optional[np.ndarray]) -> Optional[Tuple[int, int]]:
+        """The result dialog's OK, found as a dialog that came up anywhere in
+        the window since ``before`` (dialog_watch.find_dialogs). Nothing about
+        its place is assumed (diag 20261122_082918: the OK was 80 px from
+        where a fixed point had it). Panels mostly on the board are the
+        board's own "complete" effect. With several buttons the one where
+        the OK was found last wins, then the one nearest the Confirm button
+        (same height first): game dialogs put their buttons on one line."""
+        if gray is None:
+            return None
+        puzzle = None
+        bounds = self.detector.current_grid_bounds()
+        if bounds and len(bounds) == 4:
+            gx, gy, gw, gh = (int(v) for v in bounds)
+            puzzle = (gx - 8, gy - 8, gw + 16, gh + 16)   # the board, where its "complete" effect plays
+        buttons = []
+        for (x, y, w, h), found in dialog_watch.find_dialogs(before, gray, prev):
+            if puzzle is not None:
+                px, py, pw, ph = puzzle
+                ix = max(0, min(x + w, px + pw) - max(x, px))
+                iy = max(0, min(y + h, py + ph) - max(y, py))
+                if ix * iy > 0.5 * w * h:
+                    continue
+            buttons.extend(found)
+        if not buttons:
+            return None
+        learned = self._learned_result_point
+        confirm = self.confirm_button_pos
+
+        def rank(point):
+            near_learned = 0 if learned and abs(point[0] - learned[0]) <= 8 and abs(point[1] - learned[1]) <= 8 else 1
+            if confirm is None:
+                return (near_learned, 0, 0)
+            return (near_learned, abs(point[1] - confirm[1]), abs(point[0] - confirm[0]))
+
+        best = min(buttons, key=rank)
+        return (int(best[0]), int(best[1]))
+
+    def _remember_result_size(self) -> None:
+        """The window size the OK point belongs to (a resized window makes it stale)."""
+        try:
+            _, _, w, h = self.window_manager.get_window_rect()
+        except Exception:
+            return
+        sizes = dict(self._setting("position_window_sizes") or {})
+        if sizes.get("jigsaw_result_button_pos") != [int(w), int(h)]:
+            sizes["jigsaw_result_button_pos"] = [int(w), int(h)]
+            self._learn_setting("position_window_sizes", sizes)
+
+    def _check_result_gone(self, before: np.ndarray, point: Tuple[int, int]) -> None:
+        """After the OK click: the dialog gone means the button was the OK
+        (remembered for the next board); still there, it is clicked once more."""
+        deadline = time.perf_counter() + float(self.config.get("jigsaw_dialog_wait_timeout", 0.6)) * 2
+        while self.running and time.perf_counter() < deadline:
+            time.sleep(0.1)
+            if self._pick_result_button(before, self._gray_window(), None) != point:
+                # It was the OK: kept, and only that spot is watched from now on
+                self._learned_result_point = point
+                self._learn_setting("jigsaw_result_button_pos", [int(point[0]), int(point[1])])
+                self._remember_result_size()
+                return
+        if self.running:
+            diag.log("DECISION", f"result dialog still up after the OK click at {point}: clicking again",
+                     tag=self.diag_tag)
+            self._click_window_point(point, "Confirm jigsaw result (again)", park_at=self._parked_point())
 
     def _open_crate_and_confirm(self, crate_point: Tuple[int, int], section: str) -> Optional[Tuple[int, int]]:
         """Open a crate, confirm it, and park the cursor with one foreground lock hold."""
@@ -1921,17 +2498,18 @@ class JigsawBot:
         if self.confirm_button_pos is None:
             return self._current_cursor_relative()
 
-        shift_px = int(self.config.get("jigsaw_post_crate_cursor_right_px", 24))
         confirm_point = self.confirm_button_pos
         parked = self._parked_point()
+        self._crate_dialog_seen = True     # unknown in a dry run / on an early return: as before
         if self.dry_run:
             return parked
 
         cursor_settle = float(self.config.get("timing_cursor_settle", 0.008))
         between_click_delay = float(self.config.get("jigsaw_crate_confirm_delay", 0.06))
 
-        with input_lock:
+        with self._hold():
             if not self._focus():
+                self._crate_dialog_seen = None    # nothing was clicked
                 return parked
             # Read after the focus: a minimized window was just restored and
             # has its real place only now.
@@ -1941,15 +2519,23 @@ class JigsawBot:
             parked_x, parked_y = left + parked[0], top + parked[1]
             switched = self._switched
             self._verify_capture()
-            self.human.move_to(crate_x, crate_y)
-            self.human.sleep(max(cursor_settle, self._SWITCH_SETTLE if switched else 0.0))
+            self._glide_to(crate_x, crate_y)
+            self._hover(switched)
             baseline = self._confirm_area()
             self._crate_confirm_baseline = baseline
-            self.human.click()
+            self._press(hovered=True)
+
+            def click_crate_again():
+                self._status("The crate did not open; clicking it again")
+                if self._focus():
+                    self._glide_to(crate_x, crate_y)
+                    self._press(switched=self._switched)
+
             # Click "confirm" when the dialog is there, not a fixed time later.
-            dialog_up = self._wait_for_dialog(baseline, between_click_delay)
+            dialog_up = self._wait_for_dialog(baseline, between_click_delay, click_again=click_crate_again)
             if not self.running:
                 return parked   # stopped while waiting: leave the dialog alone
+            self._crate_dialog_seen = dialog_up
             if not dialog_up:
                 # No dialog came — or the confirm area could not be read
                 # (no baseline), so there is no telling: a confirm click
@@ -1964,29 +2550,67 @@ class JigsawBot:
                     self._status("No dialog appeared after clicking the crate; not clicking Confirm")
                 self.human.move_to(parked_x, parked_y)
                 return parked
-            self.human.move_to(confirm_x, confirm_y)
+            self._glide_to(confirm_x, confirm_y)
+            self._press()
+            self.human.move_to(parked_x, parked_y)
             if cursor_settle > 0:
                 self.human.sleep(cursor_settle)
-            self.human.click()
-            if shift_px:
-                self.human.move_to(parked_x, parked_y)
-                if cursor_settle > 0:
-                    self.human.sleep(cursor_settle)
         piece_wait = float(self.config.get("jigsaw_post_crate_piece_wait", 0.05))
         if piece_wait > 0:
             time.sleep(piece_wait)
         return parked
 
     def _parked_point(self) -> Optional[Tuple[int, int]]:
-        """Where the cursor rests between actions: beside the confirm button,
-        clear of the grid, the crate slots and the inventory."""
+        """Where the cursor rests between actions (rest_point): beside the
+        confirm button, where a held piece leaves the watched Confirm area
+        clear, and clear of the grid, the crate slots and the inventory
+        (checked by layout_problem)."""
         if self.confirm_button_pos is None:
             return None
-        shift_px = int(self.config.get("jigsaw_post_crate_cursor_right_px", 24))
-        return (self.confirm_button_pos[0] + shift_px, self.confirm_button_pos[1])
+        return rest_point(self.config, self._grid_width(), self._window_width())
+
+    def _grid_width(self) -> Optional[float]:
+        bounds = self.detector.current_grid_bounds()
+        try:
+            return float(bounds[2])
+        except (TypeError, ValueError, IndexError):
+            return None
+
+    def _window_width(self) -> Optional[int]:
+        try:
+            return int(self.window_manager.get_window_rect()[2])
+        except Exception:
+            diag.exc("window width", tag=self.diag_tag)
+            return None
 
     _PARK_SETTLE = 0.03     # seconds the game gets to redraw a held piece at the parked cursor
     _SWITCH_SETTLE = 0.04   # seconds the game gets to track the cursor after a focus switch
+
+    def _glide_to(self, x: int, y: int) -> None:
+        """Screen point; input_lock held, window in front."""
+        self.human.glide_to(x, y, self._glide)
+
+    def _hover(self, switched: bool = False) -> None:
+        """The rest on the target before a press (see _press)."""
+        cursor_settle = float(self.config.get("timing_cursor_settle", 0.008))
+        hover = max(cursor_settle, self._hover_settle, self._SWITCH_SETTLE if switched else 0.0)
+        if hover > 0:
+            self.human.sleep(hover)
+
+    def _press(self, button: str = "left", switched: bool = False, hovered: bool = False) -> None:
+        """Clicks where the cursor was just taken (input_lock held, window in
+        front), the way the game sees a click: the cursor rests on the target
+        for a few frames first (the button under it is "hovered" only after
+        the game read it there; after a focus switch the game first has to
+        notice the cursor at all), the button stays down for a few frames, and
+        the cursor stays on the target a moment after the release (a cursor
+        that leaves right away is read off the button when the release is
+        handled). ``hovered``: the caller already rested there (_hover)."""
+        if not hovered:
+            self._hover(switched)
+        self.human.click(button=button, hold=self._click_hold)
+        if self._release_settle > 0:
+            self.human.sleep(self._release_settle)
 
     def _focus(self) -> bool:
         """Brings this window to the front. input_lock must be held.
@@ -2017,16 +2641,18 @@ class JigsawBot:
         elsewhere in the window)."""
         if cursor_rel is None or self.dry_run:
             return cursor_rel
-        with input_lock:
+        with self._hold():
             self._restore_cursor(cursor_rel)
         return cursor_rel
 
     def _click_window_point(self, point: Tuple[int, int], description: str,
-                            park_at: Optional[Tuple[int, int]] = None) -> bool:
+                            park_at: Optional[Tuple[int, int]] = None,
+                            on_target: Optional[Callable[[], None]] = None) -> bool:
         """Clicks a window-relative point. With ``park_at`` the cursor is taken
         there right after the click, in the same lock hold: a piece that is
         still on the cursor (the click was not accepted) must not stay over
-        the grid, where it looks exactly like placed cells."""
+        the grid, where it looks exactly like placed cells. ``on_target`` is
+        called with the cursor resting on the point, right before the press."""
         if DEBUG_PRINTS or diag.ENABLED:
             self._dbg(f"[JigsawBot W{self.bot_id + 1}] _click_window_point: {description} rel={point} dry_run={self.dry_run}")
         self._status(f"{description} at ({point[0]}, {point[1]})")
@@ -2034,7 +2660,7 @@ class JigsawBot:
         if self.dry_run:
             return False
         cursor_settle = float(self.config.get("timing_cursor_settle", 0.008))
-        with input_lock:
+        with self._hold():
             # Fast path inside activate_window early-returns when our HWND is already foreground.
             if not self._focus():
                 diag.log("DECISION", f"{description}: window not in front, click NOT sent", tag=self.diag_tag)
@@ -2043,16 +2669,15 @@ class JigsawBot:
             left, top, _, _ = self.window_manager.get_window_rect()
             screen_x, screen_y = left + point[0], top + point[1]
             switched = self._switched
-            self.human.move_to(screen_x, screen_y)
+            self._glide_to(screen_x, screen_y)
             # After a focus switch the game first has to notice the cursor (and
             # move the held piece to it); a click sent sooner lands where the
             # cursor was the last time this window had it.
-            settle = max(cursor_settle, self._SWITCH_SETTLE if switched else 0.0)
-            if settle > 0:
-                self.human.sleep(settle)
-            self.human.click()
+            self._hover(switched)
+            if on_target is not None:
+                on_target()
+            self._press(hovered=True)
             if park_at is not None:
-                self.human.sleep(max(cursor_settle, 0.02))   # let the click be processed first
                 self.human.move_to(left + park_at[0], top + park_at[1])
                 self.human.sleep(max(cursor_settle, self._PARK_SETTLE))
             self.capture.invalidate()
@@ -2071,44 +2696,27 @@ class JigsawBot:
         self._status(description)
         if self.dry_run:
             return
-        with input_lock:
+        with self._hold():
             if not self._focus():
                 return
             if cursor_rel is not None:
                 self._restore_cursor(cursor_rel)
-            self.human.click(button="right")
+            self._press(button="right")
             if then_move_to is not None:
                 self._settle_held_piece_at(then_move_to)
 
-    # dialog_watch.PATCH half width, plus a margin: the watched Confirm area
-    _CONFIRM_PATCH_HALF_W = 20 + 6
-
     def _discard_watch_point(self) -> Optional[Tuple[int, int]]:
         """Where the cursor rests while the discard dialog is awaited: far
-        enough beside Confirm that a held piece (centered on the cursor, up
-        to 3 cells wide) leaves the watched Confirm area uncovered. Right of
-        Confirm, else left of it; None when neither fits in the window (the
-        piece then stays where it is held)."""
+        enough beside Confirm that a held piece (up to 3 cells wide) leaves
+        the watched Confirm area uncovered (piece_watch_point). The cursor
+        normally rests there anyway (rest_point). None when neither side fits
+        in the window (the piece then stays where it is held)."""
         if self.dry_run or self.confirm_button_pos is None:
             return None
-        bounds = self.config.get("jigsaw_grid_bounds")
-        try:
-            cell = float(bounds[2]) / 6.0
-        except (TypeError, ValueError, IndexError):
-            cell = JigsawDetector.DEFAULT_GRID_SIZE[0] / 6.0
-        offset = self._CONFIRM_PATCH_HALF_W + int(round(1.5 * cell)) + 1
-        cx, cy = self.confirm_button_pos
-        try:
-            _, _, win_w, _ = self.window_manager.get_window_rect()
-        except Exception:
-            diag.exc("discard watch point: window size", tag=self.diag_tag)
+        win_w = self._window_width()
+        if win_w is None:
             return None
-        half_piece = int(round(1.5 * cell))
-        if cx + offset + half_piece < win_w:
-            return (cx + offset, cy)
-        if cx - offset - half_piece >= 0:
-            return (cx - offset, cy)
-        return None
+        return piece_watch_point(self.confirm_button_pos, self._grid_width(), win_w)
 
     def _settle_held_piece_at(self, point: Tuple[int, int]) -> None:
         """Moves the cursor (input_lock held, window in front) and gives the
@@ -2120,10 +2728,12 @@ class JigsawBot:
 
     def _move_held_piece(self, point: Tuple[int, int]) -> None:
         """Takes the cursor (and a held piece) to a window point. Nothing is
-        clicked."""
+        clicked, and nothing moves when the cursor is there already."""
         if self.dry_run:
             return
-        with input_lock:
+        with self._hold():
+            if self._cursor_at(point):
+                return
             if self._focus():
                 self._settle_held_piece_at(point)
 
@@ -2143,7 +2753,7 @@ class JigsawBot:
             if DEBUG_PRINTS or diag.ENABLED:
                 self._dbg(f"[JigsawBot W{self.bot_id + 1}] _activate_window_for_jigsaw: {description}")
             self._status(description)
-            with input_lock:
+            with self._hold():
                 self.window_manager.activate_window()
                 self._verify_capture()
         except Exception as e:

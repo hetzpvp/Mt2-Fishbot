@@ -228,8 +228,9 @@ class WizardTests(GuiFixture):
         wiz._radios["special_first"].setChecked(True)
         self.assertEqual(self._saved()["jigsaw_crate_priority"], "special_first")
         self.assertTrue(w.jigsaw_tab.priority_radios["special_first"].isChecked())
+        self.assertIn("Found by itself", wiz._status["grid"].text())   # nothing to set
         w._on_grid_confirmed([10, 20, 264, 176])
-        self.assertIn("grid is set", wiz._status["grid"].text())
+        self.assertIn("fallback", wiz._status["grid"].text())
         wiz.close()
 
 

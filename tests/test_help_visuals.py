@@ -130,7 +130,10 @@ class GuiFlowTests(unittest.TestCase):
         self.w.set_mode(qt_gui.MODE_JIGSAW)
         runner = self.w.jigsaw
         windows = dict(WindowManager.get_all_windows())
-        self.w.config.update({"jigsaw_grid_bounds": [413, 287, 194, 130], "confirm_button_pos": [600, 375]})
+        # A grid defined by hand (with the puzzle window found by itself, each
+        # worker checks the layout for the place it finds it in its window)
+        self.w.config.update({"jigsaw_grid_bounds": [413, 287, 194, 130], "confirm_button_pos": [600, 375],
+                              "jigsaw_grid_auto": False})
         self.assertFalse(runner.layout_ok("Metin2 (1)", windows))    # Yes button over the grid
         topic, problem, _ = self.helps[-1]
         self.assertEqual(topic, "jigsaw_layout")
