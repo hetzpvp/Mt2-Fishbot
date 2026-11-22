@@ -1,11 +1,11 @@
-# MT2 Fishing Bot — v2.0.4
+# MT2 Fishing Bot — v2.0.5
 
 Free fishing-minigame bot for Metin2. No subscriptions, no licenses.
 **Built for educational and learning purposes only.**
 
-[Video tutorial](https://youtu.be/M0THxnio894) · [Download v2.0.4](https://github.com/hetzpvp/Mt2-Fishbot/releases/latest) · [Discord server support](https://discord.gg/vZaHCRFqW7)
+[Video tutorial](https://youtu.be/M0THxnio894) · [Download v2.0.5](https://github.com/hetzpvp/Mt2-Fishbot/releases/latest) · [Discord server support](https://discord.gg/vZaHCRFqW7)
 
-**Download v2.0.4:** [Windows .exe](https://github.com/hetzpvp/Mt2-Fishbot/releases/download/Mt2-Fishbot-v2.0.4/Fishing-Puzzle-Player-v2.0.4-windows.exe) · [Linux binary](https://github.com/hetzpvp/Mt2-Fishbot/releases/download/Mt2-Fishbot-v2.0.4/Fishing-Puzzle-Player-v2.0.4-linux.tar.gz) · [All releases](https://github.com/hetzpvp/Mt2-Fishbot/releases)
+**Download v2.0.5:** [Windows .exe](https://github.com/hetzpvp/Mt2-Fishbot/releases/download/Mt2-Fishbot-v2.0.5/Fishing-Puzzle-Player-v2.0.5-windows.exe) · [Linux binary](https://github.com/hetzpvp/Mt2-Fishbot/releases/download/Mt2-Fishbot-v2.0.5/Fishing-Puzzle-Player-v2.0.5-linux.tar.gz) · [All releases](https://github.com/hetzpvp/Mt2-Fishbot/releases)
 
 ![GUI](docs/gui_demo.png)
 
@@ -76,6 +76,7 @@ It contains what the bot did, what it saw (screenshots of the game window only, 
 
 ## Version history
 
+- **2.0.5** — Mostly jigsaw fixes: puzzle window found by itself, much faster with several windows, placement and result dialogs; pause and drop fixes
 - **2.0.4** — Jigsaw grid setup fixed on 1080p and larger screens
 - **2.0.3** — Golden Tuna dialog, dead and bait fish handling, fish selection tabs, Task Manager disguise, faster catches, drop fixes, smaller Windows exe
 - **2.0.2** — Lighter and faster with several clients, fishing and jigsaw loop fixes, diagnostic log, setup wizards and help pages

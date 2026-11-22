@@ -337,15 +337,28 @@ class JigsawBot:
         self._capture_bad_since: Optional[float] = None   # first unusable full-window frame in a row
         self.stop_reason: Optional[str] = None
         self._last_focus_log = 0.0
-        # How a click is sent (see _press): the fishing bot's UI click (cursor
-        # settles 100 ms, button held 50 ms), which works on the same clients.
-        # The game reads the mouse once per frame: a press and release in the
-        # same millisecond, 12 ms after the cursor jumped onto a button, was
-        # lost on a real client (diag 20261122_002413).
+        # How a click is sent (see _press). The game reads the mouse once per
+        # frame: a press and release in the same millisecond, 12 ms after the
+        # cursor jumped onto a button, was lost on a real client (diag
+        # 20261122_002413). The fishing bot's UI click (cursor settles 100 ms,
+        # button held 50 ms) always worked, but four such clicks per crate
+        # were ~60 % of the ~1 s each crate held the one mouse, so four
+        # windows opened no more crates than one (diag 20261122_132850). A
+        # click in the window that already has the focus rests 40 ms; the
+        # first one after a focus switch keeps the full 100 ms (the game has
+        # to notice the cursor first). A quick click the game does not take
+        # brings back the careful timing for a while (_click_lost).
         self._glide = max(0.0, float(config.get("jigsaw_cursor_glide", 0.0)))
-        self._hover_settle = max(0.0, float(config.get("jigsaw_click_hover", 0.10)))
-        self._click_hold = max(0.0, float(config.get("jigsaw_click_hold", 0.05)))
+        self._hover_settle = max(0.0, float(config.get("jigsaw_click_hover", 0.04)))
+        self._switch_hover = max(0.0, float(config.get("jigsaw_click_hover_switch", 0.10)))
+        self._click_hold = max(0.0, float(config.get("jigsaw_click_hold", 0.035)))
         self._release_settle = max(0.0, float(config.get("jigsaw_click_release", 0.02)))
+        self._careful_hover = max(self._hover_settle, self._switch_hover)
+        self._careful_hold = max(self._click_hold, float(config.get("jigsaw_click_hold_careful", 0.05)))
+        self._last_click_quick = False  # the last press went out with the quick timing
+        # (cursor_rel, Confirm-area baseline, watch point, deadline) of a
+        # discard whose piece is checked gone when the next round starts.
+        self._discard_check: Optional[tuple] = None
         # Does this server ask "Place the piece here?" after a click on the
         # board? Learned once (see _place_click) and saved; None until known.
         self.on_setting_learned = None   # callback(key, value): the GUI saves it in the settings
@@ -663,6 +676,10 @@ class JigsawBot:
             # From here to the end of the placement or discard, the mouse
             # stays with this window.
             self._begin_round_hold()
+            if self._discard_check is not None:
+                self._finish_discard_check()
+                if not self.running:
+                    return
             if self._check_hand is not None:
                 # The last round ended without knowing whether a piece is still
                 # on the cursor (a dialog may have been confirmed late). Opening
@@ -833,6 +850,7 @@ class JigsawBot:
                     # The "open crate?" dialog came up after the confirm
                     # click had already been sent, so it is still waiting.
                     # Confirm once more and look again.
+                    self._click_lost("crate dialog still open after its Yes")
                     self._click_window_point(self.confirm_button_pos, "Confirm crate again (no piece seen)")
                     cursor_rel = self._park_cursor(cursor_rel)
                     time.sleep(retry_delay)
@@ -1133,19 +1151,32 @@ class JigsawBot:
         self.capture.invalidate()
 
     def _look_for_piece(self, cursor_rel: Optional[Tuple[int, int]], attempts: int, delay: float):
-        """Looks for the piece on the cursor, a few times: it appears a moment
-        after the crate was confirmed."""
+        """Looks for the piece on the cursor until it shows: it appears a
+        moment after the crate was confirmed. Gives up after the time
+        ``attempts`` looks ``delay`` apart would take, but looks every
+        ``_PIECE_POLL`` meanwhile: a piece that came 10 ms after a look
+        otherwise cost the whole ``delay`` with the mouse held."""
         piece = None
+        budget = max(0, attempts - 1) * max(0.0, delay)
+        poll = min(delay, self._PIECE_POLL) if delay > 0 else 0.0
+        deadline = time.perf_counter() + budget
         with diag.loop("look for cursor piece", tag=self.diag_tag, columns=("attempt", "piece", "conf"),
                        cursor=cursor_rel, attempts=attempts) as lp:
-            for attempt in range(max(1, attempts)):
+            attempt = 0
+            while True:
+                attempt += 1
                 piece = self._detect_cursor_piece(cursor_rel)
-                lp.frame(attempt=attempt + 1, piece=piece.piece_id, conf=piece.confidence)
+                lp.frame(attempt=attempt, piece=piece.piece_id, conf=piece.confidence)
                 lp.score("confidence", piece.confidence)
                 if piece.piece_id is not None or not self.running:
                     break
-                if attempt < attempts - 1:
-                    time.sleep(delay)
+                if poll <= 0:
+                    if attempt >= attempts:
+                        break
+                    continue
+                if time.perf_counter() + poll > deadline + 1e-3:
+                    break
+                time.sleep(poll)
             lp.set("result", f"{piece.piece_id if piece else None} conf="
                              f"{piece.confidence if piece else 0:.3f}")
         return piece
@@ -1811,7 +1842,7 @@ class JigsawBot:
                 self._park_cursor(cursor_rel)
             return False
         baseline = self._place_baseline
-        timeout = float(self.config.get("jigsaw_dialog_wait_timeout", 0.6))
+        timeout = float(self.config.get("jigsaw_dialog_wait_timeout", 0.3))
         if baseline is not None and self._dialog_up_within(baseline, timeout, "place dialog"):
             self._confirm_clear = baseline
             self._place_dialog = True
@@ -1819,6 +1850,8 @@ class JigsawBot:
             self._last_place_confirmed = self._click_window_point(
                 self.confirm_button_pos, "Confirm placement", park_at=cursor_rel)
             return True
+        if baseline is not None and self._place_dialog is True and self.running:
+            self._click_lost("no placement dialog after the board click")
         if cursor_rel is not None and self.running:
             self._park_cursor(cursor_rel)
         return True
@@ -1858,7 +1891,7 @@ class JigsawBot:
         at = watch if watch is not None else cursor_rel
         self._right_click_current_position("Discard jigsaw piece", at)
         dialog_up = self._wait_for_dialog(
-            baseline, float(self.config.get("jigsaw_action_delay", 0.08)) * 0.6,
+            baseline, float(self.config.get("jigsaw_discard_dialog_min", 0.0)),
             click_again=lambda: self._right_click_current_position("Discard jigsaw piece (again)", at))
         if not self.running:
             return   # stopped while waiting: leave the dialog alone
@@ -1887,23 +1920,36 @@ class JigsawBot:
         # "Discard this piece?" again, and that new dialog then blocked every
         # crate click for 10 s (diag 20261122_002413). So the piece gets time
         # to go, and a second confirm goes out only on a dialog that is
-        # really still open.
+        # really still open. That is checked when this window's next round
+        # starts (_finish_discard_check), before anything else is clicked
+        # there: waiting for it here held the one mouse ~130 ms per discard
+        # while the other windows had nothing to do (diag 20261122_132850).
         timeout = float(self.config.get("jigsaw_discard_gone_timeout", 1.0))
-        poll = max(0.02, float(self.config.get("jigsaw_piece_detection_retry_delay", 0.20)) * 0.5)
-        deadline = time.perf_counter() + timeout
+        self._discard_check = (cursor_rel, baseline, watch, time.perf_counter() + timeout)
+
+    def _finish_discard_check(self) -> None:
+        """The check _discard_piece left for the start of the next round
+        (input_lock held): the discarded piece must have left the cursor; if
+        not, the discard dialog is confirmed again only when it is really
+        still open, else the hand is looked at (``_check_hand``)."""
+        pending, self._discard_check = self._discard_check, None
+        if pending is None or self.dry_run or not self.running:
+            return
+        cursor_rel, baseline, watch, deadline = pending
         while True:
-            time.sleep(poll)
-            if not self.running:
-                return
             if self._detect_cursor_piece(cursor_rel).piece_id is None:
                 return
             if time.perf_counter() >= deadline:
                 break
+            time.sleep(self._PIECE_POLL)
+            if not self.running:
+                return
         # Still held. The watched Confirm area must be clear of the piece to
         # tell whether the dialog is there.
         if watch is not None:
             self._move_held_piece(watch)
         if baseline is not None and dialog_watch.still_up(self._dialog_grab, self.confirm_button_pos, baseline):
+            self._click_lost("discard dialog still open after its Yes")
             self._status("The discard dialog is still open; confirming again")
             self._click_window_point(self.confirm_button_pos, "Confirm discard again", park_at=cursor_rel)
         else:
@@ -2014,7 +2060,9 @@ class JigsawBot:
                      tag=self.diag_tag)
             time.sleep(max(0.0, minimum))
             return False
-        timeout = float(self.config.get("jigsaw_dialog_wait_timeout", 0.6))
+        # Real client: every dialog that came at all was there within 45 ms
+        # (1800 waits, diag 20261122_132850); a lost click cost the full wait.
+        timeout = float(self.config.get("jigsaw_dialog_wait_timeout", 0.3))
         if self._dialog_up_within(baseline, timeout, "dialog", minimum):
             self._confirm_clear = baseline   # a dialog came up over it: it was clear
             return True
@@ -2024,6 +2072,7 @@ class JigsawBot:
         if click_again is not None:
             diag.log("DECISION", f"dialog not up within {timeout:.2f}s: the click was not taken, clicking again",
                      tag=self.diag_tag)
+            self._click_lost("no dialog after the click")
             click_again()
             if not self.running:
                 return False
@@ -2124,6 +2173,8 @@ class JigsawBot:
         if self._place_dialog_still_up():
             # The "Place the piece here?" came later than its wait: it is
             # answered, not clicked through (a board click behind it does nothing).
+            if self._last_place_confirmed:
+                self._click_lost("placement dialog still open after its Yes")
             self._status("The placement dialog is still open; confirming it")
             retry_sent = self._click_window_point(self.confirm_button_pos, "Confirm placement (late dialog)",
                                                   park_at=cursor_rel)
@@ -2390,6 +2441,9 @@ class JigsawBot:
         """A new run starts from the saved settings (the GUI passes them)."""
         with cls._learned_lock:
             cls._learned_settings.clear()
+        with JigsawBot._pace_lock:
+            JigsawBot._careful_left = 0    # each run starts with the quick clicks
+            JigsawBot._quick_since_loss = None
 
     def _result_ok_point(self) -> Optional[Tuple[int, int]]:
         """The saved OK point of the result dialog, if it belongs to this
@@ -2478,7 +2532,7 @@ class JigsawBot:
     def _check_result_gone(self, before: np.ndarray, point: Tuple[int, int]) -> None:
         """After the OK click: the dialog gone means the button was the OK
         (remembered for the next board); still there, it is clicked once more."""
-        deadline = time.perf_counter() + float(self.config.get("jigsaw_dialog_wait_timeout", 0.6)) * 2
+        deadline = time.perf_counter() + float(self.config.get("jigsaw_result_gone_timeout", 1.2))
         while self.running and time.perf_counter() < deadline:
             time.sleep(0.1)
             if self._pick_result_button(before, self._gray_window(), None) != point:
@@ -2505,7 +2559,9 @@ class JigsawBot:
             return parked
 
         cursor_settle = float(self.config.get("timing_cursor_settle", 0.008))
-        between_click_delay = float(self.config.get("jigsaw_crate_confirm_delay", 0.06))
+        # No fixed wait before the Yes: it goes out once the dialog is seen
+        # (dialog-sized change, drawn still for 3 reads).
+        between_click_delay = float(self.config.get("jigsaw_crate_confirm_delay", 0.0))
 
         with self._hold():
             if not self._focus():
@@ -2555,7 +2611,7 @@ class JigsawBot:
             self.human.move_to(parked_x, parked_y)
             if cursor_settle > 0:
                 self.human.sleep(cursor_settle)
-        piece_wait = float(self.config.get("jigsaw_post_crate_piece_wait", 0.05))
+        piece_wait = float(self.config.get("jigsaw_post_crate_piece_wait", 0.03))
         if piece_wait > 0:
             time.sleep(piece_wait)
         return parked
@@ -2584,6 +2640,7 @@ class JigsawBot:
             return None
 
     _PARK_SETTLE = 0.03     # seconds the game gets to redraw a held piece at the parked cursor
+    _PIECE_POLL = 0.03      # seconds between looks for the piece after a crate
     _SWITCH_SETTLE = 0.04   # seconds the game gets to track the cursor after a focus switch
 
     def _glide_to(self, x: int, y: int) -> None:
@@ -2591,11 +2648,66 @@ class JigsawBot:
         self.human.glide_to(x, y, self._glide)
 
     def _hover(self, switched: bool = False) -> None:
-        """The rest on the target before a press (see _press)."""
+        """The rest on the target before a press (see _press): short in the
+        window that had the focus already, longer right after a focus switch
+        or while the careful timing is on (_click_lost)."""
         cursor_settle = float(self.config.get("timing_cursor_settle", 0.008))
-        hover = max(cursor_settle, self._hover_settle, self._SWITCH_SETTLE if switched else 0.0)
+        careful = switched or self._careful_now()
+        base = self._careful_hover if careful else self._hover_settle
+        self._last_click_quick = not careful and base < self._careful_hover
+        hover = max(cursor_settle, base, self._SWITCH_SETTLE if switched else 0.0)
         if hover > 0:
             self.human.sleep(hover)
+
+    # Clicks sent with the careful timing after quick ones were lost; shared
+    # by the windows of a run (same game, same machine), reset per run. One
+    # lost click alone proves nothing (crate clicks were lost now and then
+    # with the careful timing too); a second one within LOSS_WINDOW quick
+    # clicks does.
+    CAREFUL_CLICKS = 200
+    LOSS_WINDOW = 50
+    _careful_left = 0
+    _quick_since_loss: Optional[int] = None   # quick clicks since the last lost one (None: none lost)
+    _pace_lock = threading.Lock()
+
+    @staticmethod
+    def _careful_now() -> bool:
+        return JigsawBot._careful_left > 0
+
+    def _count_click(self) -> None:
+        back = False
+        with JigsawBot._pace_lock:
+            if self._last_click_quick and JigsawBot._quick_since_loss is not None:
+                JigsawBot._quick_since_loss += 1
+            if JigsawBot._careful_left > 0:
+                JigsawBot._careful_left -= 1
+                back = JigsawBot._careful_left == 0
+        if back:
+            diag.log("DECISION", "careful click timing done: quick clicks again", tag=self.diag_tag)
+
+    def _click_lost(self, what: str) -> None:
+        """A click the game did not take (no dialog came, a dialog stayed
+        open). When it went out with the quick timing and another quick one
+        was lost shortly before, the next CAREFUL_CLICKS clicks of every
+        window use the careful timing."""
+        if not self._last_click_quick:
+            return
+        with JigsawBot._pace_lock:
+            recent = JigsawBot._quick_since_loss
+            JigsawBot._quick_since_loss = 0
+            careful = recent is not None and recent <= self.LOSS_WINDOW
+            if careful:
+                first = JigsawBot._careful_left <= 0
+                JigsawBot._careful_left = self.CAREFUL_CLICKS
+        if not careful:
+            diag.log("DECISION", f"{what}: a quick click was not taken (first one lately: timing kept)",
+                     tag=self.diag_tag)
+            return
+        diag.log("DECISION", f"{what}: another quick click was not taken ({recent} quick clicks after the "
+                             f"last) -> careful click timing for the next {self.CAREFUL_CLICKS} clicks",
+                 tag=self.diag_tag)
+        if first:
+            self._status("Quick clicks were not taken; clicking more slowly for a while")
 
     def _press(self, button: str = "left", switched: bool = False, hovered: bool = False) -> None:
         """Clicks where the cursor was just taken (input_lock held, window in
@@ -2608,7 +2720,9 @@ class JigsawBot:
         handled). ``hovered``: the caller already rested there (_hover)."""
         if not hovered:
             self._hover(switched)
-        self.human.click(button=button, hold=self._click_hold)
+        hold = self._click_hold if self._last_click_quick else max(self._click_hold, self._careful_hold)
+        self.human.click(button=button, hold=hold)
+        self._count_click()
         if self._release_settle > 0:
             self.human.sleep(self._release_settle)
 
@@ -2701,7 +2815,7 @@ class JigsawBot:
                 return
             if cursor_rel is not None:
                 self._restore_cursor(cursor_rel)
-            self._press(button="right")
+            self._press(button="right", switched=self._switched)
             if then_move_to is not None:
                 self._settle_held_piece_at(then_move_to)
 

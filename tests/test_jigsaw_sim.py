@@ -221,6 +221,8 @@ CONFIG = {
     # once (see Desktop.input_frame for one that reads the mouse per frame).
     "jigsaw_cursor_glide": 0.0,
     "jigsaw_click_hover": 0.0,
+    "jigsaw_click_hover_switch": 0.0,
+    "jigsaw_click_hold_careful": 0.0,
     "jigsaw_click_hold": 0.0,
     "jigsaw_click_release": 0.0,
 }

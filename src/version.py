@@ -1,7 +1,7 @@
 # Version configuration for MT2 Fishing Bot
 # Update this version number before each release
 
-VERSION = "2.0.4"
+VERSION = "2.0.5"
 
 # Version history:
 # 1.0.0 - Initial release with classic fishing support
@@ -20,3 +20,4 @@ VERSION = "2.0.4"
 # 2.0.3 - Golden Tuna dialog, dead and bait fish handling, fish selection tabs, Task Manager disguise,
 #         faster catches, drop fixes, smaller Windows exe
 # 2.0.4 - Jigsaw grid setup fixed on 1080p and larger screens
+# 2.0.5 - Mostly jigsaw fixes: puzzle window found by itself, much faster with several windows, placement and result dialogs; pause and drop fixes
