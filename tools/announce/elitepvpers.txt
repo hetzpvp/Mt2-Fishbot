@@ -1,21 +1,26 @@
-[CENTER][SIZE="5"][B]Fishing Bot v{{version}} — new release[/B][/SIZE]
+[CENTER][SIZE=5][B][FREE] MT2 Fish Bot {{version}} | Multi-Client | Minigame + Classic | Jigsaw Solver[/B][/SIZE]
+[SIZE=3][COLOR=Gray]Official client and most private servers[/COLOR][/SIZE][/CENTER]
 
-Free fishing-minigame and jigsaw bot for Metin2. No subscriptions, no licenses.[/CENTER]
+[url="https://www.youtube.com/watch?v=jJNG8R5lypU"]https://www.youtube.com/watch?v=jJNG8R5lypU[/url]
 
-[B]What's new in v{{version}}[/B]
-{{highlights}}
+A vision bot: it reads the screen and clicks like a player. It never touches the client, reads no memory and sends no packets. Timings are randomised.
+[I]No bot is risk-free. Use at your own risk.[/I]
 
-[B]Download[/B]
-{{downloads}}
+[B][SIZE=4]Features[/SIZE][/B]
+🎣 Fishing minigame and classic fishing
+🖥️ Up to 8 clients at once
+🐟 Automatic fish Keep / use / open / drop for every fish and item
+🧩 Fish jigsaw solver on all clients - [B]BETA[/B]
+⚡ Quick skip with horse or armor, bait on up to 8 hotkeys
+🐧 Linux support
 
-[B]Virus scan[/B]
-{{virustotal}}
+[B][SIZE=4]Free[/SIZE][/B]
+No key, no account, no subscription. The source is on GitHub.
 
-[B]Release information[/B]
-Version: {{version}}
-Release date: {{date}}
-Release page and checksums: [URL="{{release_url}}"]{{release_url}}[/URL]
-Source code: [URL="https://github.com/hetzpvp/Mt2-Fishbot"]GitHub[/URL]
-Linux setup: [URL="https://github.com/hetzpvp/Mt2-Fishbot/blob/main/docs/LINUX.md"]docs/LINUX.md[/URL]
+[B][SIZE=4]Setup[/SIZE][/B]
+Run as administrator and follow the built-in setup guide. It takes about 2 minutes.
 
-Bugs and questions: [URL="https://discord.gg/vZaHCRFqW7"]Discord server[/URL]
+[B]Github:[/B] [URL="https://github.com/hetzpvp/Mt2-Fishbot"]https://github.com/hetzpvp/Mt2-Fishbot[/URL]
+[B]Download:[/B] [URL="{{win_url}}"]{{win_url}}[/URL]{{mirror}}
+[B]VirusTotal:[/B] {{virustotal}}
+[B]Support Discord Sever:[/B] [URL="https://discord.gg/vZaHCRFqW7"]Discord[/URL]

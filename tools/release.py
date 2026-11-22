@@ -733,15 +733,19 @@ def render_announcement(kind, v, highlights, date, mediafire=None, virustotal=No
         downloads = "\n\n".join(dl)
         vt = f"View VirusTotal Results\n{virustotal}" if virustotal else "VirusTotal scan coming soon."
     else:
+        # The elitepvpers thread is a standing post (the user's template):
+        # version, Windows download and VirusTotal; no change list.
         hl = "[LIST]\n" + "\n".join(f"[*]{_plain(h)}" for h in highlights) + "\n[/LIST]"
         dl = [f'[URL="{win}"]Windows .exe[/URL] (run as administrator)',
               f'[URL="{lin}"]Linux binary[/URL] (game under Wine)']
         if mediafire:
             dl.append(f'[URL="{mediafire}"]Windows mirror (MediaFire)[/URL]')
         downloads = "[LIST]\n" + "\n".join(f"[*]{d}" for d in dl) + "\n[/LIST]"
-        vt = f'[URL="{virustotal}"]VirusTotal results[/URL]' if virustotal else "VirusTotal scan coming soon."
+        vt = f'[URL="{virustotal}"]{virustotal}[/URL]' if virustotal else "coming soon"
+    mirror = f'\n[B]Mirror (MediaFire):[/B] [URL="{mediafire}"]{mediafire}[/URL]' if mediafire else ""
     fields = {"version": v, "date": date, "highlights": hl, "downloads": downloads,
-              "virustotal": vt, "release_url": release_url}
+              "virustotal": vt, "release_url": release_url, "win_url": win, "linux_url": lin,
+              "mirror": mirror if kind != "discord" else ""}
     text = re.sub(r"\{\{(\w+)\}\}", lambda m: fields[m.group(1)], template)
     return text.rstrip() + "\n"
 

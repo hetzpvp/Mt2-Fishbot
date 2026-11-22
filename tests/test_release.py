@@ -105,15 +105,27 @@ def test_announce_highlights_come_from_whats_new():
 def test_announcements_fill_every_placeholder(kind):
     hl = release.notes_highlights(NOTES)
     text = release.render_announcement(kind, V, hl, "21/11/2026")
-    assert "{{" not in text and V in text and "21/11/2026" in text
+    assert "{{" not in text and V in text
     assert release.asset_url(V, release.win_asset(V)) in text
-    assert release.asset_url(V, release.linux_asset(V)) in text
-    assert "Golden Tuna" in text and "coming soon" in text
+    assert "coming soon" in text
     with_links = release.render_announcement(kind, V, hl, "21/11/2026",
                                              mediafire="https://mf.example/x", virustotal="https://vt.example/y")
     assert "https://mf.example/x" in with_links and "https://vt.example/y" in with_links
-    if kind == "elitepvpers":
-        assert "**" not in text and "[*]Golden Tuna dialog handled" in text
+    if kind == "discord":
+        assert "21/11/2026" in text and "Golden Tuna" in text
+        assert release.asset_url(V, release.linux_asset(V)) in text
+
+
+def test_elitepvpers_is_the_standing_thread_post():
+    # The user's thread template (2026-11-22): title with the version, the
+    # Windows download, VirusTotal; no change list, no mirror line unless given.
+    text = release.render_announcement("elitepvpers", V, release.notes_highlights(NOTES), "21/11/2026")
+    assert text.startswith(f"[CENTER][SIZE=5][B][FREE] MT2 Fish Bot {V} | Multi-Client")
+    win = release.asset_url(V, release.win_asset(V))
+    assert f'[B]Download:[/B] [URL="{win}"]{win}[/URL]\n[B]VirusTotal:[/B] coming soon\n' in text
+    assert "Golden Tuna" not in text and "Mirror" not in text
+    vt = release.render_announcement("elitepvpers", V, [], "x", virustotal="https://vt.example/y")
+    assert '[B]VirusTotal:[/B] [URL="https://vt.example/y"]https://vt.example/y[/URL]' in vt
 
 
 def _png_with_text(path, key=None, value=None):
