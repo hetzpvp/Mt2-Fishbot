@@ -57,6 +57,12 @@ class ClassicScaleRotationTests(unittest.TestCase):
         bot._last_frame_usable = True
         return bot
 
+    @staticmethod
+    def _per_scale():
+        """Pictures matched at one scale (the icon, and the bite bubble)."""
+        cache = FishingBot._classic_fish_scaled_cache
+        return max(sum(1 for st in cache if st[0] == scale) for scale in {st[0] for st in cache})
+
     def _wait(self, bot, timeout=3.0):
         calls = []
         real = cv2.matchTemplate
@@ -89,7 +95,8 @@ class ClassicScaleRotationTests(unittest.TestCase):
         self.assertTrue(found)
         others = len(FishingBot._classic_fish_scaled_cache) - 1
         self.assertLessEqual(self.polls, math.ceil(others / FishingBot._CLASSIC_ROTATING_SCALES))
-        self.assertTrue(all(n <= 1 + FishingBot._CLASSIC_ROTATING_SCALES for n in per_poll), per_poll)
+        self.assertTrue(all(n <= self._per_scale() + FishingBot._CLASSIC_ROTATING_SCALES for n in per_poll),
+                        per_poll)
         self.assertEqual(FishingBot._classic_fish_last_scale, 1.4)
 
     def test_every_scale_is_tried_while_the_icon_is_missing(self):
@@ -97,9 +104,10 @@ class ClassicScaleRotationTests(unittest.TestCase):
         bot = self._bot(None)
         found, per_poll = self._wait(bot, timeout=0.6)
         self.assertFalse(found)
-        self.assertTrue(all(n <= 1 + FishingBot._CLASSIC_ROTATING_SCALES for n in per_poll), per_poll)
+        self.assertTrue(all(n <= self._per_scale() + FishingBot._CLASSIC_ROTATING_SCALES for n in per_poll),
+                        per_poll)
         self.assertGreater(self.polls, 6)
-        fitting = {t.shape for _, w, h, t in FishingBot._classic_fish_scaled_cache if h <= 360 and w <= 250}
+        fitting = {t.shape for _, w, h, t, _b in FishingBot._classic_fish_scaled_cache if h <= 360 and w <= 250}
         self.assertEqual(self.shapes, fitting)
 
     def test_windows_with_different_scales_keep_their_own(self):

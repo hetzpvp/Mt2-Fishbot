@@ -4,6 +4,7 @@ Automation loop for the Metin2 Fishing Jigsaw event minigame.
 
 from __future__ import annotations
 
+import math
 import os
 import threading
 import time
@@ -329,6 +330,14 @@ class JigsawBot:
         self._discard_streak = 0        # rounds in a row that ended in a discard of any kind
         self._suspect_mask = 0          # cells a refused placement aimed at: treated as filled
         self._suspect_board = 0         # the board read when they became suspect
+        # Servers differ in how the click becomes a placement (see
+        # _note_landing_shift and _bbox_refusal). Both are learned from what
+        # the game does, per window and per run, and change nothing on a
+        # server that places pieces where they are aimed.
+        self._landing_shift_seen: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
+        self._landing_correction: Dict[Tuple[int, int], Tuple[int, int]] = {}
+        self._bbox_fit = False          # this client wants a piece's whole bounding box free
+        self._bbox_disproven = False    # a piece was accepted with a filled cell in its bounding box
         self._last_click_sent = False   # the last _click_window_point really clicked
         self._result_baseline = None    # {OK point: its area with no dialog up} (taken before a crate)
         self._last_placement_matched = False   # the last placement showed up exactly as predicted
@@ -831,6 +840,12 @@ class JigsawBot:
                     # comes after all is confirmed by the next round's check.
                     if self._crate_dialog_seen is False:
                         self._no_dialog_rounds += 1
+                        # A piece already on the cursor is the other reason a
+                        # crate does not open: the window ignores crate clicks
+                        # while one is held (servers re-send a piece kept
+                        # through a relog). The next round looks for it and
+                        # plays it before trying a crate again.
+                        self._check_hand = self._current_cursor_relative()
                     limit = int(self.config.get("jigsaw_max_unopened_crates", 3))
                     if limit > 0 and self._no_dialog_rounds >= limit:
                         self._no_dialog_rounds = 0
@@ -1732,6 +1747,11 @@ class JigsawBot:
                     "chosen_action": action,
                     "candidates": candidates,
                 }
+            if self._bbox_fit and self._bbox_blocked(grid.board_mask, self._cells_for_action(action, spec)):
+                action = self._best_bbox_action(grid.board_mask, spec)
+                if action is None:
+                    return JigsawActionResult("discard", reason="no placement with a free bounding box"), {
+                        "candidates": candidates}
             target = self._target_for_action(grid, action, spec)
             cells = self._cells_for_action(action, spec)
             if DEBUG_PRINTS or diag.ENABLED:
@@ -1758,6 +1778,45 @@ class JigsawBot:
             "placement_cells": cells,
             "candidates": candidates,
         }
+
+    @staticmethod
+    def _cell_bit(cell: int) -> int:
+        """The board-mask bit of cell ``row * 6 + col`` (see _cells_for_action)."""
+        row, col = divmod(cell, 6)
+        return (1 << (N * 6 - 1)) >> (col * N + row)
+
+    @classmethod
+    def _mask_cells(cls, mask: int) -> List[int]:
+        return [cell for cell in range(N * 6) if mask & cls._cell_bit(cell)]
+
+    @staticmethod
+    def _bbox_cells(cells: Iterable[int]) -> List[int]:
+        cells = list(cells)
+        if not cells:
+            return []
+        rows = [c // 6 for c in cells]
+        cols = [c % 6 for c in cells]
+        return [r * 6 + c for r in range(min(rows), max(rows) + 1) for c in range(min(cols), max(cols) + 1)]
+
+    @classmethod
+    def _bbox_blocked(cls, board: int, cells: Iterable[int]) -> bool:
+        """A cell of the piece's bounding box that is not one of its own
+        cells is filled (an L, mirrored L or Z fitted against a neighbour)."""
+        cells = list(cells)
+        own = set(cells)
+        return any(board & cls._cell_bit(c) for c in cls._bbox_cells(cells) if c not in own)
+
+    def _best_bbox_action(self, board: int, spec: PieceSpec) -> Optional[int]:
+        """The solver's best move among those this client takes (whole
+        bounding box free), or None when skipping ranks better or none fits.
+        The solver's values assume the real-cell rule, so this is a close
+        approximation, not an exact optimum."""
+        for item in self.solver.rank_actions(board, spec.figure_index, include_skip=True):
+            if item.is_skip:
+                return None
+            if not self._bbox_blocked(board, self._cells_for_action(item.action, spec)):
+                return item.action
+        return None
 
     def _best_special_action(self, board: int, spec: PieceSpec) -> Optional[int]:
         if DEBUG_PRINTS or diag.ENABLED:
@@ -2149,6 +2208,7 @@ class JigsawBot:
             diag.image("jigsaw_placement_not_seen", self.capture_full_window(), tag=self.diag_tag,
                        note=f"decision {decision}")
         if matched:
+            self._note_exact_landing(before, expected)
             self._unverified_streak = 0
             self._refused_streak = 0
             self._last_placement_matched = True
@@ -2163,6 +2223,8 @@ class JigsawBot:
             # Something changed, just not exactly as predicted (effect still
             # playing, board cleared after completion): the next round reads
             # the board again and works from what is really there.
+            if grid is not None and grid.grid_found:
+                self._note_landing_shift(before, expected, grid.board_mask)
             self._unverified_streak = 0
             return True
 
@@ -2185,6 +2247,10 @@ class JigsawBot:
             retry_sent = self._place_click(decision.target, "Place jigsaw piece (retry)", cursor_rel)
         grid, matched = self._await_board(expected, timeout)
         self._last_placement_matched = matched
+        if matched:
+            self._note_exact_landing(before, expected)
+        elif grid is not None and grid.grid_found and grid.board_mask != before:
+            self._note_landing_shift(before, expected, grid.board_mask)
         if matched or grid is None or not grid.grid_found or grid.board_mask != before:
             self._unverified_streak = 0
             return True
@@ -2200,6 +2266,8 @@ class JigsawBot:
                                  f"retry={retry_sent}, piece seen={piece.piece_id}): no cell marked suspect, "
                                  f"hand checked next round", tag=self.diag_tag)
             self._check_hand = cursor_rel
+            return False
+        if piece.piece_id is not None and self._bbox_refusal(before, expected, cursor_rel):
             return False
         if piece.piece_id is not None:
             # The game refused: at least one of the target cells is filled
@@ -2229,6 +2297,95 @@ class JigsawBot:
                            else "re-align the grid with Define Grid"))
         return False
 
+    _SHIFT_CONFIRMATIONS = 2   # same shifted landing in a row before the aim is corrected
+    _SHIFT_MAX = 2             # cells the learned correction may reach per axis
+
+    @staticmethod
+    def _size_of(cells: List[int]) -> Tuple[int, int]:
+        rows = [c // 6 for c in cells]
+        cols = [c % 6 for c in cells]
+        return (max(cols) - min(cols) + 1, max(rows) - min(rows) + 1)
+
+    def _note_exact_landing(self, before: int, expected: int) -> None:
+        """A piece landed where it was aimed: the shifts seen for its size
+        were not the rule. A bounding box with a filled cell that was
+        accepted shows this client judges real cells."""
+        cells = self._mask_cells(expected & ~before)
+        if not cells:
+            return
+        self._landing_shift_seen.pop(self._size_of(cells), None)
+        if not self._bbox_disproven and self._bbox_blocked(before, cells):
+            self._bbox_disproven = True
+            if self._bbox_fit:
+                self._bbox_fit = False
+            diag.log("DECISION", "a piece was accepted with a filled cell in its bounding box: this client "
+                                 "judges the real cells", tag=self.diag_tag)
+
+    def _note_landing_shift(self, before: int, expected: int, now: int) -> None:
+        """The board changed, not as predicted. When the new cells are the
+        aimed ones moved by one cell (some clients place a 3-wide piece one
+        column right of where it is drawn), that is noted for the piece's
+        size; the same shift twice in a row corrects the aim for that size."""
+        want = self._mask_cells(expected & ~before)
+        got = set(self._mask_cells(now & ~before))
+        if not want or len(got) != len(want) or now & before != before:
+            return
+        shift = None
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if (dc, dr) == (0, 0):
+                    continue
+                moved = set()
+                for cell in want:
+                    r, c = cell // 6 + dr, cell % 6 + dc
+                    if not (0 <= r < N and 0 <= c < 6):
+                        break
+                    moved.add(r * 6 + c)
+                else:
+                    if moved == got:
+                        shift = (dc, dr)
+        if shift is None:
+            return
+        size = self._size_of(want)
+        seen = self._landing_shift_seen.setdefault(size, [])
+        seen.append(shift)
+        del seen[:-self._SHIFT_CONFIRMATIONS]
+        diag.log("DECISION", f"piece of size {size[0]}x{size[1]} landed shifted by {shift} (cols, rows) from "
+                             f"where it was aimed ({len(seen)} in a row)", tag=self.diag_tag)
+        if len(seen) < self._SHIFT_CONFIRMATIONS or len(set(seen)) != 1:
+            return
+        old = self._landing_correction.get(size, (0, 0))
+        new = (max(-self._SHIFT_MAX, min(self._SHIFT_MAX, old[0] + shift[0])),
+               max(-self._SHIFT_MAX, min(self._SHIFT_MAX, old[1] + shift[1])))
+        if new == (0, 0):
+            self._landing_correction.pop(size, None)
+        else:
+            self._landing_correction[size] = new
+        self._landing_shift_seen.pop(size, None)
+        diag.log("DECISION", f"aim for {size[0]}x{size[1]} pieces corrected by {new} cells: this client "
+                             f"places them shifted", tag=self.diag_tag)
+        self._status(f"Pieces of size {size[0]}x{size[1]} land shifted on this client; correcting the aim")
+
+    def _bbox_refusal(self, before: int, expected: int, cursor_rel: Optional[Tuple[int, int]]) -> bool:
+        """A placement was refused with the piece still on the cursor. On
+        some clients an L, mirrored L or Z is only taken when its whole
+        bounding box is free, although the server needs only its own cells.
+        When the refused piece's box had a filled cell (and no piece was ever
+        accepted like that), that is taken as the reason: the bot plays the
+        held piece again with that rule instead of discarding it and marking
+        cells that are really empty as filled. Returns True when handled."""
+        cells = self._mask_cells(expected & ~before)
+        if self._bbox_disproven or self._bbox_fit or not cells or not self._bbox_blocked(before, cells):
+            return False   # (already playing by that rule: something else is wrong)
+        self._refused_streak += 1
+        self._bbox_fit = True
+        diag.log("DECISION", f"placement refused with a filled cell in the piece's bounding box "
+                             f"({self._refused_streak} refused in a row): this client wants the whole box "
+                             f"free; playing the held piece again with that rule", tag=self.diag_tag)
+        self._status("This game client only takes a piece whose whole box is free; adjusting")
+        self._check_hand = cursor_rel
+        return True
+
     # Where the game holds each piece, in cells from the piece's top-left
     # corner: it draws the piece at that offset from the cursor and, on the
     # click, snaps the piece's top-left corner to the nearest cell. Measured
@@ -2237,14 +2394,16 @@ class JigsawBot:
     # line of 3 (middle cell) and the Z (1.25 cells in, top row). Clicking
     # the middle of the piece's outline instead put the Z half a cell too
     # low: the game snapped it a row down, "the piece does not fit there",
-    # every time; the 2x2 pieces sat right on a snapping boundary.
+    # every time; the 2x2 pieces sat right on a snapping boundary. The
+    # special 3x2 piece is held like the Z: the same cursor offset in every
+    # client implementation read (2026-11-25), though not measured in game.
     _HOTSPOTS = {0: (0.5, 0.5), 1: (0.5, 1.5), 2: (0.5, 0.5), 3: (0.5, 0.5), 4: (0.5, 0.5), 5: (1.25, 0.5)}
 
     def _piece_hotspot(self, spec: Optional[PieceSpec], width: int, height: int) -> Tuple[float, float]:
         if spec is not None and spec.figure_index in self._HOTSPOTS:
             return self._HOTSPOTS[spec.figure_index]
         if (width, height) == (3, 2):
-            return self._HOTSPOTS[5]      # the special 3x2 piece: assumed held like the Z (not measured)
+            return self._HOTSPOTS[5]      # the special 3x2 piece: held like the Z
         return (width / 2.0, height / 2.0)
 
     def _target_for_action(self, grid: JigsawGridResult, action: int, spec: Optional[PieceSpec] = None) -> Optional[Tuple[int, int]]:
@@ -2267,7 +2426,16 @@ class JigsawBot:
 
         if grid.grid_bounds is not None:
             gx, gy, gw, gh = grid.grid_bounds
-            hx, hy = self._piece_hotspot(spec, max_col - min_col + 1, max_row - min_row + 1)
+            size = (max_col - min_col + 1, max_row - min_row + 1)
+            hx, hy = self._piece_hotspot(spec, *size)
+            shift = self._landing_correction.get(size)
+            if shift:
+                # This client lands pieces of this size shifted: aim that
+                # much the other way, at the middle of a cell (a client that
+                # snaps by the cell under the cursor is the usual cause), and
+                # never off the board.
+                hx = min(max(math.floor(hx - shift[0]) + 0.5, 0.5 - min_col), 5.5 - min_col)
+                hy = min(max(math.floor(hy - shift[1]) + 0.5, 0.5 - min_row), 3.5 - min_row)
             return (int(round(gx + (min_col + hx) * gw / 6.0)), int(round(gy + (min_row + hy) * gh / 4.0)))
 
         # No bounds: derive the same point from the cell centers.
@@ -2533,13 +2701,24 @@ class JigsawBot:
         """After the OK click: the dialog gone means the button was the OK
         (remembered for the next board); still there, it is clicked once more."""
         deadline = time.perf_counter() + float(self.config.get("jigsaw_result_gone_timeout", 1.2))
+        clear = 0
         while self.running and time.perf_counter() < deadline:
             time.sleep(0.1)
-            if self._pick_result_button(before, self._gray_window(), None) != point:
+            pick = self._pick_result_button(before, self._gray_window(), None)
+            # Gone means no dialog anywhere, twice: another button still seen
+            # is the dialog still up (real run 2026-11-26: the click missed the
+            # OK, the finder then saw the real OK, and the missed point was
+            # saved as the OK for every later board and run).
+            clear = clear + 1 if pick is None else 0
+            if clear >= 2:
                 # It was the OK: kept, and only that spot is watched from now on
                 self._learned_result_point = point
                 self._learn_setting("jigsaw_result_button_pos", [int(point[0]), int(point[1])])
                 self._remember_result_size()
+                return
+            if pick is not None and pick != point:
+                diag.log("DECISION", f"result dialog still up after the click at {point} (a button at {pick}): "
+                                     "not learned", tag=self.diag_tag)
                 return
         if self.running:
             diag.log("DECISION", f"result dialog still up after the OK click at {point}: clicking again",

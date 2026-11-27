@@ -376,6 +376,28 @@ class PageSwitchTests(unittest.TestCase):
         screen.render()
         self.assertEqual(screen.page, 0)
 
+    def test_two_tabs_a_dead_spot_on_the_tab_is_clicked_around(self):
+        """Trailer take 2026-11-27 (fish client): a click right on tab I's
+        label never switched the page, 10 px beside it always did. The bot
+        re-clicked the same spot and then used page II as page I."""
+        screen = InventoryScreen(dead_spots=[InventoryScreen.TABS[1]])
+        item = cv2.imread(os.path.join(ROOT, "assets", "fishing", "Carp_living.jpg"))
+        screen.fill(0, 8, item)                                       # page 1: 37 empty, page 2: 45
+        screen.page = 1
+        bot = self._two_tab_bot(screen)
+        self.assertTrue(bot._goto_page(screen.TABS[1], settle=0.05))
+        screen.render()
+        self.assertEqual(screen.page, 0)
+        # the spot that worked is used straight away next time
+        bot._goto_page(screen.TABS[2], settle=0.05)
+        screen.render()
+        self.assertEqual(screen.page, 1)
+        clicks = len(screen.tab_clicks)
+        self.assertTrue(bot._goto_page(screen.TABS[1], settle=0.05))
+        screen.render()
+        self.assertEqual(screen.page, 0)
+        self.assertEqual(len(screen.tab_clicks), clicks + 1)
+
     def test_two_tabs_a_click_that_worked_is_not_repeated(self):
         screen = InventoryScreen()
         item = cv2.imread(os.path.join(ROOT, "assets", "fishing", "Carp_living.jpg"))
@@ -386,11 +408,15 @@ class PageSwitchTests(unittest.TestCase):
         screen.render()
         self.assertEqual(screen.page, 1)
 
-    def test_two_tabs_pages_that_look_alike_cost_one_harmless_click(self):
+    def test_two_tabs_pages_that_look_alike_cost_three_harmless_clicks(self):
+        """Nothing tells a missed click from a page that looks the same: the
+        tab is clicked again, then beside it on both sides (a label may
+        swallow clicks), all on the same tab."""
         screen = InventoryScreen()                                    # both pages empty
         bot = self._two_tab_bot(screen)
         self.assertTrue(bot._goto_page(screen.TABS[2], settle=0.05))
-        self.assertEqual(screen.tab_clicks, [2, 2])
+        self.assertEqual(screen.tab_clicks, [2, 2, 2, 2])
+        self.assertEqual(bot._tab_click_spot, {})                     # nothing learned from it
         screen.render()
         self.assertEqual(screen.page, 1)
 

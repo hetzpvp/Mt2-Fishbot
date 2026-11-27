@@ -226,6 +226,33 @@ class MinigameMountRecoveryTests(unittest.TestCase):
         self.assertEqual(ctrl, [])
         self.assertEqual(drops, [5])
 
+    @staticmethod
+    def _pause_briefly(bot):
+        """Paused when the loop starts, resumed 0.3 s later (the resume path runs)."""
+        bot.paused = True
+        threading.Timer(0.3, lambda: setattr(bot, "paused", False)).start()
+
+    def test_a_lost_second_ctrl_g_survives_a_pause(self):
+        """Trailer take 2026-11-27: F5 came between the quick skip's two
+        CTRL+G presses. The resume forgot the quick skip, the character
+        stayed on the horse, and every cast after it missed."""
+        bot = _minigame_bot()
+        bot._qs_second_lost = True
+        bot._quickskip_unchecked = True
+        self._pause_briefly(bot)
+        casts, ctrl, drops = self._run(bot, [False, True])
+        self.assertEqual(ctrl, ["g"])
+        self.assertEqual(drops, [])
+        self.assertFalse(bot._qs_second_lost)
+
+    def test_a_plain_pause_gets_no_recovery_ctrl_g(self):
+        bot = _minigame_bot()
+        bot._quickskip_unchecked = True       # forgotten by the resume: the player had the controls
+        self._pause_briefly(bot)
+        casts, ctrl, drops = self._run(bot, [False] * 20)
+        self.assertEqual(ctrl, [])
+        self.assertEqual(drops, [5])
+
     def test_no_ctrl_g_without_the_horse_quick_skip(self):
         for qs, mode in ((False, "horse"), (True, "armor")):
             bot = _minigame_bot(quick_skip=qs, mode=mode)

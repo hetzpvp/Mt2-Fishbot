@@ -1,0 +1,25 @@
+{
+ "source": "real classic client (metin2-local-server classic instance, M2Dev), 800x600, area map closed; crop = the strip wait_for_classic_fish reads (x 275-525, top half)",
+ "bite": {
+  "bite_1.png": true,
+  "bite_2.png": true,
+  "bite_3.png": true,
+  "bite_4.png": true,
+  "nobite_1.png": false,
+  "nobite_2.png": false,
+  "nobite_3.png": false,
+  "nobite_4.png": false,
+  "nobite_5.png": false,
+  "nobite_6.png": false,
+  "nobite_7.png": false,
+  "nobite_8.png": false,
+  "neighbour_bite_W1.png": false,
+  "neighbour_bite_W2.png": false,
+  "neighbour_bite_W3.png": false,
+  "moon_W4.png": false,
+  "glow_W2.png": false
+ },
+ "neighbour_note": "neighbour_bite_W*.png: frames where the bot reeled in although its own character had no bite (W3 had no rod); four characters stood on the same spot, so these show the other characters' name tags / bubbles. The bot must not take them for its own bite.",
+ "moon_note": "moon_W4.png: real-client test run 2026-11-26, character at the end of the pier: the moon in the night sky matched the bubble picture at 0.74 (a white disc with no icon inside) and the bot reeled in on it.",
+ "glow_note": "glow_W2.png: real-client run 2026-11-26, character without a rod: a small white glow in front of the dock matched the bubble picture at 0.71; it does not fill the bubble's disc."
+}

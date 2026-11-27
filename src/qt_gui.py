@@ -64,6 +64,10 @@ import dialog_watch  # noqa: E402
 import disguise  # noqa: E402
 import inventory_layout  # noqa: E402
 import setup_checks  # noqa: E402
+import session_setup  # noqa: E402
+from session_setup import (  # noqa: E402
+    BAIT_DISPLAY, DEAD_DISPLAY, FISH_DISPLAY, ITEM_DISPLAY, default_fish_action,
+)
 from window_manager import WindowManager, window_size_mismatch  # noqa: E402
 import help_visuals  # noqa: E402
 from input_backend import probe_backend, probed_backend_info  # noqa: E402
@@ -3263,71 +3267,8 @@ class SettingsTab(QWidget):
 # Modals
 # ============================================================================
 
-FISH_DISPLAY: List[Tuple[str, str, str]] = [
-    # (display_name, asset_basename, fallback text; empty: the name's first letter)
-    ("Aal", "Aal_living.jpg", ""),
-    ("Ayu", "Ayu_living.jpg", ""),
-    ("Barsch", "Barsch_living.jpg", ""),
-    ("Brookforel", "Brookforell_living.jpg", ""),
-    ("Carp", "Carp_living.jpg", ""),
-    ("Catfish", "Catsfish_living.jpg", ""),
-    ("Crab", "Crab_living.jpg", ""),
-    ("Goldfish", "Goldfish_living.jpg", ""),
-    ("Grasscarp", "Grasscarp_living.jpg", ""),
-    ("Large zander", "Large_zander_living.jpg", ""),
-    ("Lotusfish", "Lotusfish_living.jpg", ""),
-    ("Mandarinfish", "Mandarinfish_living.jpg", ""),
-    ("Mirrorcarp", "Mirrorcarp_living.jpg", ""),
-    ("Rainbowfish", "Rainbowforell_living.jpg", ""),
-    ("Redfeather", "Redfeather_living.jpg", ""),
-    ("Riverforel", "Riverforell_living.jpg", ""),
-    ("Salmon", "Salmon_living.jpg", ""),
-    ("Shiri", "Shiri_living.jpg", ""),
-    ("Skygazer", "Skygazer_living.jpg", ""),
-    ("Snake head", "Snake_head_living.jpg", ""),
-    ("Stint", "Stint_living.jpg", ""),
-    ("Tenchi", "Tenchi_living.jpg", ""),
-    ("Yabby", "Yabby_living.jpg", ""),
-    ("Zander", "Zander_living.jpg", ""),
-    ("Zebra", "Zebra_living.jpg", ""),
-]
-
-# Fish the game takes as bait (see utils.BAIT_FISH): keep, drop or use.
-BAIT_DISPLAY: List[Tuple[str, str, str]] = [
-    ("Shrimp", "Shrimp_living.jpg", ""),
-    ("Vai", "Vai_living.jpg", ""),
-]
-
-# The dead kind of each fish with a dead icon in assets/fishing. They get no
-# tile: a dead fish does what its living fish does (utils.dead_fish_action).
-# Grilled fish are recognized too (so they are never taken for dead ones)
-# and always kept.
-DEAD_DISPLAY: List[Tuple[str, str, str]] = [
-    (name, asset.replace("_living.jpg", "_dead.png"), emoji) for name, asset, emoji in FISH_DISPLAY + BAIT_DISPLAY
-    if os.path.exists(get_resource_path(asset.replace("_living.jpg", "_dead.png")))
-]
-
-ITEM_DISPLAY: List[Tuple[str, str, str]] = [
-    ("Black Dye", "Black_Dye_item.jpg", ""),
-    ("Bleach", "Bleach_item.jpg", ""),
-    ("Brown Dye", "Brown_Dye_item.jpg", ""),
-    ("Gold", "Gold_item.jpg", ""),
-    ("Goldring", "Goldring_item.jpg", ""),
-    ("Kelp Key", "Kelp_Key_item.jpg", ""),
-    ("Lucys ring", "Lucys_ring_item.jpg", ""),
-    ("Red Dye", "Red_Dye_item.jpg", ""),
-    ("Refugee cape", "Refugee_cape_item.jpg", ""),
-    ("Sage King Glove", "Sage_King_Glove_item.jpg", ""),
-    ("White Dye", "White_Dye_item.jpg", ""),
-    ("Wise Emperor symbol", "Symbol_wise_emperors_item.jpg", ""),
-    ("Yellow Dye", "Yellow_Dye_item.jpg", ""),
-]
-
-
-def default_fish_action(asset: str) -> str:
-    """What a fish / item not set yet starts as: bait fish are used as bait,
-    everything else is kept."""
-    return "use" if is_bait_fish(asset) else "keep"
+# The fish / item tables and default_fish_action live in session_setup.py
+# (shared with the real-client tests); imported at the top.
 
 
 def section_divider(text: str) -> QHBoxLayout:
@@ -5443,24 +5384,7 @@ class FishbotWindow(QMainWindow):
     }
 
     # Defaults that mirror the Tk version's TimingSettingsWindow.DEFAULTS
-    TIMING_DEFAULTS = {
-        "timing_cursor_settle":     0.012,
-        "timing_button_hold":       0.008,
-        "timing_post_click":        0.035,
-        "timing_human_min":         0.150,
-        "timing_human_max":         0.400,
-        "timing_key_hold":          0.025,
-        "timing_key_settle":        0.030,
-        "timing_cast_interkey":     0.050,
-        "timing_minigame_timeout":  6.000,
-        "timing_recast_wait":       4.000,
-        "timing_catch_wait":        0.400,
-        "timing_open_wait":         0.100,
-        "timing_dead_fish_check":   0.100,
-        "timing_drop_settle":       0.120,
-        "timing_quickskip_between": 0.100,
-        "timing_quickskip_after":   0.100,
-    }
+    TIMING_DEFAULTS = session_setup.TIMING_DEFAULTS
 
     def __init__(self):
         super().__init__()
@@ -5818,72 +5742,7 @@ class FishbotWindow(QMainWindow):
 
     # ---------------- Defaults ----------------
     def _default_config(self) -> dict:
-        cfg = {
-            "version": APP_VERSION,
-            "human_like_clicking": False,
-            "quick_skip": False,
-            "quick_skip_mode": "horse",
-            "golden_tuna": True,
-            "golden_tuna_choice": 1,
-            "sound_alert_on_finish": True,
-            "sound_on_pause": True,
-            "classic_fishing": False,
-            "classic_fishing_delay": 3.0,
-            "ui_mode": MODE_FISHING,
-            "ui_scale": "auto",
-            disguise.CONFIG_KEY: False,
-            "jigsaw_solver_enabled": False,
-            "jigsaw_crate_priority": "normal_first",
-            "jigsaw_detection_threshold": 0.80,
-            "jigsaw_action_delay": 0.15,
-            "jigsaw_debug_screenshots": False,
-            "jigsaw_dry_run": False,
-            "auto_fish_handling": False,
-            # Minigame detection: None = stock (official client) colors. A
-            # profile learned by self-calibration is stored here automatically;
-            # set it back to null to forget it.
-            "adaptive_detection": True,
-            # Shorten timing_recast_wait automatically while casts keep succeeding.
-            "adaptive_recast_wait": True,
-            # "auto" = per-window capture once verified, "screen" = always copy
-            # the screen, "window" = always per-window (no verification).
-            "capture_backend": "auto",
-            "detection_profile": None,
-            # Diagnostic log (Settings tab): one zip per run next to the program.
-            "diagnostics_enabled": False,
-            "diagnostics_record_screens": False,   # + a video of each game window in the log
-            "fish_actions": {},
-            "drop_button_pos": None,
-            "confirm_button_pos": None,
-            "armor_slot_pos": None,
-            "armor_slot_page": None,      # inventory page (1-8) the spare armor is on, read at capture
-            "accent_color": DEFAULT_ACCENT,
-            "rgb_wave_active": False,
-            "bait_keys": ["1", "2", "3", "4"],
-            "cast_key": "space",            # cast / reel in (Fishing tab)
-            "mount_key": "g",               # Ctrl+<key> mounts / dismounts (quick skip, classic misses; Fishing tab)
-            # Values a client may need changed that have no GUI field: kept
-            # in the file so they can be changed there.
-            "drop_ground_pos": None,        # window-relative drop spot; None = window center
-            "inventory_rows": 9,            # rows of an inventory page
-            "classic_miss_limit": 3,        # classic misses in a row before a bait key counts as empty
-            "timing_drop_dialog_timeout": 1.0,
-            "timing_minigame_timeout_cap": 60.0,   # longest bite wait after misses
-            "jigsaw_result_button_pos": None,      # None = lower middle of the window
-            "jigsaw_piece_detection_threshold": 0.60,
-            "jigsaw_inventory_crate_threshold": 0.72,
-            "bait_quantity": 200,
-            "bait": 800,
-            "selected_windows": [""] * MAX_WINDOWS,
-            # The setup wizard button pulses until that activity's wizard
-            # was opened once (first start / first switch to Jigsaw).
-            "wizard_done_fishing": False,
-            "wizard_done_jigsaw": False,
-        }
-        for p in range(1, 9):
-            cfg[f"inv_page_{p}_pos"] = None
-        cfg.update(self.TIMING_DEFAULTS)
-        return cfg
+        return session_setup.default_config(APP_VERSION, DEFAULT_ACCENT)
 
     # ---------------- Layout helpers ----------------
     def _build_footer(self) -> QFrame:
@@ -7279,11 +7138,8 @@ class FishbotWindow(QMainWindow):
 
         # Every fish/item gets an action the bot knows: unset or broken ones
         # (an empty action from an older version) are "keep"
-        actions = self.config.setdefault("fish_actions", {})
-        for asset in [a for _, a, _ in FISH_DISPLAY + BAIT_DISPLAY + ITEM_DISPLAY] + list(actions):
-            actions[asset] = normalize_fish_action(actions.get(asset, default_fish_action(asset)), asset)
         # The dead fish follow their living fish (no choice of their own)
-        self.config["fish_actions"] = with_dead_fish_actions(actions)
+        session_setup.complete_fish_actions(self.config)
 
         # Workers from the previous run must have exited, otherwise two bots
         # would drive the same window (and fight over the cursor). Wait at most
@@ -7309,9 +7165,7 @@ class FishbotWindow(QMainWindow):
         if FishingBot is not None:
             FishingBot.reset_session_state()   # nothing learned by the last run's windows carries over
 
-        cfg_for_bot = dict(self.config)
-        cfg_for_bot["bait_keys"] = bait_keys
-        cfg_for_bot["jigsaw_solver_enabled"] = False
+        cfg_for_bot = session_setup.fishing_session_config(self.config, bait_keys)
         self._begin_diag_session("fishing", selected, all_windows, cfg_for_bot)
         for i, name in selected:
             if name not in all_windows:

@@ -26,6 +26,7 @@ if getattr(sys, "frozen", False):
 import ctypes
 
 import diag
+from catch_timing import CatchTimingStats
 
 # Fix for high DPI displays (125%, 150%, etc.) where UI elements may be cut off
 try:
@@ -228,6 +229,7 @@ class FishingBot:
     # about half the empty slots on the rescaled client.
     _EMPTY_SLOT_THRESHOLD = 0.55
     _classic_fish_template = None  # Cache for classic fish detection template
+    _classic_bubble_template = None  # Cache for the bite bubble template (False: file missing)
     _classic_fish_scaled_cache = None  # Pre-computed scaled variants (shared across calls)
     _classic_fish_last_scale = None    # Last successful scale — tried first on next poll
     
@@ -440,6 +442,11 @@ class FishingBot:
         self._catch_baseline: Optional[np.ndarray] = None
         self._pending_bounds = None       # panel bounds awaiting a confirming frame
         self._longest_bite = 0.0          # longest cast->minigame delay seen (s)
+        self._longest_classic_bite = 0.0  # longest cast->bite icon delay seen (classic, s)
+        # Timing of the last game whose catch is not judged yet: (kind, seconds)
+        self._catch_timing: Optional[Tuple[str, float]] = None
+        self._classic_seen_at: Optional[float] = None   # when the last classic bite icon was captured
+        self.catch_timing_stats = CatchTimingStats()
         self._games_without_fish = 0      # learned profile sanity check
         self._fish_ever_seen = False      # the active profile has detected a fish this session
         self._minigame_ever_seen = False  # a minigame was played this session
@@ -486,6 +493,10 @@ class FishingBot:
         # second CTRL+G can have left the character mounted. Without one
         # the bot never mounted it, and a recovery CTRL+G would mount it.
         self._quickskip_unchecked = False
+        # The bot's own quick skip lost its second CTRL+G: the character is
+        # probably still on the horse. Kept over a pause (unlike the flags
+        # above): the player pausing does not dismount it.
+        self._qs_second_lost = False
         # Started with a minigame running: it is played first, the startup
         # inventory scan comes after it
         self._startup_scan_after_game = False
@@ -530,6 +541,7 @@ class FishingBot:
         self._tab_check_seen = False      # the active tab was recognized at least once
         self._tab_check_misses = 0        # waits in a row that timed out
         self._tab_check_off = False       # this client's tabs cannot be read: fixed wait
+        self._tab_click_spot = {}         # tab point -> a spot beside it that switches the page (label swallows clicks)
         self._fill_page_pending = False   # armor quick skip left another page on screen
         self._drop_failures = 0           # drops in a row that failed at a dialog step
         self._direct_yes_no_items = set() # last drop of this item was yes / no, with no Drop / Sell step
@@ -2169,6 +2181,25 @@ class FishingBot:
         except Exception:
             diag.exc("put back after the game", tag=self.diag_tag)
 
+    def _set_catch_timing(self, kind: str, seconds: float) -> None:
+        """The timing the bot controlled in the game just ended (classic:
+        reel after the bite; minigame: length of the game), kept until its
+        catch is judged (_judge_catch)."""
+        if self._catch_timing is not None:
+            diag.log("ANALYSIS", f"catch timing: the {self._catch_timing[0]} game before was never judged",
+                     tag=self.diag_tag)
+        self._catch_timing = (kind, seconds)
+
+    def _judge_catch(self, item: bool, what: str) -> None:
+        """The last game's catch is known: recorded against its timing."""
+        timing, self._catch_timing = self._catch_timing, None
+        if timing is None:
+            return
+        kind, seconds = timing
+        self.catch_timing_stats.record(kind, seconds, item)
+        diag.log("ANALYSIS", f"catch timing: {kind} {seconds:.2f}s -> {'item' if item else 'nothing'} ({what})",
+                 tag=self.diag_tag)
+
     def _defer_catch(self, may_have_catch: bool) -> None:
         """Right after a minigame: remembers the inventory as it is before
         the item lands. The item is handled after the quick skip, before the
@@ -2183,6 +2214,8 @@ class FishingBot:
         if self._pending_catch is not None:
             # The previous catch is not handled yet (a minigame already open
             # was played first): the older picture shows both as new.
+            # Which game gave what is not known: no timing recorded.
+            self._catch_timing = None
             baseline = self._pending_catch[0]
             may_have_catch = may_have_catch or self._pending_catch[1]
         self._pending_catch = (baseline if baseline is not None else self.capture_inventory_area(),
@@ -2490,14 +2523,16 @@ class FishingBot:
             self._restore_fill_page()   # may click a page tab
         if not self.config.get('auto_fish_handling', False):
             if not may_have_catch:
+                self._judge_catch(False, "no hit")
                 return  # nothing was caught: the inventory is as it was
             # Even without auto handling, track inventory fullness so page-switching works
             try:
                 if baseline is None:
                     baseline = self.capture_inventory_area()
-                inventory_frame, _ = self._wait_inventory_change(
+                inventory_frame, changed = self._wait_inventory_change(
                     cv2.cvtColor(baseline, cv2.COLOR_BGR2GRAY),
                     time.perf_counter() + self._t_catch_wait)
+                self._judge_catch(changed is not None, "inventory change")
                 if not self._page_has_space(inventory_frame, self._empty_slot_positions) and self.running:
                     diag.log("DECISION", "auto handling off, page full -> switch page", tag=self.diag_tag)
                     self._switch_inventory_page()
@@ -2508,6 +2543,7 @@ class FishingBot:
 
         fish_actions = self.config.get('fish_actions', {})
         if not fish_actions:
+            self._catch_timing = None   # not looked at: not judged
             return
 
         try:
@@ -2517,6 +2553,8 @@ class FishingBot:
                                                          defer_late=defer_late)
             if not match and self._late_watch is not None:
                 return   # watched for after the cast: judged there
+            if not self.running:
+                self._catch_timing = None
             if not match or not self.running:
                 diag.log("DECISION", f"no caught item to handle (match={match}, running={self.running})",
                          tag=self.diag_tag)
@@ -2525,16 +2563,21 @@ class FishingBot:
                 # An item the bot has no template for still takes a slot:
                 # without this check a page filled with unknown items is
                 # never left and later catches land where nobody looks.
+                if not may_have_catch:
+                    self._judge_catch(False, "no hit")
                 if may_have_catch and self.running:
                     before = len(self._empty_slot_positions)
                     has_space = self._page_has_space(inventory_frame, self._empty_slot_positions)
-                    self._note_unrecognized_catch(len(self._empty_slot_positions) < before)
+                    filled = len(self._empty_slot_positions) < before
+                    self._judge_catch(filled, "unrecognized item took a slot" if filled else "no new item")
+                    self._note_unrecognized_catch(filled)
                     if not has_space and self.running:
                         self._switch_page_when_free("unrecognized catch, page full")
                 return
 
             self._catches_recognized += 1
             self._unrecognized_in_a_row = 0
+            self._judge_catch(True, match[0])
 
             filename, (inv_x, inv_y) = match
             action = normalize_fish_action(fish_actions.get(filename), filename)
@@ -3590,6 +3633,25 @@ class FishingBot:
         grown = base * (1.5 ** min(self.consecutive_failures, 4))
         return min(max(base, learned, grown), max(base, self._t_bite_cap))
 
+    # Classic bite wait. The stock server bites 10-40 whole seconds after the
+    # cast, and a bite that comes after the wait gave up is read as a miss
+    # (then CTRL+G, which may mount the character). Other servers use other
+    # ranges, so the wait also follows the longest bite seen in this run.
+    _CLASSIC_BITE_TIMEOUT = 45.0
+    _CLASSIC_BITE_TIMEOUT_CAP = 180.0
+
+    def _classic_bite_timeout(self) -> float:
+        """How long to wait for the classic bite icon after a cast:
+        ``classic_bite_timeout`` (45 s), or longer when a bite this run came
+        late enough that the next one could fall outside it."""
+        try:
+            base = float(self.config.get('classic_bite_timeout', self._CLASSIC_BITE_TIMEOUT))
+        except (TypeError, ValueError):
+            base = self._CLASSIC_BITE_TIMEOUT
+        base = max(5.0, base)
+        learned = self._longest_classic_bite * 1.2 + 2.0 if self._longest_classic_bite else 0.0
+        return min(max(base, learned), max(base, self._CLASSIC_BITE_TIMEOUT_CAP))
+
     def _next_recast_wait(self) -> float:
         """Base wait before the next cast (quick skip off), remembered so the
         outcome of that cast can be fed back to the tuner."""
@@ -3764,6 +3826,16 @@ class FishingBot:
             return False
         return len(points) >= 3 and clicked in points.values()
 
+    def _click_tab_point(self, page_pos, spot) -> None:
+        """One more click for the tab at ``page_pos``, at window point ``spot``
+        (the remembered working spot when there is one and ``spot`` is the tab point)."""
+        if tuple(spot) == tuple(page_pos):
+            spot = self._tab_click_spot.get(tuple(int(v) for v in page_pos), tuple(page_pos))
+        with input_lock:
+            if self.running and self._focus(force=True):
+                win_left, win_top, _, _ = self.window_manager.get_window_rect()
+                self._click_page_tab(win_left + spot[0], win_top + spot[1])
+
     def _page_empty_slots(self) -> Optional[list]:
         """Empty slots on the page shown now (None when it cannot be captured)."""
         frame = self._grab(*self._inventory_rect())
@@ -3788,9 +3860,10 @@ class FishingBot:
             with input_lock:
                 if self._focus(force=True):
                     win_left, win_top, _, _ = self.window_manager.get_window_rect()
-                    diag.log("ACTION", f"inventory page tab at win={tuple(page_pos)} "
-                                       f"screen=({win_left + page_pos[0]},{win_top + page_pos[1]})", tag=self.diag_tag)
-                    self._click_page_tab(win_left + page_pos[0], win_top + page_pos[1])
+                    spot = self._tab_click_spot.get(tuple(int(v) for v in page_pos), tuple(page_pos))
+                    diag.log("ACTION", f"inventory page tab at win={tuple(spot)} "
+                                       f"screen=({win_left + spot[0]},{win_top + spot[1]})", tag=self.diag_tag)
+                    self._click_page_tab(win_left + spot[0], win_top + spot[1])
                     ok = True
             if ok:
                 break
@@ -3808,11 +3881,31 @@ class FishingBot:
                                      + ("same page, the click may have been missed: clicking the tab once more"
                                         if same else "page switched"), tag=self.diag_tag)
                 if same:
-                    with input_lock:
-                        if self.running and self._focus(force=True):
-                            win_left, win_top, _, _ = self.window_manager.get_window_rect()
-                            self._click_page_tab(win_left + page_pos[0], win_top + page_pos[1])
+                    self._click_tab_point(page_pos, page_pos)
                     self._wait_for_page(page_pos, settle)
+                    # Still the same page: on some clients the tab's label
+                    # swallows clicks on it (the fish client's tab I at its
+                    # middle: every click there missed, 10 px beside it
+                    # every one worked; trailer take 2026-11-27, the bot
+                    # then used page II as page I). Clicked beside the
+                    # point, left then right; a spot that works is kept.
+                    for dx in (-12, 12):
+                        if not self.running:
+                            break
+                        now = self._page_empty_slots()
+                        if now is None or not inventory_layout.same_empty_slots(before, now)[0]:
+                            break
+                        spot = (int(page_pos[0]) + dx, int(page_pos[1]))
+                        diag.log("DECISION", f"page tab {tuple(page_pos)}: still the same page after the second "
+                                             f"click: clicking beside it at {spot}", tag=self.diag_tag)
+                        self._click_tab_point(page_pos, spot)
+                        self._wait_for_page(page_pos, settle)
+                        after = self._page_empty_slots()
+                        if after is not None and not inventory_layout.same_empty_slots(before, after)[0]:
+                            self._tab_click_spot[tuple(int(v) for v in page_pos)] = spot
+                            diag.log("DECISION", f"page tab {tuple(page_pos)}: the click beside it at {spot} "
+                                                 f"switched the page: used from now on", tag=self.diag_tag)
+                            break
         else:
             diag.log("DECISION", "page tab could not be clicked: the old page is still showing", tag=self.diag_tag)
         return ok
@@ -4102,6 +4195,7 @@ class FishingBot:
                 if self._wait_before_recast():
                     self._was_paused = True
                 return
+            self._qs_second_lost = not second
             if not second:
                 diag.log("DECISION", "quick skip: second CTRL+G not sent -> normal recast wait",
                          tag=self.diag_tag)
@@ -5480,9 +5574,58 @@ class FishingBot:
                 self.on_status_update(f"[W{self.bot_id+1}] Classic fish template not found at assets/fishing/classic_fish.jpg")
         
         return FishingBot._classic_fish_template
-    
+
+    @staticmethod
+    def _load_classic_bubble_template():
+        """The bite bubble as a small client draws it (assets/fishing/
+        classic_fish_bubble.png, grayscale): a white disc round the hook and
+        fish icon, its lower edge under the character's name. The icon alone
+        (classic_fish.jpg) does not match it there: at that size the round
+        bubble is most of the picture. None when the file is missing."""
+        if FishingBot._classic_bubble_template is None:
+            path = get_resource_path("classic_fish_bubble.png")
+            img = cv2.imread(path) if os.path.exists(path) else None
+            FishingBot._classic_bubble_template = False if img is None else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        return FishingBot._classic_bubble_template if FishingBot._classic_bubble_template is not False else None
+
     # Scales matched per poll besides the known one (see wait_for_classic_fish).
     _CLASSIC_ROTATING_SCALES = 3
+    # Smallest scale the bite bubble picture is matched at (it is cut from
+    # an 800x600 client, the smallest window size in use).
+    _CLASSIC_BUBBLE_MIN_SCALE = 0.8
+    # What a match of the bubble picture must also show (real-client runs
+    # 2026-11-26, tests/fixtures/real_classic): the moon in the night sky
+    # (a white disc with nothing inside) matched at 0.74, and a small white
+    # glow in front of the dock at 0.71, by a character without a rod.
+    # - contrast in the middle third (the hook and fish icon), as a share of
+    #   the disc's brightness: real bubbles 0.36-0.91, the moon <= 0.13
+    # - the share of the picture's white disc (outside the middle) that is
+    #   bright in the frame: real bubbles >= 0.77, the glow <= 0.52 (it is
+    #   smaller than the bubble, the dark dock shows round it)
+    # Both measured under gamma 0.6-1.6, 3x3 / 5x5 blur, 0.8-1.5x, JPEG 30.
+    _CLASSIC_BUBBLE_MIN_ICON_CONTRAST = 0.25
+    _CLASSIC_BUBBLE_MIN_DISC_FILL = 0.65
+
+    @staticmethod
+    def _bubble_has_icon(patch_gray: np.ndarray, picture: np.ndarray) -> bool:
+        """Is a patch matched by the bubble picture (``picture``, the scaled
+        template) really the bubble: a white disc as big as the picture's
+        with the icon inside? Both measured against the disc's own
+        brightness, so gamma, brightness and gray captures keep them."""
+        h, w = patch_gray.shape[:2]
+        if h < 6 or w < 6 or picture.shape[:2] != (h, w):
+            return False
+        patch = patch_gray.astype(np.float32)
+        disc = float(np.percentile(patch, 90)) + 1.0
+        mid = (slice(h // 3, h - h // 3), slice(w // 3, w - w // 3))
+        inner = patch[mid]
+        if (float(inner.max()) - float(inner.min())) / disc < FishingBot._CLASSIC_BUBBLE_MIN_ICON_CONTRAST:
+            return False                       # nothing inside: the moon
+        ring = picture >= 200
+        ring[mid] = False
+        if not ring.any():
+            return True
+        return float((patch[ring] >= disc * 0.75).mean()) >= FishingBot._CLASSIC_BUBBLE_MIN_DISC_FILL
 
     def wait_for_classic_fish(self, timeout: float = 10.0) -> bool:
         """Waits for the classic fish image to appear in the game window.
@@ -5506,15 +5649,32 @@ class FishingBot:
         # Build (and class-cache) scaled variants once — shared across all calls
         # and all bot instances. Previously rebuilt on every wait_for_classic_fish
         # invocation, allocating ~20 resize buffers per cast.
+        # Two pictures of the bite: the icon (clients that draw it large) and
+        # the whole bubble (clients that draw it small, where the icon alone
+        # never matched: seen on a real 800x600 client). Each scale entry
+        # carries both; a match of either is a bite.
         if FishingBot._classic_fish_scaled_cache is None:
             _scales_raw = [0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.7, 0.8, 0.9,
                            1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.25, 2.5, 2.75, 3.0]
+            _pictures = [template]
+            _bubble = self._load_classic_bubble_template()
+            if _bubble is not None:
+                _pictures.append(_bubble)
             _scaled = []
-            for _s in _scales_raw:
-                _nw, _nh = int(t_w * _s), int(t_h * _s)
-                if _nw >= 10 and _nh >= 10:
-                    _interp = cv2.INTER_AREA if _s < 1 else cv2.INTER_LINEAR
-                    _scaled.append((_s, _nw, _nh, cv2.resize(template, (_nw, _nh), interpolation=_interp)))
+            for _k, _pic in enumerate(_pictures):
+                _ph, _pw = _pic.shape
+                for _s in _scales_raw:
+                    # The bubble picture is already the small client's size:
+                    # shrunk further (19x10 px at 0.5) it matched name tags
+                    # and other players' bubbles on a real client (bites
+                    # "seen" by a character without a rod).
+                    if _k > 0 and _s < self._CLASSIC_BUBBLE_MIN_SCALE:
+                        continue
+                    _nw, _nh = int(_pw * _s), int(_ph * _s)
+                    if _nw >= 10 and _nh >= 10:
+                        _interp = cv2.INTER_AREA if _s < 1 else cv2.INTER_LINEAR
+                        _scaled.append((_s, _nw, _nh, cv2.resize(_pic, (_nw, _nh), interpolation=_interp),
+                                        _k > 0))
             FishingBot._classic_fish_scaled_cache = _scaled
 
         all_scales = FishingBot._classic_fish_scaled_cache
@@ -5567,6 +5727,7 @@ class FishingBot:
                     crop_w = min(250, win_w - crop_left)
                     poll_start = perf_counter()
                     frame = capture_region(crop_left, 0, crop_w, win_h >> 1)
+                    seen_at = perf_counter()   # when this frame showed the game (the match takes a while)
                     if not self._last_frame_usable:
                         # Nothing to see: not a "no bite" either. The time
                         # does not count towards the timeout.
@@ -5593,13 +5754,20 @@ class FishingBot:
                     else:
                         scaled_templates = all_scales
 
-                    for scale, new_w, new_h, scaled_template in scaled_templates:
+                    for scale, new_w, new_h, scaled_template, is_bubble in scaled_templates:
                         # Skip if scaled template is larger than current cropped frame
                         if new_h > f_h or new_w > f_w:
                             continue
 
                         result = match_template(frame_gray, scaled_template, TM_CCOEFF_NORMED)
-                        _, max_val, _, _ = minMaxLoc(result)
+                        _, max_val, _, max_loc = minMaxLoc(result)
+                        if is_bubble and max_val >= ACCEPT_THRESHOLD:
+                            bx, by = max_loc
+                            if not self._bubble_has_icon(frame_gray[by:by + new_h, bx:bx + new_w], scaled_template):
+                                lp.count("empty_bubbles")
+                                diag.first("classic_empty_bubble", frame, tag=self.diag_tag,
+                                           note=f"score {max_val:.3f} scale {scale} at ({bx},{by}): not a bubble with the icon")
+                                max_val = min(max_val, ACCEPT_THRESHOLD - 0.01)
 
                         if max_val > best_match_val:
                             best_match_val = max_val
@@ -5621,6 +5789,12 @@ class FishingBot:
                                              f"{ACCEPT_THRESHOLD} at scale {best_scale}): waiting "
                                              f"classic_fishing_delay {self.config.get('classic_fishing_delay', 3.0)}s "
                                              f"before reeling in", tag=self.diag_tag)
+                        bite = seen_at - start_time
+                        if bite > self._longest_classic_bite:
+                            self._longest_classic_bite = bite
+                            diag.log("DECISION", f"longest classic bite so far: {bite:.1f}s after the cast "
+                                                 f"(bite wait now {self._classic_bite_timeout():.1f}s)",
+                                     tag=self.diag_tag)
                         # Persist the winning scale for the next poll/cast
                         self._classic_scale = best_scale
                         FishingBot._classic_fish_last_scale = best_scale
@@ -5629,8 +5803,12 @@ class FishingBot:
                         # The bite does not wait for the bot: the reel moment
                         # is fixed in real time. A pause neither restarts nor
                         # extends it (a restart reeled in a whole delay late);
-                        # the caller reels in after the resume.
-                        reel_at = perf_counter() + delay - 0.05   # monotonic: a clock change must not skew it
+                        # the caller reels in after the resume. It counts from
+                        # the frame the icon was seen on, not from the end of
+                        # the match: matching took 5-50 ms (all scales on the
+                        # first bite), which moved the reel around by as much.
+                        reel_at = seen_at + delay - 0.05   # monotonic: a clock change must not skew it
+                        self._classic_seen_at = seen_at
                         while perf_counter() < reel_at:
                             if not self.running:
                                 return False  # Bot stopped during delay
@@ -5734,8 +5912,12 @@ class FishingBot:
             # Writing off a bait tier on that would end in a false "bait
             # depleted"; the player has to look.
             classic = self.config.get('classic_fishing', False)
-            hint = ("If the fish icon does appear: keep the game window uncovered and the camera as "
-                    "usual." if classic else
+            # Classic: the bite bubble shows above the character's head for
+            # about a second, so a game window there (the area map opens in
+            # that spot on some clients) hides every bite.
+            hint = ("If the fish icon does appear above your character: keep the game window uncovered, "
+                    "close game windows over your character's head (the area map, M) and keep the "
+                    "camera as usual." if classic else
                     "If the minigame does open on screen: keep the game window uncovered, or use "
                     "Classic fishing if this server has no minigame.")
             self._stop_bot(
@@ -5853,6 +6035,7 @@ class FishingBot:
                         continue
 
                     self._game_end_time = perf_counter()
+                    self._set_catch_timing("minigame", game_time)
                     self.total_games += 1
                     if not self._fish_bait_cast:
                         self.bait_counter -= 1   # a bait fish is not from the bait stack
@@ -6018,7 +6201,13 @@ class FishingBot:
                 self._last_cast_wait = None
                 self._game_end_time = None
                 self._mount_toggled = False   # the player had the controls: mount state unknown
-                self._quickskip_unchecked = False
+                # ...except when the bot's own quick skip lost its second
+                # CTRL+G right before the pause: then the character is most
+                # likely on the horse, and the first miss must get the
+                # recovery CTRL+G (trailer take 2026-11-27: F5 came between
+                # the two presses, the character stayed mounted, every cast
+                # after the resume missed and three bait keys were written off)
+                self._quickskip_unchecked = self._qs_second_lost
                 # A Golden Tuna dialog left open hides the inventory the
                 # resume is about to read
                 self._handle_quest_dialog()
@@ -6180,6 +6369,7 @@ class FishingBot:
                             # the bot did not mount the character, and the
                             # toggle would (diag 20261121_122030).
                             self._quickskip_unchecked = False
+                            self._qs_second_lost = False
                             self._log("No minigame — pressing CTRL+G in case the character is still on the horse")
                             self._mount_toggled = self.press_ctrl_key(mount_key)
                             self._sleep_interruptible(self._MOUNT_SETTLE)
@@ -6199,6 +6389,7 @@ class FishingBot:
                     self.consecutive_failures = 0
                     self._mount_toggled = False   # a cast worked: on foot now
                     self._quickskip_unchecked = False
+                    self._qs_second_lost = False
                     self._minigame_ever_seen = self._bite_ever_seen = True
                     self._report_cast(cast_wait, True)
                     bite = time.perf_counter() - cast_time
@@ -6227,7 +6418,7 @@ class FishingBot:
                             self._discard_learned_profile()
                 else:
                     # Classic Fishing system - wait for fish indicator, then reel in
-                    fish_found = self.wait_for_classic_fish(timeout=40)
+                    fish_found = self.wait_for_classic_fish(timeout=self._classic_bite_timeout())
                     if not self.running:
                         break
                     if self._wait_interrupted:
@@ -6276,8 +6467,14 @@ class FishingBot:
                         break
 
                     # Timer already elapsed in wait_for_classic_fish - press space to reel in
+                    reel_start = time.perf_counter()
                     reeled = self._send_reel()
                     self._game_end_time = time.perf_counter()
+                    if reeled and self._classic_seen_at is not None:
+                        # The reel's time after the bite as the bot saw it:
+                        # what the catch is compared with (catch_timing)
+                        self._set_catch_timing("classic", reel_start - self._classic_seen_at)
+                    self._classic_seen_at = None
                     if not self.running:
                         break
                     if not reeled:
@@ -6359,6 +6556,10 @@ class FishingBot:
             else:
                 self._set_stop_reason(self.STOP_ERROR)
 
+        timing_summary = self.catch_timing_stats.summary()
+        if timing_summary:
+            diag.log("ANALYSIS", f"catch rate by timing (items on a stack may go unseen): {timing_summary}",
+                     tag=self.diag_tag)
         diag.log("DECISION", f"bot loop ended: stop_reason={self.stop_reason} message={self.stop_message!r} "
                              f"games={self.total_games} bait={self.bait_counter} manual={self._manually_stopped}",
                  tag=self.diag_tag)

@@ -96,8 +96,11 @@ and the push in `publish` (step 9).
 .venv/bin/python tools/run_tests.py
 ```
 
-These are the unit tests. They never touch the desktop, so they're safe while
-the user plays. **If anything fails, stop and report it** with the output.
+These are the unit tests, then the real-client tests (the bot against real
+Metin2 clients of the local test rig, on hidden displays; several minutes,
+skipped when the rig isn't there; see docs/REAL_CLIENT_TESTS.md). None of it
+touches the desktop, so it's safe while the user plays. Run it with
+`run_in_background`. **If anything fails, stop and report it** with the output.
 Don't release over failing tests.
 
 ### 6. Build both binaries
@@ -158,9 +161,9 @@ End the message with the attribution lines from the session's system reminder.
 This checks that HEAD carries the version, the work tree is clean (no
 changes to tracked files, no untracked files under `src/`, `packaging/` or
 `assets/`), both assets passed their smoke test, the branch is `main`, and
-that the tag and release don't exist yet. It then runs the unit tests on the
-committed tree (about 2 minutes, so use `run_in_background`) and stops if
-they fail. Then it creates the annotated tag `Mt2-Fishbot-vX.Y.Z`, pushes `main` and the tag,
+that the tag and release don't exist yet. It then runs the tests on the
+committed tree (unit + real-client, about 15 minutes, so use
+`run_in_background`) and stops if they fail. Then it creates the annotated tag `Mt2-Fishbot-vX.Y.Z`, pushes `main` and the tag,
 and creates the GitHub release (title `vX.Y.Z`, marked latest) with the three
 assets.
 

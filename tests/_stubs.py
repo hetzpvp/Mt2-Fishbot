@@ -185,7 +185,7 @@ class InventoryScreen:
     TABS = {1: (660, 329), 2: (752, 323), 3: (671, 350), 4: (733, 348)}
     EQUIPMENT = [(740, 230), (740, 270), (640, 250)]        # empty equipment slots (top-left)
 
-    def __init__(self, page_delay=0.0, lost_clicks=0, highlight=True):
+    def __init__(self, page_delay=0.0, lost_clicks=0, highlight=True, dead_spots=()):
         rng = np.random.default_rng(3)
         base = rng.integers(40, 90, size=(self.H, self.W, 3), dtype=np.uint8)
         self.background = cv2.GaussianBlur(base, (9, 9), 0)
@@ -194,6 +194,7 @@ class InventoryScreen:
         self.page = 0
         self.page_delay = page_delay
         self.lost_clicks = lost_clicks
+        self.dead_spots = list(dead_spots)                  # points where a click is swallowed (a tab label)
         self.highlight = highlight
         self.tab_clicks = []
         self.clicks = []
@@ -217,6 +218,8 @@ class InventoryScreen:
         for page, (x1, y1, x2, y2) in self.TAB_BOXES.items():
             if x1 <= pos[0] <= x2 and y1 <= pos[1] <= y2 and button == "left":
                 self.tab_clicks.append(page)
+                if any(abs(pos[0] - dx) <= 4 and abs(pos[1] - dy) <= 4 for dx, dy in self.dead_spots):
+                    return
                 if self.lost_clicks > 0:
                     self.lost_clicks -= 1
                     return

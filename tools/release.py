@@ -26,7 +26,7 @@ Release helper for MT2 Fishing Bot. The full flow is in CLAUDE.md
         built with --no-smoke, or whose smoke test failed, is not.
 
     python tools/release.py publish --notes-file FILE [--draft]
-        Runs the unit tests on the committed tree, then tags HEAD as
+        Runs the tests (unit + real-client) on the committed tree, then tags HEAD as
         Mt2-Fishbot-vX.Y.Z, pushes main and the tag, and creates the GitHub
         release with the assets. Refuses if HEAD does not carry the version,
         the work tree has changes that would not be in the tag, an asset is
@@ -614,9 +614,9 @@ def cmd_publish(args):
     if out(["gh", "release", "view", tag, "--repo", REPO])[0] == 0:
         sys.exit(f"GitHub release {tag} already exists")
     # The committed tree (it is clean, see above) is what gets tagged.
-    print("running the unit tests on the committed tree…", flush=True)
+    print("running the tests (unit + real-client) on the committed tree…", flush=True)
     if subprocess.run([sys.executable, os.path.join(ROOT, "tools", "run_tests.py"), "-q"], cwd=ROOT).returncode:
-        sys.exit("unit tests failed: not publishing")
+        sys.exit("tests failed: not publishing")
 
     run(["git", "tag", "-a", tag, "-m", f"v{v}"])
     run(["git", "push", "origin", "main"])
